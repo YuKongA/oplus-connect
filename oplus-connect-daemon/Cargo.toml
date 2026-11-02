@@ -1,0 +1,37 @@
+[package]
+name = "oplus-connect-daemon"
+version = "0.1.0"
+edition = "2024"
+description = "Native backend for OPLUS devices"
+
+[dependencies]
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "process", "signal"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi"] }
+hmac = "0.13"
+rand_core = "0.10"
+getrandom = { version = "0.4", features = ["sys_rng"] }
+p256 = { version = "0.14", default-features = false, features = ["arithmetic", "ecdh"] }
+sha2 = "0.11"
+aes-gcm = "0.11"
+hkdf = "0.13"
+x25519-dalek = "3"
+base64 = "0.22"
+tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+notify-rust = "4"
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
+
+[target.'cfg(windows)'.dependencies]
+arboard = { version = "3", default-features = false }
+winrt-toast-reborn = "0.3.8"
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

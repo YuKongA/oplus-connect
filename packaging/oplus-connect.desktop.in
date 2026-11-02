@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=OPLUS 互联
+Comment=OPPO / 一加设备互联客户端
+Exec=@EXEC@
+Icon=oplus-connect
+Terminal=false
+Categories=Network;
+StartupWMClass=oplus-connect

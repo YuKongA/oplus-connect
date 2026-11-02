@@ -1,0 +1,80 @@
+# Rust build output and compiler backups
+# Cargo.lock and .cargo/config.toml belong in version control.
+target/
+*.rs.bk
+*.profraw
+*.profdata
+/.cargo-isolated/
+
+# Compiled libraries, debug symbols, and installer packages
+*.o
+*.obj
+*.a
+*.lib
+*.rlib
+*.rmeta
+*.pdb
+*.exe
+*.dll
+*.so
+*.so.*
+*.dylib
+*.dmg
+*.deb
+*.rpm
+*.msi
+*.AppImage
+*.AppImage.*
+
+# Python analysis tools and rebuildable caches
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+
+# Local downloads and one-off analysis (at the root or in the daemon)
+/workspace/
+analysis/
+
+# Private official binaries and logs
+/windows-protocol-evidence/*
+
+# Raw captures and extracted TCP streams contain device and authentication data.
+/windows-protocol-evidence/**/*.pcap
+/windows-protocol-evidence/**/*.pcapng
+/windows-protocol-evidence/**/*.bin
+
+# Runtime logs, sockets, process files, and pairing secrets
+*.log
+*.log.*
+*.sock
+*.socket
+*.pid
+*.pid.lock
+ksc.bin
+ptc.db
+ptc.db-shm
+ptc.db-wal
+
+# Local environment overrides; keep distributable configuration examples.
+.env
+.env.*
+!.env.example
+!.env.*.example
+!.env.template
+!.env.*.template
+
+# OS metadata, local editor settings, and temporary files
+.DS_Store
+._*
+Thumbs.db
+[Dd]esktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
