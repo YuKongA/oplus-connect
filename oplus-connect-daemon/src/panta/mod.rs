@@ -702,6 +702,29 @@ pub const OFFICIAL_WINDOWS_TOPIC_SYNC_JSON: &str = r#"{
     }
 }"#;
 
+/// Topic sync replaces the entire set, so each authenticated bus owns both leases.
+#[derive(Default)]
+struct BusTopics {
+    kms: bool,
+    cast: bool,
+}
+
+impl BusTopics {
+    fn sync_json(&self) -> String {
+        let mut value: serde_json::Value = serde_json::from_str(OFFICIAL_WINDOWS_TOPIC_SYNC_JSON)
+            .expect("valid base topic sync");
+        for role in ["pub", "sub"] {
+            let topics = value["dbs_msg_payload"][role].as_array_mut().expect("topic array");
+            for (enabled, name) in [(self.kms, "Oplus_KeyMouseLink"), (self.cast, "Oplus_Cast")] {
+                if enabled {
+                    topics.push(serde_json::json!({"dbs_topic_name":name,"dbs_topic_tag":0}));
+                }
+            }
+        }
+        value.to_string()
+    }
+}
+
 /// Screen-status data message the official PC sends on the data bus; phones
 /// appear to start syncing once they have seen one.
 pub const SCREEN_STATUS_JSON: &str = r#"{"data_sync_msg_encrypt":false,"data_sync_msg_id":"","data_sync_msg_module":15001,"data_sync_msg_payload":"{\"device_screen_status\":true}","data_sync_msg_priority":-1,"data_sync_msg_type":"15001"}"#;
@@ -1686,6 +1709,25 @@ pub async fn serve<F, Fut>(
     serve_with_events(sock, peer, hostname, service_count, ksc_for_device, None, None).await;
 }
 
+struct DataSessionGuard {
+    state: Option<crate::state::AppState>,
+    attached: Option<(String, u64)>,
+}
+
+impl Drop for DataSessionGuard {
+    fn drop(&mut self) {
+        if let (Some(state), Some((device_id, token))) =
+            (self.state.take(), self.attached.take())
+        {
+            // Cancellation skips the async epilogue. Only this session's token
+            // is removed, so delayed cleanup cannot detach a reconnect.
+            tokio::spawn(async move {
+                state.detach_data_session(&device_id, token).await;
+            });
+        }
+    }
+}
+
 pub async fn serve_with_events<F, Fut>(
     sock: TcpStream,
     peer: std::net::SocketAddr,
@@ -1701,7 +1743,10 @@ pub async fn serve_with_events<F, Fut>(
     // The data channel, not the short-lived SCP handshake socket, owns the
     // device connection lifetime. Attach only after auth confirms, detach when
     // this connection ends.
-    let mut attached_device: Option<String> = None;
+    let mut session = DataSessionGuard {
+        state: lifecycle.clone(),
+        attached: None,
+    };
     run_session(
         sock,
         peer,
@@ -1710,11 +1755,15 @@ pub async fn serve_with_events<F, Fut>(
         ksc_for_device,
         event_broadcaster,
         lifecycle.as_ref(),
-        &mut attached_device,
+        &mut session.attached,
     )
     .await;
-    if let (Some(state), Some(device_id)) = (lifecycle.as_ref(), attached_device) {
-        state.detach_data_session(&device_id).await;
+    if let (Some(state), Some((device_id, token))) = (lifecycle, session.attached.take()) {
+        // Finish the token removal even if the serving task is cancelled while
+        // the cleanup is waiting for state locks.
+        let _ = tokio::spawn(async move {
+            state.detach_data_session(&device_id, token).await;
+        }).await;
     }
 }
 
@@ -1726,7 +1775,7 @@ async fn run_session<F, Fut>(
     ksc_for_device: F,
     event_broadcaster: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
     lifecycle: Option<&crate::state::AppState>,
-    attached_device: &mut Option<String>,
+    attached_device: &mut Option<(String, u64)>,
 ) where
     F: Fn(String) -> Fut,
     Fut: Future<Output = Option<Vec<u8>>>,
@@ -1742,6 +1791,8 @@ async fn run_session<F, Fut>(
     let mut chunk = vec![0u8; 8192];
     let mut ksc: Option<Vec<u8>> = None;
     let mut peer_device_id: Option<[u8; 6]> = None;
+    let mut authenticated_device_id: Option<[u8; 6]> = None;
+    let mut pending_auth_device_id: Option<[u8; 6]> = None;
     let mut link_info_sent = false;
     let mut agent_answered = false;
     let mut oshare_session_opened = false;
@@ -1760,6 +1811,12 @@ async fn run_session<F, Fut>(
     let mut peer_sessions: Vec<u16> = Vec::new();
     let mut peer_service_agent = PEER_SERVICE_AGENT;
     let mut peer_oshare_agent = PEER_OSHARE_AGENT;
+    let mut kms_controller: Option<crate::kms::control::Controller> = None;
+    let mut cast_controller: Option<crate::cast::control::Controller> = None;
+    let mut bus_topics = BusTopics::default();
+    let mut epi_name = String::new();
+    let mut epi_type = 0u8;
+
     let mut local_session_requested = false;
     let mut local_session_confirmed = false;
     let mut oshare_session_confirmed = false;
@@ -1809,20 +1866,183 @@ async fn run_session<F, Fut>(
         std::env::var("OPLUS_CLIPBOARD_ALLOW_UNCONFIRMED").as_deref() == Ok("1");
 
     loop {
-        if let (Some(state), Some(device_id)) = (lifecycle, attached_device.as_deref()) {
-            if state.take_disconnect_request(device_id).await {
+        if let (Some(controller), Some(peer_id)) = (kms_controller.as_mut(), authenticated_device_id) {
+            if local_session_confirmed && link_info_sent {
+                for _ in 0..16 {
+                    let Some(command) = controller.try_next() else { break; };
+                    match command {
+                        crate::kms::control::BusCommand::Start { config, reply } => {
+                            if reply.is_closed() { continue; }
+                            match controller.start(config).await {
+                                Ok(publication) => {
+                                    bus_topics.kms = true;
+                                    for (route_head, json) in [(0x2a, bus_topics.sync_json()), (0x52, publication.device_info)] {
+                                        let frame = build_data_bus_with(local_session, our_id, peer_id, route_head, &json);
+                                        if !matches!(tokio::time::timeout(crate::kms::server::WRITE_TIMEOUT, write_frame(&mut sock, &frame)).await, Ok(Ok(()))) {
+                                            controller.abort().await;
+                                            return;
+                                        }
+                                    }
+                                    if reply.send(Ok(publication.info)).is_err() {
+                                        let _ = controller.stop().await;
+                                        bus_topics.kms = false;
+                                        let frame = build_data_bus_with(local_session, our_id, peer_id, 0x2a, &bus_topics.sync_json());
+                                        if !matches!(tokio::time::timeout(crate::kms::server::WRITE_TIMEOUT, write_frame(&mut sock, &frame)).await, Ok(Ok(()))) { return; }
+                                    }
+                                }
+                                Err(error) => { let _ = reply.send(Err(error)); }
+                            }
+                        }
+                        crate::kms::control::BusCommand::Stop { reply } => {
+                            if reply.is_closed() { continue; }
+                            match controller.stop().await {
+                                Ok(()) => {
+                                    bus_topics.kms = false;
+                                    let frame = build_data_bus_with(local_session, our_id, peer_id, 0x2a, &bus_topics.sync_json());
+                                    if !matches!(tokio::time::timeout(crate::kms::server::WRITE_TIMEOUT, write_frame(&mut sock, &frame)).await, Ok(Ok(()))) { return; }
+                                    let _ = reply.send(Ok(()));
+                                }
+                                Err(error) => { let _ = reply.send(Err(error)); }
+                            }
+                        }
+                        crate::kms::control::BusCommand::Status { reply } => { let _ = reply.send(controller.status()); }
+                        crate::kms::control::BusCommand::Input { generation, event, reply } => {
+                            if reply.is_closed() { continue; }
+                            let result = controller.send_input(generation, event).await;
+                            let _ = reply.send(result);
+                        }
+                        crate::kms::control::BusCommand::Release { generation, reply } => {
+                            if reply.is_closed() { continue; }
+                            let result = controller.release_input(generation).await;
+                            let _ = reply.send(result);
+                        }
+                }
+            }
+        }
+        }
+        if let (Some(controller), Some(peer_id)) = (cast_controller.as_mut(), authenticated_device_id) {
+            if local_session_confirmed && link_info_sent {
+                for _ in 0..16 {
+                    let Some(command) = controller.try_next() else { break; };
+                    match command {
+                        crate::cast::control::BusCommand::Start { reply } => {
+                            if reply.is_closed() { continue; }
+                            match controller.start().await {
+                                Ok(publication) => {
+                                    if reply.is_closed() {
+                                        let _ = controller.stop().await;
+                                        continue;
+                                    }
+                                    bus_topics.cast = true;
+                                    let messages = std::iter::once((0x2a, bus_topics.sync_json()))
+                                        .chain(publication.messages.into_iter().map(|json| (0x52, json)));
+                                    for (route_head, json) in messages {
+                                        let frame = build_data_bus_with(local_session, our_id, peer_id, route_head, &json);
+                                        if !matches!(tokio::time::timeout(crate::cast::control::BUS_WRITE_TIMEOUT, write_frame(&mut sock, &frame)).await, Ok(Ok(()))) {
+                                            let _ = controller.stop().await;
+                                            return;
+                                        }
+                                    }
+                                    if reply.send(Ok(publication.info)).is_err() {
+                                        let _ = controller.stop().await;
+                                        bus_topics.cast = false;
+                                        for (route_head, json) in [(0x52, crate::cast::control::disconnect_message()), (0x2a, bus_topics.sync_json())] {
+                                            let frame = build_data_bus_with(local_session, our_id, peer_id, route_head, &json);
+                                            if !matches!(tokio::time::timeout(crate::cast::control::BUS_WRITE_TIMEOUT, write_frame(&mut sock, &frame)).await, Ok(Ok(()))) { return; }
+                                        }
+                                    }
+                                }
+                                Err(error) => { let _ = reply.send(Err(error)); }
+                            }
+                        }
+                        crate::cast::control::BusCommand::Stop { reply } => {
+                            if reply.is_closed() { continue; }
+                            match controller.stop().await {
+                                Ok(()) => {
+                                    bus_topics.cast = false;
+                                    for (route_head, json) in [(0x52, crate::cast::control::disconnect_message()), (0x2a, bus_topics.sync_json())] {
+                                        let frame = build_data_bus_with(local_session, our_id, peer_id, route_head, &json);
+                                        if !matches!(tokio::time::timeout(crate::cast::control::BUS_WRITE_TIMEOUT, write_frame(&mut sock, &frame)).await, Ok(Ok(()))) { return; }
+                                    }
+                                    let _ = reply.send(Ok(()));
+                                }
+                                Err(error) => { let _ = reply.send(Err(error)); }
+                            }
+                        }
+                        crate::cast::control::BusCommand::Status { reply } => {
+                            let _ = reply.send(Ok(controller.status()));
+                        }
+                        crate::cast::control::BusCommand::Send { connection_id, payload, reply } => {
+                            if reply.is_closed() { continue; }
+                            let result = controller.send(connection_id, payload).await;
+                            let _ = reply.send(result);
+                        }
+                        crate::cast::control::BusCommand::ConfigureVideo { connection_id, width, fps, reply } => {
+                            if reply.is_closed() { continue; }
+                            let result = controller.configure_video(connection_id, width, fps).await;
+                            let _ = reply.send(result);
+                        }
+                        crate::cast::control::BusCommand::Receive { connection_id, max, reply } => {
+                            if reply.is_closed() { continue; }
+                            let _ = reply.send(controller.receive(connection_id, max));
+                        }
+                    }
+                }
+            } else {
+                // No DBR HELLO yet: the phone's data bus has not finished the
+                // handshake, so publishing a cast topic is impossible. Fail the
+                // request immediately instead of letting the caller wait for the
+                // 15 s control timeout.
+                let reason = "phone data channel is not ready; reconnect the device".to_string();
+                for _ in 0..16 {
+                    let Some(command) = controller.try_next() else { break; };
+                    match command {
+                        crate::cast::control::BusCommand::Status { reply } => {
+                            let _ = reply.send(Ok(controller.status()));
+                        }
+                        crate::cast::control::BusCommand::Start { reply } => {
+                            let _ = reply.send(Err(reason.clone()));
+                        }
+                        crate::cast::control::BusCommand::Stop { reply } => {
+                            let _ = reply.send(Err(reason.clone()));
+                        }
+                        crate::cast::control::BusCommand::Send { reply, .. }
+                        | crate::cast::control::BusCommand::ConfigureVideo { reply, .. } => {
+                            let _ = reply.send(Err(reason.clone()));
+                        }
+                        crate::cast::control::BusCommand::Receive { reply, .. } => {
+                            let _ = reply.send(Err(reason.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        if let (Some(state), Some((_, token))) = (lifecycle, attached_device.as_ref()) {
+            if state.take_disconnect_request(*token).await {
                 info!("panta[{}]: closing session on user request", peer);
                 return;
             }
         }
         // Idle for 700 ms = a chance to mirror local clipboard changes; a
         // cancelled read loses nothing, so the timeout is safe.
-        let read = match tokio::time::timeout(
-            std::time::Duration::from_millis(700),
-            sock.read(&mut chunk),
-        )
-        .await
-        {
+        let read = match tokio::select! {
+            _ = async {
+                match cast_controller.as_mut() {
+                    Some(controller) => controller.wait_command().await,
+                    None => std::future::pending().await,
+                }
+            } => continue,
+            _ = async {
+                match kms_controller.as_mut() {
+                    Some(controller) => controller.wait_command().await,
+                    None => std::future::pending().await,
+                }
+            }, if local_session_confirmed && link_info_sent => continue,
+            result = tokio::time::timeout(
+                std::time::Duration::from_millis(700),
+                sock.read(&mut chunk),
+            ) => result.map_err(|_| ()),
+        } {
             Err(_) => {
                 if let Some(peer_id) = peer_device_id {
                     if !injected
@@ -1950,17 +2170,19 @@ async fn run_session<F, Fut>(
 
         while let Some(body) = take_frame(&mut buf) {
             match body.first().copied() {
-                Some(MSG_EPI_ANSWER) => match parse_answer(&body) {
-                    Some(answer) => info!(
-                        "panta[{}]: EPI answer id={} name={} product={} category={} profiles={}",
-                        peer,
-                        answer.endpoint_id,
-                        answer.friendly_name,
-                        answer.product,
-                        answer.device_category,
-                        answer.service_profile_count
-                    ),
-                    None => warn!("panta[{}]: malformed EPI answer", peer),
+                Some(MSG_EPI_ANSWER) => {
+                    match parse_answer(&body) {
+                        Some(answer) => {
+                            epi_name = answer.friendly_name.clone();
+                            epi_type = answer.device_category;
+                            info!(
+                                "panta[{}]: EPI answer id={} name={} product={} category={} profiles={}",
+                                peer, answer.endpoint_id, answer.friendly_name, answer.product,
+                                answer.device_category, answer.service_profile_count
+                            );
+                        }
+                        None => warn!("panta[{}]: malformed EPI answer", peer),
+                    }
                 },
                 Some(MSG_AUTH_REQUEST) => {
                     let Some(request) = parse_auth_request(&body) else {
@@ -1994,7 +2216,7 @@ async fn run_session<F, Fut>(
                         continue;
                     }
                     info!("panta[{}]: auth request MAC verified", peer);
-
+                    pending_auth_device_id = Some(request.device_id);
                     ksc = Some(key);
                     client_rc2 = request.client_rc2;
                     client_fc = request.client_fc;
@@ -2027,13 +2249,21 @@ async fn run_session<F, Fut>(
                             "panta[{}]: auth confirm verified, data channel authenticated",
                             peer
                         );
-                        if attached_device.is_none() {
-                            if let (Some(state), Some(device_id)) =
-                                (lifecycle, peer_device_id.as_ref())
-                            {
-                                let device_id = hex(device_id);
-                                state.attach_data_session(&device_id).await;
-                                *attached_device = Some(device_id);
+                        if authenticated_device_id.is_none() {
+                            if let (Some(state), Some(device_id)) = (lifecycle, pending_auth_device_id) {
+                                authenticated_device_id = Some(device_id);
+                                let device_id = hex(&device_id);
+                                let token = state.attach_data_session(&device_id).await;
+                                if let Ok(local_addr) = sock.local_addr() {
+                                    if let Some(registration) = state.kms.register_bus(&device_id, peer.ip(), local_addr.ip()) {
+                                        kms_controller = Some(registration.into_controller(
+                                            device_id.clone(), epi_name.clone(), epi_type,
+                                            hostname.to_string(), crate::net_utils::pdid(),
+                                        ));
+                                    }
+                                    cast_controller = state.cast.register_bus(&device_id, peer.ip(), local_addr.ip());
+                                }
+                                *attached_device = Some((device_id, token));
                             }
                         }
                         let list = build_service_list(&SERVICE_PROFILES);
@@ -2610,6 +2840,29 @@ async fn run_session<F, Fut>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cast_and_kms_topic_ownership_compose_in_both_stop_orders() {
+        for stop_cast_first in [true, false] {
+            let mut topics = BusTopics { kms: true, cast: true };
+            for step in 0..3 {
+                let value: serde_json::Value = serde_json::from_str(&topics.sync_json()).unwrap();
+                for role in ["pub", "sub"] {
+                    let names: Vec<&str> = value["dbs_msg_payload"][role].as_array().unwrap().iter()
+                        .map(|topic| topic["dbs_topic_name"].as_str().unwrap()).collect();
+                    assert_eq!(names.contains(&"Oplus_KeyMouseLink"), topics.kms);
+                    assert_eq!(names.contains(&"Oplus_Cast"), topics.cast);
+                    assert!(names.contains(&"Oplus_MacConnect"));
+                    assert_eq!(names.len(), 2 + usize::from(topics.kms) + usize::from(topics.cast));
+                }
+                match (step, stop_cast_first) {
+                    (0, true) | (1, false) => topics.cast = false,
+                    (0, false) | (1, true) => topics.kms = false,
+                    _ => {}
+                }
+            }
+        }
+    }
 
     /// Verbatim official offer (Windows 17.20.3, first successful connection).
     const OFFICIAL_OFFER: &str = "0100024f4146505f4d303030303030303030303030373935413144323633433039423241393633200d01001000000303fe04271002fffb05000a0b020d010e000000000000080759754b6f6e6741070b6d616e7566612d74657374060c70726f647563742d746573740a060c03";

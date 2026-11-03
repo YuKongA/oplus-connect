@@ -925,7 +925,7 @@ route block 形状；其中设备能力相关 topic 集合仍应按对端能力�
 
 ## 9. 通知、文件、投屏
 
-当前 Rust 客户端只实现通知同步；文件与投屏保留协议结论，界面入口尚未提供。
+通知同步已实现；投屏已接入认证信令、GUI 启停、H.264 WebRTC 接收和 VA 硬解，解码帧由 GPUI 投屏窗口绘制（窗口比例取自手机实际分辨率），手机真机出画已验证。文件数据面与对应界面入口仍未提供。
 
 ### 9.1 通知
 
@@ -962,7 +962,271 @@ Windows 后端使用 `winrt-toast-reborn`（稳定 tag/group 更新、toast hist
 - ODMF/ODMF key 与 DBS 的 KSC 不同
 - 媒体走 UDP，部分封装在 Wintun IP-in-IP 隧道
 
-投屏不属于当前 Rust 实现；后续接入官方投屏链路时按上述协议继续。
+Rust `cast/` 提供显式启动、ODMF 认证与加密信令收发；GUI 的 `cast_session.rs` 和 `cast_media.rs` 提供 H.264/H.265 视频接收、GPUI 投屏窗口、Opus 音频播放与键鼠反控。中文输入暂不支持。
+
+2026-11-03 补充（证据见 `analysis/cast-kms-20261102/` 与 `analysis/scp-log-recovery-20261102/`）：
+
+- 7236/7239 的 ODMF 信令是 WebRTC SDP/ICE 的载体。`0x01` 帧格式为
+  `0x01 + 13B AAD(ASCII 时间戳) + 12B IV + AES-256-GCM 密文 + 16B tag`；
+  32B OdmfKey 可从 `phoneCast.dmp`（0x0bd2b1fe）提取，7236 与 7239 共用。
+- 手机投屏：PC 为 offerer、手机 answerer；完整 offer/answer、ICE ufrag/pwd、
+  DTLS SHA-256 指纹、`OdmfDataChannel`(id=1)、`sctp-port:5000` 已还原。
+  官方日志打印的反控前缀为 24B，不能据此认定完整线上帧只有 24B。
+  当前触摸、按键和滚轮载荷及时间戳长度见下文；反控走 DTLS/SCTP。
+- ExpandCast：PC 为 offerer、平板 answerer；H.264 PT100
+  (`profile-level-id=42e01f;packetization-mode=1`) + RS-FEC(49)/RTX(101)，
+  `m=application`、`sctp-port:5000`。反向触控为 30B 消息
+  （6B 头 + 24B 事件体，type 0x10 TOUCH）走 DataChannel(sid=0)；
+  完整 offer/answer 在 `analysis/scp-log-recovery-20261102/expandcast-signaling/`。
+- KMS：`key = SHA-256(pwd)[:16]`，AES-128-GCM（无 AAD），24B 帧头 +
+  12B nonce + 密文 + 16B tag；平板是 TCP 客户端，PC 监听动态 `socket_port`；
+  输入事件使用 Windows VK。
+- 结论：协议证据已足够开始 Linux 实现；剩余主要是 WebRTC/媒体/输入/
+  虚拟显示工程，以及反控包装层、SCTP PPID、配对/信任行为的少量验证。
+
+#### 手机投屏启动与认证信令（2026-11-03）
+
+`cast/auth.rs`、`cast/mod.rs`、`cast/server.rs`、`cast/control.rs` 实现运行时
+身份生成、TCP 分帧与 GCM、双连接生命周期和私有 IPC。仅显式调用时启动，
+要求已有认证且确认完成的 Panta 数据通道，不自动发起投屏或反控。
+
+**认证证据闭环**：原始 `01-cast-mirror-wlan.pcapng` 的两条 TCP 连接均由 PC
+先发 `OdmfAuthRequest`；手机返回 `OdmfAuthResponse.auth_info`。从对应 dump
+中的 AuthInfo 布局取得 SharedKey 后，两条 AuthSuccess 均通过 GCM 验证，
+解出的 JSON 包含 base64 `id` 和 `key`；key 等于 AuthInfo 的传输密钥。
+用该 key 验证原始手机捕获的 34 条加密 JSON 信令全部成功。
+
+- `odmf.dll` 的 `VerifyClientIdentity`（VA `0x1802ee100`）将 P-256 ECDH
+  的原始 32 字节共享秘密直接用于 AES-256-GCM，**没有 SHA-256/HKDF**。
+- 手机证明的明文是预先通过 Panta 发布的身份 ID，**不是** TCP 请求中的
+  `msg` 数值；必须同时校验 GCM tag 和 ID。
+- PC 用共享秘密加密 `{"id":"base64身份","key":"base64传输密钥"}`，
+  放入 AuthSuccess。随后 `0x01` 信令使用分发的传输密钥。
+- 线上另有 2 字节大端长度前缀。PairRequest 加密，但捕获中的 PairSuccess、
+  ping/pong 是明文例外；认证后拒绝明文 SDP/ICE，不能将例外扩大成整体降级。
+
+Linux 实现每次启动生成新的 P-256 密钥、八位十进制身份和 32 字节传输密钥，
+不内嵌 dump 密钥或历史身份。AuthSuccess 与普通加密帧使用随机 nonce；
+AAD 使用当前 13 位毫秒时间戳。advertisement 的 `timestamp:"28703"` 是保留的
+近场协议参数，不是当前时间。新身份、随机 nonce 和动态端口已在本机与一加 15T
+的投屏会话中验证；其他设备仍需互通验收。
+
+Panta 追加 `Oplus_Cast` topic 后，先发送带实际监听地址、端口和新公钥的
+`rsp_odmf_key`，再发送 `pc_devicetype_supportodmf`、`send_image_quality`、
+`send_is_front_scene`。SDP 由 GUI 媒体引擎生成，daemon 只转发；
+不发送虚构的 KMS input_service 或统计信息。
+
+私有同用户 UDS 接口均为 POST JSON：
+
+| 路径 | 请求字段 | 行为 |
+| --- | --- | --- |
+| `/cast/start` | device_id | 绑定动态端口并完成 Panta 通告；返回不表示有画面 |
+| `/cast/status` | device_id | 返回 local_addr、status.state、connection_ids、last_error；未启动时地址/status 为 null |
+| `/cast/stop` | device_id | 关闭全部 TCP 连接/监听，发送 screen_cast_disconnect，撤销 cast topic |
+| `/cast/send` | device_id、connection_id、payload（JSON 对象） | 将内层信令封装为 cmd=send/msg=JSON 字符串，加密写入指定 TCP 连接 |
+| `/cast/receive` | device_id、connection_id、max（可选，1..32） | 非阻塞批量收取；返回 payloads，默认单条模式同时保留 payload |
+| `/cast/configure` | device_id、connection_id、width（1..4096）、fps（1..60） | 发送加密 customBroadcast / SET_PARAMETER，height=0 保持比例，rotatesWithContent/foldRotatesWithContent=true |
+
+接收结果的 payload 为 `{"kind":"signaling","payload":内层JSON}` 或
+`{"kind":"control","payload":完整ODMF对象}`；control 保留已观察到的
+customBroadcast / TimeSyncResult，不代表本实现执行了对应服务。
+后端传输状态为 listening/authenticating/signaling_ready/closed；GUI 根据实际解码帧另行显示媒体状态，不能把传输就绪当作出画。
+只有完成认证和 PairRequest 的连接才取得可用于发送/接收的 connection_id。
+每次 TCP 重连 token 改变，旧请求不跨连接重放；最多两条连接（官方视频/音频链路），
+每条收发队列上限64，容纳多网卡桌面的一次 ICE 候选突发；溢出明确关闭该连接，消息不无限积压。握手10秒、写入5秒、
+空闲90秒限时。并发写入保留正在读取的半帧；取消、Stop、Panta EOF 均清理连接。
+
+KMS 和 cast 的 topic 集合统一由 Panta 维护：停止其中一个不会撤销另一个。
+已实际运行私有临时 UDS + loopback TCP + 真实 Panta 认证的 smoke，独立 Python
+P-256/AES-GCM 对端验证双连接认证、双向加密信令、控制消息、明文心跳、错误身份
+拒绝、重连旧 token 拒绝、启动公钥轮换、两种停止顺序的 topic 保留、Stop/EOF
+关闭连接及端口。这些为信令层验证；当天手机视频、音频和输入验收见下一节。
+
+#### 投屏：视频、音频与反控（2026-11-03）
+
+GUI 已连接设备卡片提供“开始投屏／停止投屏”。桌面进程负责媒体管线，daemon
+只传认证及信令，**不通过 JSON IPC 传视频帧**。启动前检查 GStreamer WebRTC、
+libnice、DTLS/SRTP/SCTP、VA 解码与 `appsink`，缺失时报错，不静默退回软件解码；
+音频与 H.265 的元素只在对应开关启用时检查。构建最低 GStreamer 1.24；
+本机实测 1.28.7/core、1.28.6/plugins-bad 和 RX 9070 XT。
+
+每条认证 TCP token 对应独立 WebRTC peer，手机用两条：视频总线与音频总线。
+GUI 先发送 `pc_codec`（H264/H265）和 SET_PARAMETER（请求 width=1080、fps=60、
+height=0），再转发实际生成的 offer/ICE。请求值不等于实际画面参数，窗口尺寸来自
+解码 CAPS。
+
+**offer 形状**（两条连接相同）：`m=video recvonly`（H.264 PT 100 或 H.265 PT 35）、
+`m=audio recvonly`（Opus PT 111）、`m=application`（OdmfDataChannel）。
+手机按连接分别作答：视频总线回 `video sendonly`、`audio inactive`；音频总线回
+`video inactive`、`audio sendonly`。BUNDLE 顺序与 mid（`video0`/`audio1`/`application2`）
+保持 webrtcbin 生成值。
+
+**媒体路径**（进程内，无独立输出窗口）：
+`webrtcbin → rtph264depay/rtph265depay → h264parse/h265parse → vah264dec/vah265dec
+→ vapostproc（显存内缩放）→ capsfilter → appsink`，帧以 BGRA 交给 GPUI 投屏窗口，
+用应用自己的标题栏绘制。音频：`rtpopusdepay → opusdec → audioconvert → audioresample
+→ autoaudiosink`。抖动缓冲初始 30 ms；丢包请求关键帧并等待恢复。
+
+**窗口与尺寸**：投屏窗口是普通 GPUI 窗口，尺寸 = 视频区（长边上限 1560，按手机
+实际分辨率等比换算）+ 标题栏高度；旋转或分辨率变化时重新计算 capsfilter 并
+`resize` 窗口。关闭窗口等同于停止投屏（`on_window_closed` 在下一轮 effect 里处理，
+避免重入更新 `RootView`）。具体数值：720×1560 是示例手机的实际结果，不再是常量。
+
+**反控（UIBC over DataChannel）**：触摸载荷 34 字节、按键载荷 24 字节、滚轮载荷
+31 字节，发送时均追加 8 字节大端毫秒时间戳，线上长度分别为 42/32/39 字节。
+手机原生层移除时间戳后交给 Java 解析器；载荷以 `81 03 01 07` 开头，
+eventType 为 2（触摸）、0（按键）、3（滚轮）。触摸坐标空间与显示帧尺寸一致，
+尾部携带 `width u16/height u16/deviceId u32`，手机再映射到实际屏幕。
+已实现：左键点击/拖拽、悬停（`ACTION_HOVER_MOVE`）、滚轮（累积预算、每 16 ms
+发 1 单位，避免"一格跳到底"）、键盘（Android keycode + meta，组合键会先补发
+Ctrl/Shift/Alt 的按下事件）。节流规则：`MOVE`/`HOVER` 位置未变或 <16 ms 丢弃，
+`DOWN`/`UP` 不参与移动节流。曾用松手后 250 ms 的悬停间隔调整手感；
+页面卡在拖动中间的已定位原因是 `UP` 被节流丢弃，不能据此认定悬停会取消惯性。
+右键不提供长按替代行为；现有证据不足以确认原生右键协议。
+
+**关键约束（实测确认）**：
+- 本机音频在补齐 `a=rtpmap:111 opus/48000/2`、
+  `a=fmtp:111 minptime=10;sr=48000;stereo=1;useinbandfec=0` 和官方 extmap 1–6 后出声。
+  第 4 条为 `odmf-audio-timing`；未逐项隔离验证，不能断言每条都是必要条件。
+- H.264 使用 **PT 100、profile-level-id=42e01f、packetization-mode=1、
+  level-asymmetry-allowed=1**；H.265 使用 **PT 35、profile-id=1、level-id=120、
+  tier-flag=0、tx-mode=SRST**，并声明 nack/nack pli/ccm fir/transport-cc。
+- 保留 webrtcbin 生成的 `a=mid`，**不要**改写成数字：`set-local-description` 按 mid
+  匹配 transceiver，改写会报“mid 0 not found”。
+- 每个 ICE candidate 的内层 JSON 必须带 `id`（= 该 m-line 的实际 mid）和 `label`（= 索引）。
+  手机 `OdmfSignalingClient` 缺 `id` 会抛 `JSONException: No value for id` 并丢弃该帧。
+- **offer 必须先入队**。`set-local-description` 期间就开始产生候选，若不缓冲，
+  候选会排在 offer 前面；会话按条发送时 offer 要等数十条候选才轮到，
+  手机 17 秒超时后自行结束（`MEDIA_FAILED` / `Source Release`）。
+- 时间同步回包字段必须是 `{"client_request_time":…,"server_response_time":…}`；
+  回显请求或改字段名会让手机算出 epoch 级 offset。
+- SCTP 与 DTLS 错误必须按实际失败路径处理，不能根据元素名称一概忽略；
+  DTLS 也承载媒体的安全协商。音频 peer 缺少 application 段并非已证实结论。
+- `connect_local` 回调有创建线程限制；从 GStreamer 工作线程触发会触发 glib
+  线程守卫并导致进程 abort。跨线程回调需满足线程安全约束，输入发送集中在管线线程。
+
+**启动时延**：一次真机会话从 start 请求到解码链建立约 0.74 秒，此前约 11 秒。
+Panta 主循环直接等待各控制器的命令队列，避免跨设备共享唤醒和空闲读超时造成延迟。
+该指标不是首帧实际呈现时间，也不是端到端显示延迟；不可将解码帧计数当作上屏帧率。
+
+**设置页**「投屏」分组：键盘与鼠标、音频两个开关（默认启用，键鼠即时生效、音频下次
+投屏生效），编码方式用 `Select` 选择 H.264/H.265（默认 H.265）。设置持久化到
+`oppo-connect/cast-settings.json`。
+
+音频与编码偏好在会话启动时快照，重连 peer 沿用同一配置。输入只路由到实际出画且
+数据通道就绪的 peer；停用输入、失焦或关闭窗口会释放按键和触摸。队列有界，
+输入过载/传输失效会终止会话，避免静默丢失抬起事件。设置通过临时文件原子替换保存。
+
+**已知限制**：中文输入尚未实现，需要进一步验证 IME 提交文本与手机输入通道的对接；
+不能将“没有已接入的文本路径”归因为 GPUI 无 IME 能力。右键未实现；
+端到端延迟与长时间稳定性未测量。
+
+#### KMS Rust 协议层（2026-11-03）
+
+`oplus-connect-daemon/src/kms/mod.rs` 实现编解码与异步 TCP 分帧读取；
+`kms/server.rs`、`kms/control.rs` 已接入显式 IPC 启停、动态监听和 Panta 通告。
+`kms/input.rs` 提供显式输入事件发送；尚未捕获全局键鼠，也未提供 GUI 开关。
+
+24 字节帧头精确布局如下（多字节整数均为大端）：
+
+| 偏移 | 长度 | 字段 |
+| --- | --- | --- |
+| 0 | 2 | magic `ab 12` |
+| 2 | 1 | version `01` |
+| 3 | 1 | event type；未知值保留，由业务层分派 |
+| 4 | 2 | 加密标志：0 明文、1 AES-GCM |
+| 6 | 4 | wire body 长度；加密时包含 nonce 和 tag |
+| 10 | 6 | 48-bit sequence |
+| 16 | 8 | 毫秒时间戳 |
+
+`Codec::new(password, max_body_len)` 派生密钥并限制 wire body 长度；
+`encode` 写入调用方复用的 buffer，每个加密帧生成新随机 nonce；
+`decode` 原地解密并返回借用的明文；`read` 接收 TCP 分片/粘包，帧间 EOF 返回
+`None`，帧中 EOF 返回错误。解析/认证失败或读取中途取消后应关闭连接，不能扫描
+magic 尝试恢复。序号分配、超时、设备身份校验和连接生命周期由上层负责。
+
+官方协议使用空 AAD，**帧头未被 GCM 认证**；body 认证成功不能证明发送者身份
+或帧头未被篡改。长度限制在 body 分配前检查；认证失败不返回明文，并清除 payload。
+
+实测：对 `03-kms-tablet-wlan.pcapng` 的 TCP 59705 会话按序号重组、核对重传重叠
+字节后，Rust 成功解码 3,775 帧，其中 3,165 帧通过 GCM 认证；重新编码的全部
+3,775 帧再由独立 Python AESGCM 实现认证/解码并核对正文、类型、序号和时间戳。
+其中 3,747 帧与官方事件日志逐条一致，额外 28 帧为 PC 发出的心跳请求/响应。
+此计数不同于 Windows 汇总中的 3,172 加密帧，统计差异尚未归因。
+
+6 项永久回归测试覆盖独立密码学向量、nonce/密文/tag 篡改、错误密码、长度/标志/
+版本校验、48-bit 序号边界、TCP 分片/粘包和截断 EOF。不提交抓包密码或进程 dump
+中的密钥。离线验证不等同于 Linux 与平板真机互通。
+
+#### KMS 连接控制与 IPC
+
+通过现有私有 UDS HTTP 接口调用，均为 POST，JSON body：
+
+| 路径 | 请求 |
+| --- | --- |
+| `/kms/start` | `{"device_id":"设备 PDID","width":3840,"height":2160,"direction":1}` |
+| `/kms/status` | `{"device_id":"设备 PDID"}` |
+| `/kms/stop` | `{"device_id":"设备 PDID"}` |
+
+尺寸范围为 1..16384；当前只接受已抓到的 direction=1。无已认证数据通道、重复
+启动或会话未就绪时返回错误，不自动开启。Start 成功表示 listener 已绑定，且
+确认的 unite session 已发出追加 `Oplus_KeyMouseLink` 的 topic sync 和
+`kms_ability_sync/pc_device_info`，不表示平板已完成连接。响应只含设备、地址和
+状态，不含 randomPwd/testData。状态为 listening/handshaking/connected/closed；
+没有运行的 KMS 服务时 status/local_addr 为 null。
+
+服务绑定 Panta 连接的具体本地地址和动态端口，只接受同一 peer IP；INFO_SYNC
+要求 deviceid 一致且 supportEncrypt=1。设备 ID 是明文一致性检查，**不是密码学
+身份认证**。完成 resolution 后发送加密 arrange/resolution；心跳 type4/5 为
+明文、sequence=0，type100 接受 alive。入站 type2 指针消息仅保留最新快照，
+不触发本机输入。握手限时10秒、空闲90秒、心跳间隔30秒、写入限时5秒；这些是
+本实现的保守超时策略，不是已定案的官方常量。心跳 tick 不取消正在读取的半帧。
+
+每个设备只有一个 Panta 控制 owner；有界队列串行处理启停，Start 等通告写完才
+回复，取消的请求不会遗留服务。Stop 关闭 listener/连接并恢复原 topic 列表；
+Panta EOF/任务取消会销毁 owner 和 KMS 服务。不虚构未确认的远端停止 opcode。
+
+本轮在私有临时 UDS 与 loopback TCP 上跑了真实 Panta 认证/确认/加密 HELLO，
+验证离线启动拒绝、端口通告及 testData、独立 Python 解密 arrange/resolution、
+心跳 echo、重复启动拒绝、停止后的 EOF/端口关闭/topic 撤销、重启密码轮换和
+Panta EOF 清理。此验证未连接真机，不能替代平板互通验收。
+
+#### KMS 显式输入与释放
+
+先调用 `/kms/status`，仅在 connected 状态下读取非空 `connection_id`。
+它标识一次成功的 KMS TCP 握手，不是 Panta session ID；每次重连或重启都改变。
+POST `/kms/input` 请求：
+
+```json
+{"device_id":"设备 PDID","connection_id":1,"event":{"kind":"key","key_code":79,"modifier":0,"pressed":true}}
+```
+
+`event` 支持以下协议原生字段；不自动转换 Linux evdev/XKB 键码：
+
+| kind | 字段 | 外层 event type / body type |
+| --- | --- | --- |
+| move | delta_x、delta_y（i32） | 3 / 0 |
+| key | key_code（非零 Windows VK u8）、modifier（u32）、pressed | 3 / 3 |
+| button | button_type（抓包值0/1）、pressed | 3 / 1 |
+| scroll | delta_x、delta_y（i32） | 3 / 5 |
+| enter | pct_x、pct_y（有限浮点数，边缘穿越允许超过1） | 2 / 6 |
+
+所有输入使用 platform=2 并加密发送。button 的 clickCount=0；scroll 的
+isContinuous=false、momentumPhase/scrollPhase=-1；enter 的 left_key=0。
+这些是已抓到的离散鼠标模式，不声称支持触控板惯性滚动或额外鼠标按钮。
+
+POST `/kms/release` 使用 `{"device_id":"设备 PDID","connection_id":1}`，
+为成功发出的、仍按下的键和按钮补发释放事件。重复 key-down 仅保留一份按下状态。
+正常 Stop 也会尝试释放后关闭；掉线、进程退出/强制取消或写入失败时**不能保证远端
+收到 key-up**，只清除本地状态并关闭连接，绝不在新连接补发旧输入。
+
+输入经过有界队列，成功响应表示实际写入完成，不表示平板已经应用。旧 connection_id、
+未连接、队列满或写失败返回错误；重连前残留输入被拒绝。输入发送和心跳不会取消
+正在读取的半帧。按下状态采用固定大小存储，不记录输入历史。
+
+隔离 smoke 已覆盖：真实 IPC 发送后由独立 Python GCM 解码 move/enter/scroll/
+key/button、显式 release 的 key-up/button-up、Stop 的 key-up 后 EOF，以及 Stop/
+Start、KMS TCP 重连后旧连接标识拒绝。未进行平板真机输入验收。
 
 ---
 

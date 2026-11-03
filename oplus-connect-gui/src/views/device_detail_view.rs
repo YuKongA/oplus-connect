@@ -170,39 +170,56 @@ impl DeviceDetailView {
 
         if is_connected {
             let device_id = device.device_id.clone();
-            card = card.child(
+            let casting = state.cast.device_id == device.device_id && state.cast.active();
+            let cast_label = if casting {
+                match state.cast.phase {
+                    CastPhase::Stopping => "停止中…",
+                    CastPhase::Displaying => "停止投屏",
+                    _ => "投屏启动中",
+                }
+            } else {
+                "开始投屏"
+            };
+            let cast_id = device_id.clone();
+            let mut actions = div().flex().items_center().gap(px(8.0));
+            actions = actions.child(
+                Button::new(("btn-cast", index))
+                    .primary()
+                    .disabled((state.cast.active() && !casting) || state.cast.phase == CastPhase::Stopping)
+                    .label(cast_label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.state.cast.active() {
+                            this.stop_cast(cx);
+                        } else {
+                            this.start_cast(cast_id.clone(), cx);
+                        }
+                        cx.notify();
+                    })),
+            );
+            actions = actions.child(
                 Button::new(("btn-disconnect", index))
                     .secondary()
                     .label("断开")
-                    .on_click(cx.listener(move |_this, _, _, cx| {
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.state.cast.device_id == device_id { this.stop_cast(cx); }
                         let device_id = device_id.clone();
                         cx.spawn(async move |this, app| {
                             let client = DaemonClient::new();
-                            let result = app
-                                .background_executor()
-                                .spawn(async move { client.disconnect_device(&device_id).await })
-                                .await;
+                            let result = app.background_executor().spawn(async move { client.disconnect_device(&device_id).await }).await;
                             let _ = this.update(app, |view, cx| {
-                                if result.is_ok() {
-                                    view.state.set_toast("正在断开…");
-                                } else {
-                                    view.state.set_toast("断开失败");
-                                }
+                                view.state.set_toast(if result.is_ok() { "正在断开…" } else { "断开失败" });
                                 cx.notify();
                             });
-                        })
-                        .detach();
+                        }).detach();
                     })),
             );
+            card = card.child(actions);
         } else {
             card = card.child(Self::render_disconnected_actions(device, state, cx, index));
         }
 
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(16.0))
-            .child(card)
+        let result = div().flex().flex_col().gap(px(8.0)).child(card);
+        result
     }
 
     fn render_disconnected_actions(

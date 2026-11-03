@@ -53,6 +53,50 @@ pub fn save_known_devices(devices: &[DeviceInfo]) {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CastSettings {
+    #[serde(default = "default_true")]
+    audio: bool,
+    #[serde(default = "default_true")]
+    input: bool,
+    #[serde(default = "default_true")]
+    h265: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn cast_settings_path() -> PathBuf {
+    oplus_connect_daemon::net_utils::config_dir()
+        .join("oppo-connect")
+        .join("cast-settings.json")
+}
+
+/// Defaults stay enabled when the file is missing or unreadable.
+pub fn load_cast_settings() -> (bool, bool, bool) {
+    match fs::read(cast_settings_path()) {
+        Ok(bytes) => match serde_json::from_slice::<CastSettings>(&bytes) {
+            Ok(settings) => (settings.audio, settings.input, settings.h265),
+            Err(error) => {
+                tracing::warn!("Cannot parse cast settings: {}", error);
+                (true, true, true)
+            }
+        },
+        Err(_) => (true, true, true),
+    }
+}
+
+pub fn save_cast_settings(audio: bool, input: bool, h265: bool) {
+    let settings = CastSettings { audio, input, h265 };
+    let result = serde_json::to_vec_pretty(&settings)
+        .map_err(io::Error::other)
+        .and_then(|bytes| save_bytes(&cast_settings_path(), &bytes));
+    if let Err(error) = result {
+        tracing::warn!("Cannot persist cast settings: {}", error);
+    }
+}
+
 fn normalize(devices: &mut [DeviceInfo]) {
     for device in devices {
         device.is_connected = false;
@@ -104,10 +148,10 @@ fn save_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    let temp = path.with_extension("json.tmp");
-    {
+    let temp = path.with_extension(format!("json.{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
         let mut options = OpenOptions::new();
-        options.write(true).create(true).truncate(true);
+        options.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -116,8 +160,16 @@ fn save_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let mut file = options.open(&temp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
+        fs::rename(&temp, path)?;
+        if let Some(dir) = path.parent() {
+            fs::File::open(dir)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
     }
-    fs::rename(&temp, path)
+    result
 }
 
 #[cfg(test)]
@@ -132,6 +184,26 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    #[test]
+    fn partial_cast_settings_preserve_enabled_defaults() {
+        let settings: CastSettings = serde_json::from_str(r#"{"audio":false}"#).unwrap();
+        assert!(!settings.audio);
+        assert!(settings.input);
+        assert!(settings.h265);
+        let settings: CastSettings = serde_json::from_str("{}").unwrap();
+        assert!(settings.audio && settings.input && settings.h265);
+    }
+
+    #[test]
+    fn cast_settings_atomically_replace_previous_values() {
+        let path = temp_path();
+        save_bytes(&path, br#"{"audio":true,"input":true,"h265":true}"#).unwrap();
+        save_bytes(&path, br#"{"audio":false,"input":false,"h265":false}"#).unwrap();
+        let settings: CastSettings = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(!settings.audio && !settings.input && !settings.h265);
+        let _ = fs::remove_file(path);
     }
 
     fn device(id: &str, name: &str) -> DeviceInfo {

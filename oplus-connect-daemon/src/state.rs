@@ -1,7 +1,20 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 use tokio::sync::{RwLock, broadcast};
+use crate::kms::control::KmsRegistry;
+use crate::cast::control::CastRegistry;
+
+static NEXT_LIFECYCLE_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+fn next_lifecycle_token() -> u64 {
+    loop {
+        let token = NEXT_LIFECYCLE_TOKEN.fetch_add(1, Ordering::Relaxed);
+        if token != 0 {
+            return token;
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceInfo {
@@ -48,11 +61,11 @@ pub struct AppState {
     // Authenticated data channels per device id. The SCP handshake socket is
     // closed by the phone right after SyncSecure, so only these channels prove
     // the connection is still alive.
-    device_sessions: Arc<RwLock<HashMap<String, usize>>>,
-    disconnect_requests: Arc<RwLock<HashSet<String>>>,
-    // Removal generation per device, armed when the SCP socket closes and
-    // cancelled when an authenticated data channel attaches.
+    device_sessions: Arc<RwLock<HashMap<String, HashSet<u64>>>>,
+    disconnect_requests: Arc<RwLock<HashSet<u64>>>,
     pending_removals: Arc<RwLock<HashMap<String, u64>>>,
+    pub kms: Arc<KmsRegistry>,
+    pub cast: Arc<CastRegistry>,
 }
 
 impl AppState {
@@ -69,6 +82,8 @@ impl AppState {
             device_sessions: Arc::new(RwLock::new(HashMap::new())),
             disconnect_requests: Arc::new(RwLock::new(HashSet::new())),
             pending_removals: Arc::new(RwLock::new(HashMap::new())),
+            kms: Arc::new(KmsRegistry::new()),
+            cast: Arc::new(CastRegistry::new()),
         }
     }
 
@@ -111,12 +126,13 @@ impl AppState {
     /// pending removal scheduled when the SCP handshake socket closed.
     /// Device ids are case-insensitive across SCP (`SyncSecure`) and panta
     /// (`AUTH_REQUEST`), so keys are normalized before every lookup.
-    pub async fn attach_data_session(&self, device_id: &str) {
+    pub async fn attach_data_session(&self, device_id: &str) -> u64 {
         let device_id = device_id.to_ascii_uppercase();
+        let token = next_lifecycle_token();
         let mut sessions = self.device_sessions.write().await;
-        *sessions.entry(device_id.clone()).or_insert(0) += 1;
-        drop(sessions);
+        sessions.entry(device_id.clone()).or_default().insert(token);
         self.pending_removals.write().await.remove(&device_id);
+        token
     }
 
     /// Drops one authenticated data channel for `device_id`. The device is only
@@ -124,43 +140,36 @@ impl AppState {
     /// closes the SCP handshake socket right after `SyncSecure`, while clipboard
     /// and notifications keep flowing over the data channel.
     /// Returns true when the device was removed.
-    pub async fn detach_data_session(&self, device_id: &str) -> bool {
+    pub async fn detach_data_session(&self, device_id: &str, token: u64) -> bool {
         let device_id = device_id.to_ascii_uppercase();
-        let last_session = {
-            let mut sessions = self.device_sessions.write().await;
-            match sessions.get_mut(&device_id) {
-                Some(count) => {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        sessions.remove(&device_id);
-                        true
-                    } else {
-                        false
-                    }
-                }
-                None => true,
-            }
+        let mut sessions = self.device_sessions.write().await;
+        let Some(tokens) = sessions.get_mut(&device_id) else {
+            return false;
         };
-        if !last_session {
+        if !tokens.remove(&token) {
             return false;
         }
+        self.disconnect_requests.write().await.remove(&token);
+        if !tokens.is_empty() {
+            return false;
+        }
+        sessions.remove(&device_id);
+        // Serialize removal with new attachments so an old close cannot remove
+        // the replacement session's device.
         self.finish_disconnect(&device_id).await
     }
 
-    /// Asks the active panta session to close; the normal detach path removes
-    /// the device and broadcasts `disconnect_callback`.
+    /// Closes every data session active at the time of the request, not a later
+    /// reconnect. The last detach removes the device and broadcasts its removal.
     pub async fn request_disconnect(&self, device_id: &str) {
-        self.disconnect_requests
-            .write()
-            .await
-            .insert(device_id.to_ascii_uppercase());
+        let sessions = self.device_sessions.read().await;
+        if let Some(tokens) = sessions.get(&device_id.to_ascii_uppercase()) {
+            self.disconnect_requests.write().await.extend(tokens);
+        }
     }
 
-    pub async fn take_disconnect_request(&self, device_id: &str) -> bool {
-        self.disconnect_requests
-            .write()
-            .await
-            .remove(&device_id.to_ascii_uppercase())
+    pub async fn take_disconnect_request(&self, token: u64) -> bool {
+        self.disconnect_requests.write().await.remove(&token)
     }
 
     /// Schedules removal after the SCP handshake socket closes. The data channel
@@ -172,35 +181,27 @@ impl AppState {
         delay: std::time::Duration,
     ) {
         let device_id = device_id.to_ascii_uppercase();
-        if self.device_sessions.read().await.contains_key(&device_id) {
+        let sessions = self.device_sessions.read().await;
+        if sessions.contains_key(&device_id) {
             return;
         }
-        let generation = {
-            let mut pending = self.pending_removals.write().await;
-            let generation = pending.entry(device_id.clone()).or_insert(0);
-            *generation += 1;
-            *generation
-        };
+        let generation = next_lifecycle_token();
+        self.pending_removals.write().await.insert(device_id.clone(), generation);
+        drop(sessions);
         let state = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(delay).await;
-            let pending = state.pending_removals.read().await;
+            let sessions = state.device_sessions.read().await;
+            if sessions.contains_key(&device_id) {
+                return;
+            }
+            let mut pending = state.pending_removals.write().await;
             if pending.get(&device_id) != Some(&generation) {
                 return;
             }
+            pending.remove(&device_id);
             drop(pending);
-            if state.device_sessions.read().await.contains_key(&device_id) {
-                return;
-            }
-            if state
-                .pending_removals
-                .write()
-                .await
-                .remove(&device_id)
-                .is_some()
-            {
-                state.finish_disconnect(&device_id).await;
-            }
+            state.finish_disconnect(&device_id).await;
         });
     }
 
@@ -351,13 +352,13 @@ mod tests {
             .await;
 
         // Two control ports can serve the same device; closing one must keep it.
-        state.attach_data_session("3B161P013CM00000").await;
-        state.attach_data_session("3B161P013CM00000").await;
-        assert!(!state.detach_data_session("3B161P013CM00000").await);
+        let first = state.attach_data_session("3B161P013CM00000").await;
+        let second = state.attach_data_session("3B161P013CM00000").await;
+        assert!(!state.detach_data_session("3B161P013CM00000", first).await);
         assert!(state.devices.read().await.contains_key("3B161P013CM00000"));
 
         // The last close is the phone-side disconnect.
-        assert!(state.detach_data_session("3B161P013CM00000").await);
+        assert!(state.detach_data_session("3B161P013CM00000", second).await);
         assert!(state.devices.read().await.is_empty());
         assert!(state.active_device_id.read().await.is_none());
 
@@ -397,12 +398,12 @@ mod tests {
 
         // The data channel authenticates and keeps the device connected.
         // panta reports the id in lowercase while SCP uses uppercase.
-        state.attach_data_session("c77c702ec021").await;
+        let token = state.attach_data_session("c77c702ec021").await;
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         assert!(state.devices.read().await.contains_key("C77C702EC021"));
 
         // Only the data channel ending disconnects the device.
-        assert!(state.detach_data_session("c77c702ec021").await);
+        assert!(state.detach_data_session("c77c702ec021", token).await);
         assert!(state.devices.read().await.is_empty());
     }
 

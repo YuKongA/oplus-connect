@@ -23,6 +23,7 @@ use std::sync::LazyLock;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 enum PeerCommand {
@@ -36,6 +37,21 @@ struct PeerSession {
     tx: mpsc::Sender<PeerCommand>,
     approval_deadline: Option<tokio::time::Instant>,
     decision_made: bool,
+}
+
+struct PeerLease(Option<(String, String)>);
+
+impl Drop for PeerLease {
+    fn drop(&mut self) {
+        if let Some((peer_ip, connection_id)) = self.0.take() {
+            tokio::spawn(async move {
+                let mut active = peers().lock().await;
+                if active.get(&peer_ip).is_some_and(|peer| peer.connection_id == connection_id) {
+                    active.remove(&peer_ip);
+                }
+            });
+        }
+    }
 }
 
 const APPROVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
@@ -167,8 +183,13 @@ pub async fn serve_port_probe(listener: TcpListener, state: crate::state::AppSta
     let port = addr.port();
     info!("probe: listening on {} (SCP control port)", addr);
 
+    let mut connections = JoinSet::new();
     loop {
-        let (sock, peer) = match listener.accept().await {
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
+            Some(_) = connections.join_next(), if !connections.is_empty() => continue,
+        };
+        let (sock, peer) = match accepted {
             Ok(v) => v,
             Err(e) => {
                 warn!("probe: accept error on {}: {}", addr, e);
@@ -176,7 +197,7 @@ pub async fn serve_port_probe(listener: TcpListener, state: crate::state::AppSta
             }
         };
         let state = state.clone();
-        tokio::spawn(serve_peer(sock, port, peer, state));
+        connections.spawn(serve_peer(sock, port, peer, state));
     }
 }
 /// Serve an already-bound data listener alongside its active SCP sessions.
@@ -188,8 +209,13 @@ pub async fn serve_data_listener_with_state(listener: TcpListener, state: crate:
     let addr = listener.local_addr().expect("bound data listener address");
     let port = addr.port();
     info!("data: listening on {} (data transport)", addr);
+    let mut connections = JoinSet::new();
     loop {
-        let (socket, peer) = match listener.accept().await {
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
+            Some(_) = connections.join_next(), if !connections.is_empty() => continue,
+        };
+        let (socket, peer) = match accepted {
             Ok(connection) => connection,
             Err(error) => {
                 warn!("data[{}]: accept error: {}", port, error);
@@ -201,6 +227,7 @@ pub async fn serve_data_listener_with_state(listener: TcpListener, state: crate:
             .lock()
             .await
             .get(&peer.ip().to_string())
+            .filter(|peer| !peer.tx.is_closed())
             .map(|peer| peer.tx.clone());
         if let Some(tx) = tx {
             if tx
@@ -219,7 +246,7 @@ pub async fn serve_data_listener_with_state(listener: TcpListener, state: crate:
             );
             let state_clone = state.clone();
             let lifecycle = state.clone();
-            tokio::spawn(async move {
+            connections.spawn(async move {
                 let broadcaster = std::sync::Arc::new(move |evt: &str| {
                     state_clone.broadcast_event(evt);
                 });
@@ -279,6 +306,7 @@ async fn serve_peer_with_policy(
             decision_made: false,
         },
     );
+    let mut lease = PeerLease(Some((peer_ip.clone(), connection_id.clone())));
 
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
     let mut chunk = [0u8; READ_CHUNK_LEN];
@@ -291,8 +319,10 @@ async fn serve_peer_with_policy(
     let mut approval_requested = false;
     let handshake_deadline = tokio::time::Instant::now() + APPROVAL_TIMEOUT;
     let mut read_deadline = tokio::time::Instant::now();
+    let mut data_connections = JoinSet::new();
     'connection: loop {
         tokio::select! {
+            Some(_) = data_connections.join_next(), if !data_connections.is_empty() => {}
             _ = tokio::time::sleep_until(handshake_deadline), if server_handshake.as_ref().and_then(|server| server.secure_channel()).is_none() => {
                 warn!("probe[{}]: handshake or approval timed out for {}", port, peer);
                 break;
@@ -322,7 +352,7 @@ async fn serve_peer_with_policy(
                     info!("probe[{}]: handing data connection from {} to the panta channel", port, data_peer);
                     let state_clone = state.clone();
                     let lifecycle = state.clone();
-                    tokio::spawn(async move {
+                    data_connections.spawn(async move {
                         let broadcaster = std::sync::Arc::new(move |evt: &str| {
                             state_clone.broadcast_event(evt);
                         });
@@ -440,6 +470,7 @@ async fn serve_peer_with_policy(
         active.remove(&peer_ip);
     }
     drop(active);
+    lease.0 = None;
     if approval_expired {
         let event = serde_json::json!({
             "event": "connect_request_expired",
@@ -459,6 +490,11 @@ async fn serve_peer_with_policy(
             .schedule_device_removal(&device_id, tokio::time::Duration::from_secs(3))
             .await;
     }
+    // SCP normally closes immediately after pairing. Its data channels must
+    // outlive that handshake, but remain owned by this listener's worker.
+    drop(sock);
+    drop(rx);
+    while data_connections.join_next().await.is_some() {}
 }
 
 async fn send_ukey2_server_init(
@@ -1538,6 +1574,57 @@ mod tests {
         assert_eq!(&payload, b"data");
         peers().lock().await.remove(&address.ip().to_string());
         task.abort();
+    }
+
+    async fn read_panta_offer(client: &mut TcpStream) {
+        let mut length = [0u8; 2];
+        client.read_exact(&mut length).await.unwrap();
+        let mut offer = vec![0u8; u16::from_be_bytes(length) as usize];
+        client.read_exact(&mut offer).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_data_listener_closes_direct_panta_connection() {
+        let _test_guard = PEER_TEST_LOCK.lock().await;
+        peers().lock().await.clear();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(serve_data_listener(listener));
+        let mut client = TcpStream::connect(address).await.unwrap();
+        timeout(Duration::from_secs(1), read_panta_offer(&mut client)).await.unwrap();
+        task.abort();
+        let _ = task.await;
+        let mut byte = [0u8; 1];
+        assert_eq!(timeout(Duration::from_secs(1), client.read(&mut byte)).await.unwrap().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn routed_data_survives_scp_close_but_not_listener_cancellation() {
+        let _test_guard = PEER_TEST_LOCK.lock().await;
+        peers().lock().await.clear();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(serve_port_probe(listener, crate::state::AppState::new()));
+        let control = TcpStream::connect(address).await.unwrap();
+        let peer_ip = address.ip().to_string();
+        timeout(Duration::from_secs(1), async {
+            while !has_peer(&peer_ip).await { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        let data_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut data = TcpStream::connect(data_listener.local_addr().unwrap()).await.unwrap();
+        let (socket, peer) = data_listener.accept().await.unwrap();
+        let tx = peers().lock().await.get(&peer_ip).unwrap().tx.clone();
+        tx.send(PeerCommand::DataConnection(socket, peer)).await.unwrap();
+        timeout(Duration::from_secs(1), read_panta_offer(&mut data)).await.unwrap();
+        drop(control);
+        timeout(Duration::from_secs(1), async {
+            while has_peer(&peer_ip).await { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        let mut byte = [0u8; 1];
+        assert!(timeout(Duration::from_millis(20), data.read(&mut byte)).await.is_err());
+        task.abort();
+        let _ = task.await;
+        assert_eq!(timeout(Duration::from_secs(1), data.read(&mut byte)).await.unwrap().unwrap(), 0);
     }
 
     #[tokio::test]

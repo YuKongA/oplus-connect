@@ -1,5 +1,7 @@
+pub mod cast;
 pub mod clipboard;
 pub mod discovery;
+pub mod kms;
 pub mod net_utils;
 pub mod panta;
 pub mod platform;
@@ -99,21 +101,24 @@ pub async fn start_daemon_service(
             None
         });
 
-        clipboard::ClipboardSync::new(state).start_sync();
+        servers.spawn(async move {
+            clipboard::ClipboardSync::new(state).run().await;
+            Ok(())
+        });
         info!("OPLUS CONNECT in-process daemon service initialized successfully.");
 
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         tokio::spawn(async move {
             let mut servers = servers;
             tokio::select! {
-                _ = &mut shutdown_rx => {
-                    servers.abort_all();
-                    let _ = announcer_worker.shutdown().await;
-                }
+                _ = &mut shutdown_rx => {}
                 Some(res) = servers.join_next() => {
                     tracing::warn!("In-process daemon server task exited: {:?}", res);
                 }
             }
+            servers.abort_all();
+            while servers.join_next().await.is_some() {}
+            let _ = announcer_worker.shutdown().await;
         });
 
         Ok(Some(DaemonHandle {

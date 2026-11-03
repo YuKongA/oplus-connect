@@ -1,9 +1,18 @@
-use crate::state::{DaemonStatus, DeviceInfo, RemoteDevicePayload};
+use crate::state::{CastIncoming, CastStatus, DaemonStatus, DeviceInfo, RemoteDevicePayload};
 use anyhow::{anyhow, Context, Result};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::Duration;
+
+#[derive(Debug)]
+pub struct CastRequestRejected(pub String);
+
+impl std::fmt::Display for CastRequestRejected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { formatter.write_str(&self.0) }
+}
+
+impl std::error::Error for CastRequestRejected {}
 
 #[derive(Clone)]
 pub struct DaemonClient {
@@ -175,14 +184,198 @@ impl DaemonClient {
     }
 
 
+    /// Start the authenticated cast bus. A successful response only means that
+    /// the daemon is listening; callers must wait for connection_ids and media
+    /// engine events before reporting a picture.
+    pub async fn cast_start(&self, device_id: &str) -> Result<CastStatus> {
+        let body = self
+            .cast_request(
+                "POST",
+                "/cast/start",
+                Some(&serde_json::json!({"device_id": device_id}).to_string()),
+            )
+            .await?;
+        parse_cast_status(&body)
+    }
+
+    pub async fn cast_status(&self, device_id: &str) -> Result<CastStatus> {
+        let body = self
+            .cast_request(
+                "POST",
+                "/cast/status",
+                Some(&serde_json::json!({"device_id": device_id}).to_string()),
+            )
+            .await?;
+        parse_cast_status(&body)
+    }
+
+    pub async fn cast_stop(&self, device_id: &str) -> Result<()> {
+        let body = self
+            .cast_request(
+                "POST",
+                "/cast/stop",
+                Some(&serde_json::json!({"device_id": device_id}).to_string()),
+            )
+            .await?;
+        ensure_ok(&body)
+    }
+
+    pub async fn cast_send(
+        &self,
+        device_id: &str,
+        connection_id: u64,
+        payload: &serde_json::Value,
+    ) -> Result<()> {
+        let body = self
+            .cast_request(
+                "POST",
+                "/cast/send",
+                Some(
+                    &serde_json::json!({
+                        "device_id": device_id,
+                        "connection_id": connection_id,
+                        "payload": payload,
+                    })
+                    .to_string(),
+                ),
+            )
+            .await?;
+        ensure_ok(&body)
+    }
+
+    /// Polls one bounded item from a cast connection. A null payload is a
+    /// normal no-message result and is not an error.
+    pub async fn cast_receive(
+        &self,
+        device_id: &str,
+        connection_id: u64,
+    ) -> Result<Option<CastIncoming>> {
+        Ok(self
+            .cast_receive_batch(device_id, connection_id, 1)
+            .await?
+            .into_iter()
+            .next())
+    }
+
+    /// Fetch up to `max` queued messages in one IPC round trip. A peer sends its
+    /// SDP answer beside dozens of ICE candidates, so one-per-call polling put
+    /// the answer seconds behind them.
+    pub async fn cast_receive_batch(
+        &self,
+        device_id: &str,
+        connection_id: u64,
+        max: usize,
+    ) -> Result<Vec<CastIncoming>> {
+        let body = self
+            .cast_request(
+                "POST",
+                "/cast/receive",
+                Some(
+                    &serde_json::json!({
+                        "device_id": device_id,
+                        "connection_id": connection_id,
+                        "max": max,
+                    })
+                    .to_string(),
+                ),
+            )
+            .await?;
+        let response: serde_json::Value = serde_json::from_str(&body)
+            .with_context(|| "invalid /cast/receive response")?;
+        if response.get("code").and_then(|v| v.as_i64()) != Some(0) {
+            return Err(anyhow!(
+                "{}",
+                response
+                    .get("msg")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("cast receive failed")
+            ));
+        }
+        let payloads = response
+            .get("data")
+            .and_then(|data| data.get("payloads"))
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default();
+        payloads
+            .into_iter()
+            .map(|payload| serde_json::from_value(payload).map_err(Into::into))
+            .collect()
+    }
+
+    pub async fn cast_configure(
+        &self,
+        device_id: &str,
+        connection_id: u64,
+        width: u32,
+        fps: u32,
+    ) -> Result<()> {
+        let body = self
+            .cast_request(
+                "POST",
+                "/cast/configure",
+                Some(
+                    &serde_json::json!({
+                        "device_id": device_id,
+                        "connection_id": connection_id,
+                        "width": width,
+                        "fps": fps,
+                    })
+                    .to_string(),
+                ),
+            )
+            .await?;
+        ensure_ok(&body)
+    }
+    // Cast workers run on TOKIO_RT. Unlike the legacy UI RPC adapter this
+    // socket is dropped on cancellation, and its deadline covers the daemon's
+    // 15-second command deadline without occupying a blocking worker.
+    async fn cast_request(&self, method: &str, path: &str, body: Option<&str>) -> Result<String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::time::timeout(Duration::from_secs(17), async {
+            let mut stream = tokio::net::UnixStream::connect(&self.socket_path).await?;
+            let body = body.unwrap_or("");
+            let request = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            stream.write_all(request.as_bytes()).await?;
+            let mut response = Vec::new();
+            stream.take(8 * 1024 * 1024 + 1).read_to_end(&mut response).await?;
+            if response.len() > 8 * 1024 * 1024 { return Err(anyhow!("cast IPC response is too large")); }
+            let response = String::from_utf8(response)?;
+            let (_, body) = response.split_once("\r\n\r\n").ok_or_else(|| anyhow!("invalid cast IPC response"))?;
+            // Cast endpoints must return a structured success, never treat a
+            // truncated or non-JSON response as a successful send or stop.
+            let value: serde_json::Value = serde_json::from_str(body)?;
+            let code = value["code"].as_i64().context("cast IPC response lacks a result code")?;
+            if code != 0 {
+                return Err(CastRequestRejected(value["msg"].as_str().unwrap_or("cast request rejected").to_owned()).into());
+            }
+            Ok(body.to_owned())
+        }).await.context("cast IPC request timed out")?
+    }
+}
+
+fn parse_cast_status(body: &str) -> Result<CastStatus> {
+    let response: serde_json::Value = serde_json::from_str(body)
+        .with_context(|| "invalid cast status response")?;
+    if response.get("code").and_then(|v| v.as_i64()) != Some(0) {
+        return Err(anyhow!(
+            "{}",
+            response
+                .get("msg")
+                .and_then(|v| v.as_str())
+                .unwrap_or("cast request failed")
+        ));
+    }
+    Ok(serde_json::from_value(
+        response.get("data").cloned().unwrap_or_default(),
+    )?)
 }
 
 /// IPC routes answer with `{"code":0,"msg":"success"}`; older ones used
 /// `status`. A successful request must not surface as a connection failure.
 fn ensure_ok(body: &str) -> Result<()> {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
-        return Ok(());
-    };
+    let value: serde_json::Value = serde_json::from_str(body)
+        .context("守护进程返回了无效的确认消息")?;
     let code = value
         .get("code")
         .or_else(|| value.get("status"))
@@ -207,6 +400,13 @@ mod tests {
     fn success_response_is_not_an_error() {
         assert!(ensure_ok(r#"{"code":0,"msg":"success"}"#).is_ok());
         assert!(ensure_ok(r#"{"status":0}"#).is_ok());
+    }
+
+    #[test]
+    fn malformed_or_missing_acknowledgements_are_not_success() {
+        for body in ["", "not json", "{}", r#"{"msg":"success"}"#] {
+            assert!(ensure_ok(body).is_err(), "accepted {body:?}");
+        }
     }
 
     #[test]

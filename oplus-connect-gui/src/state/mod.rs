@@ -111,6 +111,72 @@ pub struct RemoteDevicePayload {
     pub support_link_change: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CastStatus {
+    pub device_id: String,
+    pub local_addr: Option<std::net::SocketAddr>,
+    pub status: Option<CastSessionStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CastSessionStatus {
+    pub state: String,
+    #[serde(default)]
+    pub connection_ids: Vec<u64>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
+pub enum CastIncoming {
+    Signaling(serde_json::Value),
+    Control(serde_json::Value),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CastPhase {
+    Idle,
+    Probing,
+    Starting,
+    Waiting,
+    Negotiating,
+    Displaying,
+    Stopping,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CastViewState {
+    pub device_id: String,
+    pub generation: u64,
+    pub phase: CastPhase,
+    pub detail: String,
+}
+
+impl Default for CastViewState {
+    fn default() -> Self {
+        Self { device_id: String::new(), generation: 0, phase: CastPhase::Idle, detail: "尚未投屏".into() }
+    }
+}
+
+impl CastViewState {
+    pub fn active(&self) -> bool {
+        !matches!(self.phase, CastPhase::Idle | CastPhase::Failed)
+    }
+
+    pub fn accepts_frames(&self, generation: u64) -> bool {
+        self.generation == generation && self.active() && self.phase != CastPhase::Stopping
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CastEvent {
+    Phase(CastPhase),
+    Displaying { width: u32, height: u32 },
+    Error(String),
+    Closed,
+}
+
 #[derive(Debug)]
 pub enum AppEvent {
     DaemonPolled {
@@ -122,10 +188,12 @@ pub enum AppEvent {
     Toast(String),
     DaemonStartup(Result<(), String>),
     ConnectionRequestResolved,
+    CastChanged { generation: u64, event: CastEvent },
 }
 
 pub struct AppState {
     pub connected_device: Option<DeviceInfo>,
+    pub cast: CastViewState,
     // Devices seen so far, connected first; persisted beside ksc.bin.
     pub known_devices: Vec<DeviceInfo>,
     pub known_devices_dirty: bool,
@@ -147,6 +215,10 @@ pub struct AppState {
     pub search_query: String,
     pub clipboard_filter: ClipboardFilter,
     pub last_copied_id: Option<String>,
+    /// Mirrors the settings page; the cast session reads these.
+    pub cast_audio: bool,
+    pub cast_input: bool,
+    pub cast_h265: bool,
 }
 
 impl Default for AppState {
@@ -159,6 +231,7 @@ impl AppState {
     pub fn new() -> Self {
         Self {
             connected_device: None,
+            cast: CastViewState::default(),
             known_devices: Vec::new(),
             known_devices_dirty: false,
             clipboard_history: Vec::new(),
@@ -174,6 +247,9 @@ impl AppState {
             search_query: String::new(),
             clipboard_filter: ClipboardFilter::All,
             last_copied_id: None,
+            cast_audio: true,
+            cast_input: true,
+            cast_h265: true,
         }
     }
 
@@ -387,6 +463,22 @@ impl AppState {
                 }
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod cast_tests {
+    use super::{CastPhase, CastViewState};
+
+    #[test]
+    fn stopped_and_old_generations_cannot_reopen_the_cast_window() {
+        let mut state = CastViewState { generation: 7, phase: CastPhase::Negotiating, ..Default::default() };
+        assert!(state.accepts_frames(7));
+        assert!(!state.accepts_frames(6));
+        for phase in [CastPhase::Stopping, CastPhase::Idle, CastPhase::Failed] {
+            state.phase = phase;
+            assert!(!state.accepts_frames(7));
+        }
     }
 }
 

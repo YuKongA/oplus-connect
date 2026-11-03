@@ -16,13 +16,7 @@ impl ClipboardSync {
         }
     }
 
-    pub fn start_sync(self) {
-        tokio::spawn(async move {
-            self.sync_loop().await;
-        });
-    }
-
-    async fn sync_loop(mut self) {
+    pub async fn run(mut self) {
         info!("Starting Linux Wayland/X11 clipboard sync loop");
         loop {
             match tokio::task::spawn_blocking(clipboard::read_text).await {

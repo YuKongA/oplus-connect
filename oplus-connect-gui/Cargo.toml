@@ -15,7 +15,13 @@ uuid = { version = "1.10", features = ["v4"] }
 anyhow = "1.0"
 base64 = "0.22"
 oplus-connect-daemon = { path = "../oplus-connect-daemon" }
-
+gstreamer = { version = "0.24", features = ["v1_24"] }
+gstreamer-sdp = { version = "0.24", features = ["v1_24"] }
+gstreamer-webrtc = { version = "0.24", features = ["v1_24"] }
+gstreamer-app = { version = "0.24", features = ["v1_24"] }
+gstreamer-video = { version = "0.24", features = ["v1_24"] }
+image = "0.25"
+smallvec = "1"
 [profile.release]
 opt-level = "s"
 lto = "thin"

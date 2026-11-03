@@ -1,3 +1,4 @@
+pub mod cast_window;
 pub mod clipboard_view;
 pub mod confirm_modal;
 pub mod device_detail_view;
@@ -17,6 +18,11 @@ pub struct MainContainer;
 impl MainContainer {
     pub fn render(
         state: &AppState,
+        codec: Option<
+            &Entity<gpui_kit::component::select::SelectState<
+                gpui_kit::component::searchable_list::SearchableVec<&'static str>,
+            >>,
+        >,
         window: &mut Window,
         cx: &mut Context<crate::RootView>,
     ) -> impl IntoElement {
@@ -31,7 +37,7 @@ impl MainContainer {
                 device_detail_view::DeviceDetailView::render(state, window, cx).into_any_element()
             }
             NavTab::Settings => {
-                settings_view::SettingsView::render(state, window, cx).into_any_element()
+                settings_view::SettingsView::render(state, codec, window, cx).into_any_element()
             }
         };
 

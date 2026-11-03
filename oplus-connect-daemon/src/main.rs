@@ -79,7 +79,10 @@ async fn main() -> Result<(), Error> {
                 .find_map(|ip| ip.parse().ok())
         })
     });
-    ClipboardSync::new(state).start_sync();
+    servers.spawn(async move {
+        ClipboardSync::new(state).run().await;
+        Ok(())
+    });
     info!("OPLUS CONNECT daemon is ready and listening.");
 
     let result = tokio::select! {

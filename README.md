@@ -7,8 +7,17 @@ OPLUS 互联是面向 OPPO / OnePlus 设备的 Linux 原生客户端
 - 连接、管理设备
 - 剪贴板双向同步
 - 手机消息通知镜像
+- 手机投屏：视频、音频与键鼠反控
 
 ## 构建与运行
+
+需要 GStreamer 1.24+，以及 WebRTC/libnice、VA 硬解与音频输出插件。Debian/Ubuntu：
+
+```bash
+sudo apt install pkg-config libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+  libgstreamer-plugins-bad1.0-dev gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+  gstreamer1.0-nice gstreamer1.0-pipewire mesa-va-drivers
+```
 
 GUI 会自动启动内嵌 daemon，正常使用只需运行 GUI：
 
@@ -16,18 +25,9 @@ GUI 会自动启动内嵌 daemon，正常使用只需运行 GUI：
 cargo run --release --manifest-path oplus-connect-gui/Cargo.toml
 ```
 
-构建 release 二进制：
+单独调试后端：`cargo run --manifest-path oplus-connect-daemon/Cargo.toml`。
 
-```bash
-cargo build --release --manifest-path oplus-connect-gui/Cargo.toml
-./oplus-connect-gui/target/release/oplus-connect-gui
-```
-
-调试后端时，可单独运行 daemon：
-
-```bash
-cargo run --manifest-path oplus-connect-daemon/Cargo.toml
-```
+发布构建为动态链接，运行时依赖需由打包声明。
 
 ## 配置
 

@@ -1,3 +1,4 @@
+use crate::kms::input::InputEvent;
 use crate::ipc::protocol::{ApiResponse, ConnectionDecisionReq};
 use crate::ipc::runtime::{BoundSocket, RuntimeDir};
 use crate::state::AppState;
@@ -11,6 +12,63 @@ use tracing::{info, warn};
 #[derive(serde::Deserialize)]
 struct FileSendReq {
     filepath: String,
+}
+
+#[derive(serde::Deserialize)]
+struct KmsStartReq {
+    device_id: String,
+    width: u32,
+    height: u32,
+    direction: u8,
+}
+#[derive(serde::Deserialize)]
+struct KmsInputReq {
+    device_id: String,
+    connection_id: u64,
+    event: InputEvent,
+}
+
+#[derive(serde::Deserialize)]
+struct KmsReleaseReq {
+    device_id: String,
+    connection_id: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct KmsDeviceReq {
+    device_id: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CastDeviceReq {
+    device_id: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CastSendReq {
+    device_id: String,
+    connection_id: u64,
+    payload: serde_json::Value,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CastReceiveReq {
+    device_id: String,
+    connection_id: u64,
+    #[serde(default)]
+    max: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CastConfigureReq {
+    device_id: String,
+    connection_id: u64,
+    width: u32,
+    fps: u32,
 }
 
 #[derive(serde::Deserialize)]
@@ -436,6 +494,144 @@ async fn handle_client(
                 (400, serde_json::to_string(&response).unwrap())
             }
         },
+        ("POST", "/cast/start" | "/cast/status" | "/cast/stop") => {
+            let request = match serde_json::from_str::<CastDeviceReq>(body) {
+                Ok(request) if !request.device_id.trim().is_empty() => request,
+                _ => {
+                    let response = ApiResponse::error(400, "Malformed cast device request");
+                    return write_response(&mut stream, 400, &serde_json::to_string(&response)?).await;
+                }
+            };
+            let result = match path {
+                "/cast/start" => state.cast.start(&request.device_id).await.map(|info| serde_json::to_value(info).unwrap()),
+                "/cast/status" => state.cast.status(&request.device_id).await.map(|info| serde_json::to_value(info).unwrap()),
+                _ => state.cast.stop(&request.device_id).await.map(|()| serde_json::Value::Null),
+            };
+            match result {
+                Ok(info) => (200, serde_json::to_string(&ApiResponse::success(info)).unwrap()),
+                Err(message) => (409, serde_json::to_string(&ApiResponse::error(409, message)).unwrap()),
+            }
+        }
+        // Private same-user UDS signaling boundary: never exposed on a TCP HTTP listener.
+        ("POST", "/cast/send") => {
+            let request = match serde_json::from_str::<CastSendReq>(body) {
+                Ok(request) if !request.device_id.trim().is_empty() && request.connection_id != 0 => request,
+                _ => {
+                    let response = ApiResponse::error(400, "Malformed cast signaling request");
+                    return write_response(&mut stream, 400, &serde_json::to_string(&response)?).await;
+                }
+            };
+            match state.cast.send(&request.device_id, request.connection_id, request.payload).await {
+                Ok(()) => (200, serde_json::to_string(&ApiResponse::ok()).unwrap()),
+                Err(message) => (409, serde_json::to_string(&ApiResponse::error(409, message)).unwrap()),
+            }
+        }
+        ("POST", "/cast/configure") => {
+            let request = match serde_json::from_str::<CastConfigureReq>(body) {
+                Ok(request) if !request.device_id.trim().is_empty() && request.connection_id != 0
+                    && (1..=4096).contains(&request.width) && (1..=60).contains(&request.fps) => request,
+                _ => {
+                    let response = ApiResponse::error(400, "Malformed cast video configuration");
+                    return write_response(&mut stream, 400, &serde_json::to_string(&response)?).await;
+                }
+            };
+            match state.cast.configure_video(&request.device_id, request.connection_id, request.width, request.fps).await {
+                Ok(()) => (200, serde_json::to_string(&ApiResponse::ok()).unwrap()),
+                Err(message) => (409, serde_json::to_string(&ApiResponse::error(409, message)).unwrap()),
+            }
+        }
+        ("POST", "/cast/receive") => {
+            let request = match serde_json::from_str::<CastReceiveReq>(body) {
+                Ok(request) if !request.device_id.trim().is_empty() && request.connection_id != 0 => request,
+                _ => {
+                    let response = ApiResponse::error(400, "Malformed cast receive request");
+                    return write_response(&mut stream, 400, &serde_json::to_string(&response)?).await;
+                }
+            };
+            let max = request.max.unwrap_or(1).clamp(1, 32);
+            match state.cast.receive(&request.device_id, request.connection_id, max).await {
+                Ok(payloads) => {
+                    let first = payloads.first().cloned();
+                    let payloads: Vec<serde_json::Value> =
+                        payloads.into_iter().map(|value| serde_json::json!(value)).collect();
+                    (200, serde_json::to_string(&ApiResponse::success(serde_json::json!({
+                        "device_id":request.device_id.trim().to_ascii_uppercase(),
+                        "connection_id":request.connection_id,"payload":first,"payloads":payloads
+                    }))).unwrap())
+                }
+                Err(message) => (409, serde_json::to_string(&ApiResponse::error(409, message)).unwrap()),
+            }
+        }
+        ("POST", "/kms/start") => {
+            let request = match serde_json::from_str::<KmsStartReq>(body) {
+                Ok(request) => request,
+                Err(_) => {
+                    let response = ApiResponse::error(400, "Malformed KMS start request");
+                    return write_response(&mut stream, 400, &serde_json::to_string(&response)?).await;
+                }
+            };
+            let id = request.device_id.trim().to_ascii_uppercase();
+            match state.kms.start_for_device(&id, request.width, request.height, request.direction).await {
+                Ok(info) => (200, serde_json::to_string(&ApiResponse::success(info)).unwrap()),
+                Err(message) => (409, serde_json::to_string(&ApiResponse::error(409, message)).unwrap()),
+            }
+        }
+        ("POST", "/kms/stop") => {
+            let request = match serde_json::from_str::<KmsDeviceReq>(body) {
+                Ok(request) => request,
+                Err(_) => {
+                    let response = ApiResponse::error(400, "Malformed KMS stop request");
+                    return write_response(&mut stream, 400, &serde_json::to_string(&response)?).await;
+                }
+            };
+            match state.kms.stop(request.device_id.trim()).await {
+                Ok(()) => (200, serde_json::to_string(&ApiResponse::ok()).unwrap()),
+                Err(message) => (409, serde_json::to_string(&ApiResponse::error(409, message)).unwrap()),
+            }
+        }
+        ("POST", "/kms/status") => {
+            let request = match serde_json::from_str::<KmsDeviceReq>(body) {
+                Ok(request) => request,
+                Err(_) => {
+                    let response = ApiResponse::error(400, "Malformed KMS status request");
+                    return write_response(&mut stream, 400, &serde_json::to_string(&response)?).await;
+                }
+            };
+            match state.kms.status(request.device_id.trim()).await {
+                Ok(status) => (200, serde_json::to_string(&ApiResponse::success(status)).unwrap()),
+                Err(message) => (409, serde_json::to_string(&ApiResponse::error(409, message)).unwrap()),
+            }
+        }
+        ("POST", "/kms/input") => {
+            let request = match serde_json::from_str::<KmsInputReq>(body) {
+                Ok(request) => request,
+                Err(_) => {
+                    let response = ApiResponse::error(400, "Malformed KMS input request");
+                    return write_response(&mut stream, 400, &serde_json::to_string(&response)?).await;
+                }
+            };
+            if request.event.validate().is_err() {
+                let response = ApiResponse::error(400, "Invalid KMS input event");
+                return write_response(&mut stream, 400, &serde_json::to_string(&response)?).await;
+            }
+            match state.kms.send_input(&request.device_id, request.connection_id, request.event).await {
+                Ok(()) => (200, serde_json::to_string(&ApiResponse::ok()).unwrap()),
+                Err(message) => (409, serde_json::to_string(&ApiResponse::error(409, message)).unwrap()),
+            }
+        }
+        ("POST", "/kms/release") => {
+            let request = match serde_json::from_str::<KmsReleaseReq>(body) {
+                Ok(request) => request,
+                Err(_) => {
+                    let response = ApiResponse::error(400, "Malformed KMS release request");
+                    return write_response(&mut stream, 400, &serde_json::to_string(&response)?).await;
+                }
+            };
+            match state.kms.release_input(&request.device_id, request.connection_id).await {
+                Ok(()) => (200, serde_json::to_string(&ApiResponse::ok()).unwrap()),
+                Err(message) => (409, serde_json::to_string(&ApiResponse::error(409, message)).unwrap()),
+            }
+        }
         ("GET", "/devices") => {
             let mut devices: Vec<_> = state
                 .devices
@@ -809,6 +1005,28 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn cast_routes_require_explicit_device_and_live_connection() {
+        let rpc = RpcServer::start();
+        for (path, body, status) in [
+            ("/cast/start", r#"{}"#, 400),
+            ("/cast/status", r#"{"device_id":" "}"#, 400),
+            ("/cast/stop", r#"{"device_id":"phone"}"#, 409),
+            ("/cast/start", r#"{"device_id":"phone"}"#, 409),
+            ("/cast/status", r#"{"device_id":"phone"}"#, 409),
+            ("/cast/send", r#"{"device_id":"phone","payload":{}}"#, 400),
+            ("/cast/send", r#"{"device_id":"phone","connection_id":0,"payload":{}}"#, 400),
+            ("/cast/send", r#"{"device_id":"phone","connection_id":1,"payload":{}}"#, 409),
+            ("/cast/receive", r#"{"device_id":"phone"}"#, 400),
+            ("/cast/receive", r#"{"device_id":"phone","connection_id":1}"#, 409),
+        ] {
+            let response = rpc.request(format!(
+                "POST {path} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}", body.len()
+            ).as_bytes()).await;
+            assert_status(&response, status);
+        }
+    }
+
     #[test]
     fn parses_official_file_send_path_and_rejects_bad_percent_encoding() {
         let req =
@@ -1096,13 +1314,18 @@ mod tests {
                 last_seen: 1,
             })
             .await;
+        let first = rpc.state.attach_data_session("DEVICE-A").await;
+        let second = rpc.state.attach_data_session("DEVICE-A").await;
         let body = r#"{"device_id":"DEVICE-A"}"#;
         let request = format!(
             "POST /disconnect_device HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         );
         assert_status(&rpc.request(request.as_bytes()).await, 200);
-        assert!(rpc.state.take_disconnect_request("DEVICE-A").await);
+        assert!(rpc.state.take_disconnect_request(first).await);
+        assert!(rpc.state.take_disconnect_request(second).await);
+        let reconnected = rpc.state.attach_data_session("DEVICE-A").await;
+        assert!(!rpc.state.take_disconnect_request(reconnected).await);
 
         let body = r#"{"device_id":"DEVICE-MISSING"}"#;
         let request = format!(
