@@ -1,10 +1,10 @@
 use crate::models::*;
 use crate::state::AppState;
 use crate::theme::Theme;
-use gpui_kit::*;
 use gpui_kit::assets::IconName;
-use gpui_kit::component::Icon;
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::Icon;
+use gpui_kit::*;
 
 pub struct NotificationView;
 
@@ -25,7 +25,7 @@ impl NotificationView {
             .p(px(20.0))
             .gap(px(16.0))
             .overflow_hidden()
-                        .child(
+            .child(
                 div()
                     .flex()
                     .items_center()
@@ -68,7 +68,7 @@ impl NotificationView {
                             })),
                     ),
             )
-                        .child(
+            .child(
                 div()
                     .id("notification-scroll-list")
                     .flex_1()
@@ -114,8 +114,11 @@ impl NotificationView {
             .flex()
             .flex_col()
             .gap(px(8.0))
-            .hover(|s| s.bg(Theme::bg_card_hover()).border_color(Theme::border_subtle()))
-                        .child(
+            .hover(|s| {
+                s.bg(Theme::bg_card_hover())
+                    .border_color(Theme::border_subtle())
+            })
+            .child(
                 div()
                     .flex()
                     .items_center()
@@ -203,7 +206,7 @@ impl NotificationView {
                             ),
                     ),
             )
-                        .child(
+            .child(
                 div()
                     .flex()
                     .flex_col()

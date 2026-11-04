@@ -12,7 +12,9 @@ pub struct LocalAssets {
 pub fn asset_path(rel_path: &str) -> PathBuf {
     let clean = rel_path.trim_start_matches('/');
     let candidates = [
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets").join(clean),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("assets")
+            .join(clean),
         PathBuf::from("assets").join(clean),
         PathBuf::from("oplus-connect-gui/assets").join(clean),
     ];
@@ -28,7 +30,7 @@ impl LocalAssets {
     pub fn new() -> Self {
         let mut dirs = Vec::new();
 
-                if let Ok(exe) = std::env::current_exe() {
+        if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
                 dirs.push(dir.join("assets"));
                 dirs.push(dir.join("../assets"));
@@ -37,10 +39,10 @@ impl LocalAssets {
             }
         }
 
-                dirs.push(PathBuf::from("assets"));
+        dirs.push(PathBuf::from("assets"));
         dirs.push(PathBuf::from("oplus-connect-gui/assets"));
 
-                dirs.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets"));
+        dirs.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets"));
 
         Self { base_dirs: dirs }
     }
@@ -125,7 +127,11 @@ mod tests {
         let assets = LocalAssets::new();
         let path = "icons/search.svg";
         assert_eq!(assets.load(path).unwrap(), KitAssets.load(path).unwrap());
-        assert!(assets.list("icons/").unwrap().iter().any(|name| name.as_ref() == path));
+        assert!(assets
+            .list("icons/")
+            .unwrap()
+            .iter()
+            .any(|name| name.as_ref() == path));
         assert!(assets.load("missing/optional.svg").unwrap().is_none());
     }
 
@@ -134,14 +140,18 @@ mod tests {
         let root = std::env::temp_dir().join(format!("oplus-assets-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(root.join("icons")).unwrap();
         fs::write(root.join("icons/search.svg"), b"local icon").unwrap();
-        let assets = LocalAssets { base_dirs: vec![root.clone()] };
+        let assets = LocalAssets {
+            base_dirs: vec![root.clone()],
+        };
         let loaded = assets.load("icons/search.svg").unwrap().unwrap();
         let listed = assets.list("icons/").unwrap();
         fs::remove_dir_all(root).unwrap();
 
         assert_eq!(loaded.as_ref(), b"local icon");
         assert!(listed.iter().any(|name| name.as_ref() == "search.svg"));
-        assert!(!listed.iter().any(|name| name.as_ref() == "icons/search.svg"));
+        assert!(!listed
+            .iter()
+            .any(|name| name.as_ref() == "icons/search.svg"));
         assert!(listed.iter().any(|name| name.as_ref() == "icons/check.svg"));
     }
 
@@ -149,7 +159,10 @@ mod tests {
     fn test_asset_load_system_svg() {
         let assets = LocalAssets::new();
         let close_svg = assets.load("/usr/share/icons/breeze/actions/16/window-close.svg");
-        println!("load result: {:?}", close_svg.as_ref().map(|o| o.as_ref().map(|b| b.len())));
+        println!(
+            "load result: {:?}",
+            close_svg.as_ref().map(|o| o.as_ref().map(|b| b.len()))
+        );
         assert!(close_svg.unwrap().is_some());
     }
 

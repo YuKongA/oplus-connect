@@ -33,22 +33,18 @@ pub async fn start_daemon_service(
         let directory = match ipc::runtime::RuntimeDir::new() {
             Ok(dir) => dir,
             Err(err) => {
-                info!("Daemon runtime directory already locked: {}. Attaching as client.", err);
+                info!(
+                    "Daemon runtime directory already locked: {}. Attaching as client.",
+                    err
+                );
                 return Ok(None);
             }
         };
 
         let event_hub = ipc::event_hub::EventHub::bind(state.clone(), &directory)?;
-        let uds_server = ipc::uds_http::UdsHttpServer::bind(
-            state.clone(),
-            &directory,
-            "oplus-dsp-ipc",
-        )?;
-        let rc_server = ipc::uds_http::UdsHttpServer::bind(
-            state.clone(),
-            &directory,
-            "dsprc-ipc",
-        )?;
+        let uds_server =
+            ipc::uds_http::UdsHttpServer::bind(state.clone(), &directory, "oplus-dsp-ipc")?;
+        let rc_server = ipc::uds_http::UdsHttpServer::bind(state.clone(), &directory, "dsprc-ipc")?;
 
         let mut control = Vec::new();
         let mut data = Vec::new();

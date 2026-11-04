@@ -2,11 +2,15 @@
 
 pub mod assets;
 pub mod cast_input;
-pub mod cast_settings;
 pub mod cast_media;
 pub mod cast_session;
+pub mod cast_settings;
 pub mod client;
 pub mod icons;
+pub mod kms_capture;
+pub mod kms_input;
+pub mod kms_session;
+pub mod kms_settings;
 pub mod models;
 mod persisted;
 pub mod state;
@@ -17,8 +21,8 @@ pub mod views;
 pub const APP_VERSION: &str = "v1.0.0";
 
 use client::DaemonClient;
-use gpui_kit::*;
 use gpui_kit::component::WindowExt;
+use gpui_kit::*;
 use models::*;
 use state::{AppState, CastEvent, CastPhase, CastViewState};
 use std::sync::LazyLock;
@@ -36,12 +40,13 @@ pub static TOKIO_RT: LazyLock<Runtime> = LazyLock::new(|| {
         .expect("Failed to initialize Tokio runtime")
 });
 
-static IN_PROCESS_DAEMON: std::sync::LazyLock<tokio::sync::Mutex<Option<oplus_connect_daemon::DaemonHandle>>> =
-    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(None));
+static IN_PROCESS_DAEMON: std::sync::LazyLock<
+    tokio::sync::Mutex<Option<oplus_connect_daemon::DaemonHandle>>,
+> = std::sync::LazyLock::new(|| tokio::sync::Mutex::new(None));
 
 pub fn shutdown_in_process_daemon() {
     TOKIO_RT.block_on(async {
-        cast_session::shutdown().await;
+        tokio::join!(cast_session::shutdown(), kms_session::shutdown());
         let mut handle = IN_PROCESS_DAEMON.lock().await;
         if let Some(h) = handle.take() {
             info!("Dropping in-process daemon handle and waiting for server cleanup...");
@@ -53,16 +58,30 @@ pub fn shutdown_in_process_daemon() {
 
 pub struct RootView {
     pub state: AppState,
+    pub kms: kms_session::KmsViewState,
+    kms_session: Option<kms_session::KmsSessionHandle>,
     cast_session: Option<cast_session::CastSessionHandle>,
     cast_window: Option<WindowHandle<views::cast_window::CastWindow>>,
     cast_frame_size: (u32, u32),
     cast_input: Option<cast_session::InputSender>,
     // Dropping the subscription would stop observing closes.
     _cast_window_closed: Option<Subscription>,
-    codec_select: Option<Entity<gpui_kit::component::select::SelectState<
-        gpui_kit::component::searchable_list::SearchableVec<&'static str>,
-    >>>,
+    codec_select: Option<
+        Entity<
+            gpui_kit::component::select::SelectState<
+                gpui_kit::component::searchable_list::SearchableVec<&'static str>,
+            >,
+        >,
+    >,
     _codec_events: Option<Subscription>,
+    kms_direction_select: Option<
+        Entity<
+            gpui_kit::component::select::SelectState<
+                gpui_kit::component::searchable_list::SearchableVec<&'static str>,
+            >,
+        >,
+    >,
+    _kms_direction_events: Option<Subscription>,
 }
 
 // Poll faster until /status proves the daemon is serving.
@@ -102,9 +121,12 @@ impl RootView {
         cast_settings::set_audio(cast_audio);
         cast_settings::set_input(cast_input);
         cast_settings::set_h265(cast_h265);
+        kms_settings::set_direction(persisted::load_kms_direction());
         state.daemon_starting = true;
         let mut view = Self {
             state,
+            kms: kms_session::KmsViewState::default(),
+            kms_session: None,
             cast_session: None,
             cast_window: None,
             cast_frame_size: (0, 0),
@@ -112,6 +134,8 @@ impl RootView {
             _cast_window_closed: None,
             codec_select: None,
             _codec_events: None,
+            kms_direction_select: None,
+            _kms_direction_events: None,
         };
         // The cast window carries the app's own close button, so closing it
         // must end the cast instead of leaving a session with no picture.
@@ -131,7 +155,7 @@ impl RootView {
             });
         }));
 
-                cx.spawn(async move |this, app| {
+        cx.spawn(async move |this, app| {
             while let Some(event) = rx.recv().await {
                 let _ = this.update_in(app, |view, window, cx| {
                     let was_pending = view.state.connection_request.is_some();
@@ -155,18 +179,109 @@ impl RootView {
         })
         .detach();
 
-                Self::start_daemon_poller(tx.clone());
+        Self::start_daemon_poller(tx.clone());
         Self::start_event_stream_listener(tx.clone());
 
         view
     }
 
+    pub fn start_kms(&mut self, device_id: String, cx: &mut Context<Self>) {
+        if self.kms.active()
+            || !self.state.known_devices.iter().any(|device| {
+                device.device_id == device_id
+                    && device.is_connected
+                    && device.device_type == "tablet"
+            })
+        {
+            return;
+        }
+        let generation = self.kms.generation.wrapping_add(1);
+        self.kms = kms_session::KmsViewState {
+            device_id: device_id.clone(),
+            generation,
+            phase: kms_session::KmsPhase::Preparing,
+            detail: "等待系统授权全局键鼠捕获…".into(),
+        };
+        let (tx, mut rx) = mpsc::channel(16);
+        self.kms_session = Some(kms_session::start(device_id, tx));
+        cx.spawn(async move |this, app| {
+            while let Some(event) = rx.recv().await {
+                if this
+                    .update(app, |view, cx| {
+                        use kms_session::{KmsEvent, KmsPhase};
+                        if view.kms.generation != generation || !view.kms.active() {
+                            return;
+                        }
+                        if view.kms.phase == KmsPhase::Stopping
+                            && !matches!(event, KmsEvent::Closed | KmsEvent::Error(_))
+                        {
+                            return;
+                        }
+                        match event {
+                            KmsEvent::Phase(phase) => {
+                                view.kms.phase = phase;
+                                view.kms.detail = match phase {
+                                    KmsPhase::Waiting => "等待平板键鼠通道连接…",
+                                    KmsPhase::Armed => {
+                                        "已就绪：从设置的电脑边缘移入平板；从平板相对边缘移回"
+                                    }
+                                    KmsPhase::Sharing => {
+                                        "正在控制平板 · 键鼠均作用于平板，从相对边缘移回电脑"
+                                    }
+                                    _ => "正在准备键鼠共享…",
+                                }
+                                .into();
+                            }
+                            KmsEvent::Closed => {
+                                view.kms_session = None;
+                                view.kms.phase = KmsPhase::Idle;
+                                view.kms.detail = "键鼠共享已停止".into();
+                            }
+                            KmsEvent::Error(error) => {
+                                view.kms_session = None;
+                                view.kms.phase = KmsPhase::Failed;
+                                view.kms.detail = error.clone();
+                                view.state.set_toast(error);
+                            }
+                        }
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub fn stop_kms(&mut self, cx: &mut Context<Self>) {
+        if let Some(session) = &self.kms_session {
+            session.stop();
+            self.kms.phase = kms_session::KmsPhase::Stopping;
+            self.kms.detail = "正在释放按键并关闭键鼠共享…".into();
+            cx.notify();
+        }
+    }
+
     pub fn start_cast(&mut self, device_id: String, cx: &mut Context<Self>) {
-        if self.state.cast.active() || !self.state.known_devices.iter().any(|device| device.device_id == device_id && device.is_connected) {
+        if self.state.cast.active()
+            || !self.state.known_devices.iter().any(|device| {
+                device.device_id == device_id
+                    && device.is_connected
+                    && device.device_type == "phone"
+            })
+        {
             return;
         }
         let generation = self.state.cast.generation.wrapping_add(1);
-        self.state.cast = CastViewState { device_id: device_id.clone(), generation, phase: CastPhase::Probing, detail: "检查视频解码与显示环境…".into() };
+        self.state.cast = CastViewState {
+            device_id: device_id.clone(),
+            generation,
+            phase: CastPhase::Probing,
+            detail: "检查视频解码与显示环境…".into(),
+        };
         let (tx, mut rx) = mpsc::channel(16);
         let (frame_tx, mut frame_rx) = mpsc::channel(1);
         let (session, input) = cast_session::start(device_id, tx, frame_tx);
@@ -174,22 +289,43 @@ impl RootView {
         self.cast_session = Some(session);
         cx.spawn(async move |this, app| {
             while let Some(event) = rx.recv().await {
-                if this.update(app, |view, cx| {
-                    if view.handle_app_event(AppEvent::CastChanged { generation, event }, cx) { cx.notify(); }
-                }).is_err() { break; }
+                if this
+                    .update(app, |view, cx| {
+                        if view.handle_app_event(AppEvent::CastChanged { generation, event }, cx) {
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
             }
-        }).detach();
+        })
+        .detach();
         cx.spawn(async move |this, app| {
             while let Some(frame) = frame_rx.recv().await {
-                if this.update(app, |view, cx| view.present_cast_frame(generation, frame, cx)).is_err() { break; }
+                if this
+                    .update(app, |view, cx| {
+                        view.present_cast_frame(generation, frame, cx)
+                    })
+                    .is_err()
+                {
+                    break;
+                }
             }
-        }).detach();
+        })
+        .detach();
         cx.notify();
     }
 
     /// Paint the newest decoded frame in the cast window, opening it on the
     /// first frame so the window appears only when there is something to show.
-    fn present_cast_frame(&mut self, generation: u64, frame: crate::cast_media::VideoFrame, cx: &mut Context<Self>) {
+    fn present_cast_frame(
+        &mut self,
+        generation: u64,
+        frame: crate::cast_media::VideoFrame,
+        cx: &mut Context<Self>,
+    ) {
         if !self.state.cast.accepts_frames(generation) || self.cast_session.is_none() {
             return;
         }
@@ -324,11 +460,17 @@ impl RootView {
                 let devices = client.get_devices().await.map_err(|e| e.to_string());
                 let remote = client.get_remote_device().await.map_err(|e| e.to_string());
 
-                if tx.send(AppEvent::DaemonPolled {
-                    status,
-                    devices,
-                    remote,
-                }).await.is_err() { break; }
+                if tx
+                    .send(AppEvent::DaemonPolled {
+                        status,
+                        devices,
+                        remote,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
 
                 let interval = if reachable {
                     STEADY_POLL_INTERVAL
@@ -344,7 +486,9 @@ impl RootView {
         TOKIO_RT.spawn(async move {
             let socket_path = DaemonClient::event_socket_path();
             loop {
-                if tx.is_closed() { return; }
+                if tx.is_closed() {
+                    return;
+                }
                 match UnixStream::connect(&socket_path).await {
                     Ok(stream) => {
                         info!("Connected to IPC event stream at {:?}", socket_path);
@@ -358,7 +502,9 @@ impl RootView {
                             }
 
                             if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                                if tx.send(AppEvent::IpcMessage(val)).await.is_err() { return; }
+                                if tx.send(AppEvent::IpcMessage(val)).await.is_err() {
+                                    return;
+                                }
                             }
                         }
                     }
@@ -405,15 +551,33 @@ impl RootView {
                         changed = true;
                     }
                 }
+                if !self.state.daemon_running && self.kms.active() {
+                    self.stop_kms(cx);
+                    changed = true;
+                }
 
                 if let Ok(dev_list) = devices {
-                    if self.state.cast.active() && !dev_list.iter().any(|device| device.device_id == self.state.cast.device_id) {
+                    if self.kms.active()
+                        && !dev_list.iter().any(|device| {
+                            device.device_id == self.kms.device_id && device.is_connected
+                        })
+                    {
+                        self.stop_kms(cx);
+                        changed = true;
+                    }
+                    if self.state.cast.active()
+                        && !dev_list
+                            .iter()
+                            .any(|device| device.device_id == self.state.cast.device_id)
+                    {
                         self.stop_cast(cx);
                         changed = true;
                     }
                     self.state.sync_known_devices(&dev_list);
                     let first = dev_list.into_iter().next();
-                    if self.state.connected_device.as_ref().map(|d| &d.device_id) != first.as_ref().map(|d| &d.device_id) {
+                    if self.state.connected_device.as_ref().map(|d| &d.device_id)
+                        != first.as_ref().map(|d| &d.device_id)
+                    {
                         self.state.connected_device = first;
                         changed = true;
                     }
@@ -421,11 +585,13 @@ impl RootView {
 
                 match remote {
                     Ok(Some(rm)) => {
-                        let is_new = self.state.remote_details.as_ref().map(|r| &r.device_id) != Some(&rm.device_id);
+                        let is_new = self.state.remote_details.as_ref().map(|r| &r.device_id)
+                            != Some(&rm.device_id);
                         let dev = DeviceInfo {
                             device_id: rm.device_id.clone(),
                             device_name: rm.device_name.clone(),
                             device_model: rm.device_model.clone(),
+                            device_type: rm.device_type.clone(),
                             brand: rm.brand.clone(),
                             os_version: rm.os_version.clone(),
                             battery: rm.battery_level,
@@ -463,7 +629,7 @@ impl RootView {
                 changed
             }
             AppEvent::IpcMessage(val) => {
-                                let req_data = if val
+                let req_data = if val
                     .get("payload")
                     .and_then(|p| p.get("event"))
                     .and_then(|e| e.as_str())
@@ -487,19 +653,31 @@ impl RootView {
                             .to_string(),
                         device_type: data["device_type"].as_str().unwrap_or("phone").to_string(),
                         connect_type: data["connect_type"].as_str().unwrap_or("wlan").to_string(),
-                        device_address: data["device_address"].as_str().unwrap_or_default().to_string(),
-                        connection_id: data["connection_id"].as_str().unwrap_or_default().to_string(),
+                        device_address: data["device_address"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                        connection_id: data["connection_id"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
                     };
                     info!("Incoming connection approval request: {:?}", req);
                     self.state.connection_request = Some(req);
                     return true;
                 }
 
-                                let event_type = val.get("event").and_then(|e| e.as_str()).unwrap_or_default();
+                let event_type = val
+                    .get("event")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or_default();
                 match event_type {
                     "clipboard_callback" => {
                         if let Some(content) = val.get("content").and_then(|c| c.as_str()) {
-                            let source_type = val.get("source").and_then(|s| s.as_str()).unwrap_or("remote");
+                            let source_type = val
+                                .get("source")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("remote");
                             let dev_name = self
                                 .state
                                 .connected_device
@@ -551,9 +729,7 @@ impl RootView {
                     }
                     "connect_failed" => {
                         self.state.connect_pending = false;
-                        let reason = val["data"]["reason"]
-                            .as_str()
-                            .unwrap_or("连接失败");
+                        let reason = val["data"]["reason"].as_str().unwrap_or("连接失败");
                         self.state.set_toast(format!("连接失败：{reason}"));
                         return true;
                     }
@@ -589,8 +765,20 @@ impl RootView {
                                     .as_ref()
                                     .map(|device| device.device_id.clone())
                             });
-                        if disconnected_id.as_deref().map_or(true, |id| id == self.state.cast.device_id) { self.stop_cast(cx); }
-                        self.state.mark_device_disconnected(disconnected_id.as_deref());
+                        if disconnected_id
+                            .as_deref()
+                            .map_or(true, |id| id == self.state.cast.device_id)
+                        {
+                            self.stop_cast(cx);
+                        }
+                        if disconnected_id
+                            .as_deref()
+                            .map_or(true, |id| id == self.kms.device_id)
+                        {
+                            self.stop_kms(cx);
+                        }
+                        self.state
+                            .mark_device_disconnected(disconnected_id.as_deref());
                         self.state.connected_device = None;
                         self.state.remote_details = None;
                         self.state.connection_request = None;
@@ -622,8 +810,14 @@ impl RootView {
                 true
             }
             AppEvent::CastChanged { generation, event } => {
-                if generation != self.state.cast.generation || !self.state.cast.active() { return false; }
-                if self.state.cast.phase == CastPhase::Stopping && !matches!(event, CastEvent::Closed | CastEvent::Error(_)) { return false; }
+                if generation != self.state.cast.generation || !self.state.cast.active() {
+                    return false;
+                }
+                if self.state.cast.phase == CastPhase::Stopping
+                    && !matches!(event, CastEvent::Closed | CastEvent::Error(_))
+                {
+                    return false;
+                }
                 match event {
                     CastEvent::Phase(phase) => {
                         self.state.cast.phase = phase;
@@ -633,7 +827,8 @@ impl RootView {
                             CastPhase::Waiting => "等待手机连接并认证；尚无画面",
                             CastPhase::Negotiating => "正在协商 WebRTC；等待实际视频帧",
                             _ => "投屏状态变化",
-                        }.into();
+                        }
+                        .into();
                     }
                     CastEvent::Displaying { width, height } => {
                         self.state.cast.phase = CastPhase::Displaying;
@@ -660,6 +855,14 @@ impl RootView {
     }
 }
 
+impl Drop for RootView {
+    fn drop(&mut self) {
+        if let Some(session) = &self.kms_session {
+            session.stop();
+        }
+    }
+}
+
 impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(message) = self.state.toast_message.take() {
@@ -670,18 +873,16 @@ impl Render for RootView {
                 gpui_kit::component::searchable_list::SearchableVec::new(vec!["H.264", "H.265"]);
             let selected = gpui_kit::component::IndexPath::new(usize::from(self.state.cast_h265));
             let state = cx.new(|cx| {
-                gpui_kit::component::select::SelectState::new(
-                    items,
-                    Some(selected),
-                    window,
-                    cx,
-                )
+                gpui_kit::component::select::SelectState::new(items, Some(selected), window, cx)
             });
             self._codec_events = Some(cx.subscribe(
                 &state,
-                |view, _state, event: &gpui_kit::component::select::SelectEvent<
+                |view,
+                 _state,
+                 event: &gpui_kit::component::select::SelectEvent<
                     gpui_kit::component::searchable_list::SearchableVec<&'static str>,
-                >, cx| {
+                >,
+                 cx| {
                     let gpui_kit::component::select::SelectEvent::Confirm(value) = event;
                     match value.as_deref() {
                         Some("H.265") => view.set_cast_h265(true),
@@ -693,6 +894,54 @@ impl Render for RootView {
             ));
             self.codec_select = Some(state);
         }
-        views::MainContainer::render(&self.state, self.codec_select.as_ref(), window, cx)
+        if self.kms_direction_select.is_none() {
+            let labels = vec!["向左", "向右"];
+            let index = labels
+                .iter()
+                .position(|label| *label == kms_settings::direction().label())
+                .unwrap_or(0);
+            let state = cx.new(|cx| {
+                gpui_kit::component::select::SelectState::new(
+                    gpui_kit::component::searchable_list::SearchableVec::new(labels),
+                    Some(gpui_kit::component::IndexPath::new(index)),
+                    window,
+                    cx,
+                )
+            });
+            self._kms_direction_events = Some(cx.subscribe(
+                &state,
+                |view,
+                 _,
+                 event: &gpui_kit::component::select::SelectEvent<
+                    gpui_kit::component::searchable_list::SearchableVec<&'static str>,
+                >,
+                 cx| {
+                    let gpui_kit::component::select::SelectEvent::Confirm(value) = event;
+                    let Some(direction) = value
+                        .as_deref()
+                        .and_then(kms_settings::ExitDirection::from_label)
+                    else {
+                        return;
+                    };
+                    match persisted::save_kms_direction(direction) {
+                        Ok(()) => {
+                            kms_settings::set_direction(direction);
+                            view.state.set_toast("共享方向已保存，下次启动键鼠共享生效");
+                        }
+                        Err(error) => view.state.set_toast(format!("保存共享方向失败：{error}")),
+                    }
+                    cx.notify();
+                },
+            ));
+            self.kms_direction_select = Some(state);
+        }
+        views::MainContainer::render(
+            &self.state,
+            &self.kms,
+            self.codec_select.as_ref(),
+            self.kms_direction_select.as_ref(),
+            window,
+            cx,
+        )
     }
 }

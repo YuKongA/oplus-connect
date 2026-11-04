@@ -1,6 +1,6 @@
-use crate::kms::input::InputEvent;
 use crate::ipc::protocol::{ApiResponse, ConnectionDecisionReq};
 use crate::ipc::runtime::{BoundSocket, RuntimeDir};
+use crate::kms::input::InputEvent;
 use crate::state::AppState;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -30,6 +30,12 @@ struct KmsInputReq {
 
 #[derive(serde::Deserialize)]
 struct KmsReleaseReq {
+    device_id: String,
+    connection_id: u64,
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KmsReceiveReq {
     device_id: String,
     connection_id: u64,
 }
@@ -82,11 +88,7 @@ pub struct UdsHttpServer {
 }
 
 impl UdsHttpServer {
-    pub fn bind(
-        state: AppState,
-        directory: &Arc<RuntimeDir>,
-        name: &str,
-    ) -> std::io::Result<Self> {
+    pub fn bind(state: AppState, directory: &Arc<RuntimeDir>, name: &str) -> std::io::Result<Self> {
         Ok(Self {
             state,
             socket: directory.bind(name)?,
@@ -339,7 +341,7 @@ async fn handle_client(
                     "device_model": dev.device_model,
                     "phone_model": dev.device_model,
                     "brand": dev.brand,
-                    "device_type": "tablet",
+                    "device_type": dev.device_type,
                     "os_version": dev.os_version,
                     "battery_level": dev.battery,
                     "battery_charging": dev.is_charging,
@@ -499,67 +501,131 @@ async fn handle_client(
                 Ok(request) if !request.device_id.trim().is_empty() => request,
                 _ => {
                     let response = ApiResponse::error(400, "Malformed cast device request");
-                    return write_response(&mut stream, 400, &serde_json::to_string(&response)?).await;
+                    return write_response(&mut stream, 400, &serde_json::to_string(&response)?)
+                        .await;
                 }
             };
             let result = match path {
-                "/cast/start" => state.cast.start(&request.device_id).await.map(|info| serde_json::to_value(info).unwrap()),
-                "/cast/status" => state.cast.status(&request.device_id).await.map(|info| serde_json::to_value(info).unwrap()),
-                _ => state.cast.stop(&request.device_id).await.map(|()| serde_json::Value::Null),
+                "/cast/start" => state
+                    .cast
+                    .start(&request.device_id)
+                    .await
+                    .map(|info| serde_json::to_value(info).unwrap()),
+                "/cast/status" => state
+                    .cast
+                    .status(&request.device_id)
+                    .await
+                    .map(|info| serde_json::to_value(info).unwrap()),
+                _ => state
+                    .cast
+                    .stop(&request.device_id)
+                    .await
+                    .map(|()| serde_json::Value::Null),
             };
             match result {
-                Ok(info) => (200, serde_json::to_string(&ApiResponse::success(info)).unwrap()),
-                Err(message) => (409, serde_json::to_string(&ApiResponse::error(409, message)).unwrap()),
+                Ok(info) => (
+                    200,
+                    serde_json::to_string(&ApiResponse::success(info)).unwrap(),
+                ),
+                Err(message) => (
+                    409,
+                    serde_json::to_string(&ApiResponse::error(409, message)).unwrap(),
+                ),
             }
         }
         // Private same-user UDS signaling boundary: never exposed on a TCP HTTP listener.
         ("POST", "/cast/send") => {
             let request = match serde_json::from_str::<CastSendReq>(body) {
-                Ok(request) if !request.device_id.trim().is_empty() && request.connection_id != 0 => request,
+                Ok(request)
+                    if !request.device_id.trim().is_empty() && request.connection_id != 0 =>
+                {
+                    request
+                }
                 _ => {
                     let response = ApiResponse::error(400, "Malformed cast signaling request");
-                    return write_response(&mut stream, 400, &serde_json::to_string(&response)?).await;
+                    return write_response(&mut stream, 400, &serde_json::to_string(&response)?)
+                        .await;
                 }
             };
-            match state.cast.send(&request.device_id, request.connection_id, request.payload).await {
+            match state
+                .cast
+                .send(&request.device_id, request.connection_id, request.payload)
+                .await
+            {
                 Ok(()) => (200, serde_json::to_string(&ApiResponse::ok()).unwrap()),
-                Err(message) => (409, serde_json::to_string(&ApiResponse::error(409, message)).unwrap()),
+                Err(message) => (
+                    409,
+                    serde_json::to_string(&ApiResponse::error(409, message)).unwrap(),
+                ),
             }
         }
         ("POST", "/cast/configure") => {
             let request = match serde_json::from_str::<CastConfigureReq>(body) {
-                Ok(request) if !request.device_id.trim().is_empty() && request.connection_id != 0
-                    && (1..=4096).contains(&request.width) && (1..=60).contains(&request.fps) => request,
+                Ok(request)
+                    if !request.device_id.trim().is_empty()
+                        && request.connection_id != 0
+                        && (1..=4096).contains(&request.width)
+                        && (1..=60).contains(&request.fps) =>
+                {
+                    request
+                }
                 _ => {
                     let response = ApiResponse::error(400, "Malformed cast video configuration");
-                    return write_response(&mut stream, 400, &serde_json::to_string(&response)?).await;
+                    return write_response(&mut stream, 400, &serde_json::to_string(&response)?)
+                        .await;
                 }
             };
-            match state.cast.configure_video(&request.device_id, request.connection_id, request.width, request.fps).await {
+            match state
+                .cast
+                .configure_video(
+                    &request.device_id,
+                    request.connection_id,
+                    request.width,
+                    request.fps,
+                )
+                .await
+            {
                 Ok(()) => (200, serde_json::to_string(&ApiResponse::ok()).unwrap()),
-                Err(message) => (409, serde_json::to_string(&ApiResponse::error(409, message)).unwrap()),
+                Err(message) => (
+                    409,
+                    serde_json::to_string(&ApiResponse::error(409, message)).unwrap(),
+                ),
             }
         }
         ("POST", "/cast/receive") => {
             let request = match serde_json::from_str::<CastReceiveReq>(body) {
-                Ok(request) if !request.device_id.trim().is_empty() && request.connection_id != 0 => request,
+                Ok(request)
+                    if !request.device_id.trim().is_empty() && request.connection_id != 0 =>
+                {
+                    request
+                }
                 _ => {
                     let response = ApiResponse::error(400, "Malformed cast receive request");
-                    return write_response(&mut stream, 400, &serde_json::to_string(&response)?).await;
+                    return write_response(&mut stream, 400, &serde_json::to_string(&response)?)
+                        .await;
                 }
             };
             let max = request.max.unwrap_or(1).clamp(1, 32);
-            match state.cast.receive(&request.device_id, request.connection_id, max).await {
+            match state
+                .cast
+                .receive(&request.device_id, request.connection_id, max)
+                .await
+            {
                 Ok(payloads) => {
                     let first = payloads.first().cloned();
-                    let payloads: Vec<serde_json::Value> =
-                        payloads.into_iter().map(|value| serde_json::json!(value)).collect();
+                    let payloads: Vec<serde_json::Value> = payloads
+                        .into_iter()
+                        .map(|value| serde_json::json!(value))
+                        .collect();
                     (200, serde_json::to_string(&ApiResponse::success(serde_json::json!({
                         "device_id":request.device_id.trim().to_ascii_uppercase(),
                         "connection_id":request.connection_id,"payload":first,"payloads":payloads
                     }))).unwrap())
                 }
-                Err(message) => (409, serde_json::to_string(&ApiResponse::error(409, message)).unwrap()),
+                Err(message) => (
+                    409,
+                    serde_json::to_string(&ApiResponse::error(409, message)).unwrap(),
+                ),
             }
         }
         ("POST", "/kms/start") => {
@@ -567,13 +633,24 @@ async fn handle_client(
                 Ok(request) => request,
                 Err(_) => {
                     let response = ApiResponse::error(400, "Malformed KMS start request");
-                    return write_response(&mut stream, 400, &serde_json::to_string(&response)?).await;
+                    return write_response(&mut stream, 400, &serde_json::to_string(&response)?)
+                        .await;
                 }
             };
             let id = request.device_id.trim().to_ascii_uppercase();
-            match state.kms.start_for_device(&id, request.width, request.height, request.direction).await {
-                Ok(info) => (200, serde_json::to_string(&ApiResponse::success(info)).unwrap()),
-                Err(message) => (409, serde_json::to_string(&ApiResponse::error(409, message)).unwrap()),
+            match state
+                .kms
+                .start_for_device(&id, request.width, request.height, request.direction)
+                .await
+            {
+                Ok(info) => (
+                    200,
+                    serde_json::to_string(&ApiResponse::success(info)).unwrap(),
+                ),
+                Err(message) => (
+                    409,
+                    serde_json::to_string(&ApiResponse::error(409, message)).unwrap(),
+                ),
             }
         }
         ("POST", "/kms/stop") => {
@@ -581,12 +658,16 @@ async fn handle_client(
                 Ok(request) => request,
                 Err(_) => {
                     let response = ApiResponse::error(400, "Malformed KMS stop request");
-                    return write_response(&mut stream, 400, &serde_json::to_string(&response)?).await;
+                    return write_response(&mut stream, 400, &serde_json::to_string(&response)?)
+                        .await;
                 }
             };
             match state.kms.stop(request.device_id.trim()).await {
                 Ok(()) => (200, serde_json::to_string(&ApiResponse::ok()).unwrap()),
-                Err(message) => (409, serde_json::to_string(&ApiResponse::error(409, message)).unwrap()),
+                Err(message) => (
+                    409,
+                    serde_json::to_string(&ApiResponse::error(409, message)).unwrap(),
+                ),
             }
         }
         ("POST", "/kms/status") => {
@@ -594,12 +675,19 @@ async fn handle_client(
                 Ok(request) => request,
                 Err(_) => {
                     let response = ApiResponse::error(400, "Malformed KMS status request");
-                    return write_response(&mut stream, 400, &serde_json::to_string(&response)?).await;
+                    return write_response(&mut stream, 400, &serde_json::to_string(&response)?)
+                        .await;
                 }
             };
             match state.kms.status(request.device_id.trim()).await {
-                Ok(status) => (200, serde_json::to_string(&ApiResponse::success(status)).unwrap()),
-                Err(message) => (409, serde_json::to_string(&ApiResponse::error(409, message)).unwrap()),
+                Ok(status) => (
+                    200,
+                    serde_json::to_string(&ApiResponse::success(status)).unwrap(),
+                ),
+                Err(message) => (
+                    409,
+                    serde_json::to_string(&ApiResponse::error(409, message)).unwrap(),
+                ),
             }
         }
         ("POST", "/kms/input") => {
@@ -607,16 +695,24 @@ async fn handle_client(
                 Ok(request) => request,
                 Err(_) => {
                     let response = ApiResponse::error(400, "Malformed KMS input request");
-                    return write_response(&mut stream, 400, &serde_json::to_string(&response)?).await;
+                    return write_response(&mut stream, 400, &serde_json::to_string(&response)?)
+                        .await;
                 }
             };
             if request.event.validate().is_err() {
                 let response = ApiResponse::error(400, "Invalid KMS input event");
                 return write_response(&mut stream, 400, &serde_json::to_string(&response)?).await;
             }
-            match state.kms.send_input(&request.device_id, request.connection_id, request.event).await {
+            match state
+                .kms
+                .send_input(&request.device_id, request.connection_id, request.event)
+                .await
+            {
                 Ok(()) => (200, serde_json::to_string(&ApiResponse::ok()).unwrap()),
-                Err(message) => (409, serde_json::to_string(&ApiResponse::error(409, message)).unwrap()),
+                Err(message) => (
+                    409,
+                    serde_json::to_string(&ApiResponse::error(409, message)).unwrap(),
+                ),
             }
         }
         ("POST", "/kms/release") => {
@@ -624,12 +720,53 @@ async fn handle_client(
                 Ok(request) => request,
                 Err(_) => {
                     let response = ApiResponse::error(400, "Malformed KMS release request");
-                    return write_response(&mut stream, 400, &serde_json::to_string(&response)?).await;
+                    return write_response(&mut stream, 400, &serde_json::to_string(&response)?)
+                        .await;
                 }
             };
-            match state.kms.release_input(&request.device_id, request.connection_id).await {
+            match state
+                .kms
+                .release_input(&request.device_id, request.connection_id)
+                .await
+            {
                 Ok(()) => (200, serde_json::to_string(&ApiResponse::ok()).unwrap()),
-                Err(message) => (409, serde_json::to_string(&ApiResponse::error(409, message)).unwrap()),
+                Err(message) => (
+                    409,
+                    serde_json::to_string(&ApiResponse::error(409, message)).unwrap(),
+                ),
+            }
+        }
+        ("POST", "/kms/receive") => {
+            let request = match serde_json::from_str::<KmsReceiveReq>(body) {
+                Ok(request)
+                    if !request.device_id.trim().is_empty() && request.connection_id != 0 =>
+                {
+                    request
+                }
+                _ => {
+                    let response = ApiResponse::error(400, "Malformed KMS receive request");
+                    return write_response(&mut stream, 400, &serde_json::to_string(&response)?)
+                        .await;
+                }
+            };
+            match state
+                .kms
+                .receive(&request.device_id, request.connection_id)
+                .await
+            {
+                Ok(cross_back) => (
+                    200,
+                    serde_json::to_string(&ApiResponse::success(serde_json::json!({
+                        "device_id": request.device_id.trim().to_ascii_uppercase(),
+                        "connection_id": request.connection_id,
+                        "cross_back": cross_back,
+                    })))
+                    .unwrap(),
+                ),
+                Err(message) => (
+                    409,
+                    serde_json::to_string(&ApiResponse::error(409, message)).unwrap(),
+                ),
             }
         }
         ("GET", "/devices") => {
@@ -737,7 +874,12 @@ async fn handle_client(
                 .or_else(|| {
                     serde_json::from_str::<serde_json::Value>(body)
                         .ok()
-                        .and_then(|value| value.get("ip").and_then(|ip| ip.as_str()).map(str::to_string))
+                        .and_then(|value| {
+                            value
+                                .get("ip")
+                                .and_then(|ip| ip.as_str())
+                                .map(str::to_string)
+                        })
                 });
             let device_id = query_param(path_and_query, "device_id")
                 .map(str::to_string)
@@ -751,11 +893,15 @@ async fn handle_client(
                                 .map(str::to_string)
                         })
                 });
-            match (ip.and_then(|ip| ip.parse::<std::net::IpAddr>().ok()), device_id) {
+            match (
+                ip.and_then(|ip| ip.parse::<std::net::IpAddr>().ok()),
+                device_id,
+            ) {
                 (Some(ip), Some(device_id)) if !device_id.is_empty() => {
                     let state = state.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = crate::reverse::connect(ip, device_id, state.clone()).await
+                        if let Err(error) =
+                            crate::reverse::connect(ip, device_id, state.clone()).await
                         {
                             warn!("reverse connect failed: {}", error);
                         }
@@ -1015,14 +1161,32 @@ mod tests {
             ("/cast/start", r#"{"device_id":"phone"}"#, 409),
             ("/cast/status", r#"{"device_id":"phone"}"#, 409),
             ("/cast/send", r#"{"device_id":"phone","payload":{}}"#, 400),
-            ("/cast/send", r#"{"device_id":"phone","connection_id":0,"payload":{}}"#, 400),
-            ("/cast/send", r#"{"device_id":"phone","connection_id":1,"payload":{}}"#, 409),
+            (
+                "/cast/send",
+                r#"{"device_id":"phone","connection_id":0,"payload":{}}"#,
+                400,
+            ),
+            (
+                "/cast/send",
+                r#"{"device_id":"phone","connection_id":1,"payload":{}}"#,
+                409,
+            ),
             ("/cast/receive", r#"{"device_id":"phone"}"#, 400),
-            ("/cast/receive", r#"{"device_id":"phone","connection_id":1}"#, 409),
+            (
+                "/cast/receive",
+                r#"{"device_id":"phone","connection_id":1}"#,
+                409,
+            ),
         ] {
-            let response = rpc.request(format!(
-                "POST {path} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}", body.len()
-            ).as_bytes()).await;
+            let response = rpc
+                .request(
+                    format!(
+                        "POST {path} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await;
             assert_status(&response, status);
         }
     }
@@ -1233,6 +1397,7 @@ mod tests {
             device_id: device_id.to_owned(),
             device_name: device_id.to_owned(),
             device_model: "model".to_owned(),
+            device_type: "phone".into(),
             brand: "OPPO".to_owned(),
             os_version: "ColorOS".to_owned(),
             battery: 100,
@@ -1304,6 +1469,7 @@ mod tests {
                 device_id: "DEVICE-A".to_owned(),
                 device_name: "Phone".to_owned(),
                 device_model: "model".to_owned(),
+                device_type: "phone".into(),
                 brand: "OPPO".to_owned(),
                 os_version: "ColorOS".to_owned(),
                 battery: 100,
@@ -1446,9 +1612,14 @@ mod tests {
         assert_status(&response, 200);
         let body = response.split("\r\n\r\n").nth(1).unwrap();
         let api: ApiResponse<serde_json::Value> = serde_json::from_str(body).unwrap();
-        assert_eq!(api.data.unwrap()["notifications"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            api.data.unwrap()["notifications"].as_array().unwrap().len(),
+            1
+        );
 
-        let response = rpc.request(b"GET /clipboard_history HTTP/1.1\r\n\r\n").await;
+        let response = rpc
+            .request(b"GET /clipboard_history HTTP/1.1\r\n\r\n")
+            .await;
         assert_status(&response, 200);
         let body = response.split("\r\n\r\n").nth(1).unwrap();
         let api: ApiResponse<serde_json::Value> = serde_json::from_str(body).unwrap();

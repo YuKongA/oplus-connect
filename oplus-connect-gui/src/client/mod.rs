@@ -9,10 +9,18 @@ use std::time::Duration;
 pub struct CastRequestRejected(pub String);
 
 impl std::fmt::Display for CastRequestRejected {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { formatter.write_str(&self.0) }
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
 }
 
 impl std::error::Error for CastRequestRejected {}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct KmsStatus {
+    pub connection_id: Option<u64>,
+    pub status: Option<String>,
+}
 
 #[derive(Clone)]
 pub struct DaemonClient {
@@ -120,7 +128,9 @@ impl DaemonClient {
     pub async fn get_status(&self) -> Result<DaemonStatus> {
         let body = self.request("GET", "/status", None).await?;
         let resp: serde_json::Value = serde_json::from_str(&body)?;
-        let data = resp.get("data").ok_or_else(|| anyhow!("No data in /status"))?;
+        let data = resp
+            .get("data")
+            .ok_or_else(|| anyhow!("No data in /status"))?;
         let status: DaemonStatus = serde_json::from_value(data.clone())?;
         Ok(status)
     }
@@ -128,7 +138,9 @@ impl DaemonClient {
     pub async fn get_devices(&self) -> Result<Vec<DeviceInfo>> {
         let body = self.request("GET", "/devices", None).await?;
         let resp: serde_json::Value = serde_json::from_str(&body)?;
-        let data = resp.get("data").ok_or_else(|| anyhow!("No data in /devices"))?;
+        let data = resp
+            .get("data")
+            .ok_or_else(|| anyhow!("No data in /devices"))?;
         let devices: Vec<DeviceInfo> = serde_json::from_value(
             data.get("devices")
                 .cloned()
@@ -159,7 +171,11 @@ impl DaemonClient {
         }
     }
 
-    pub async fn accept_connection(&self, device_address: &str, connection_id: &str) -> Result<bool> {
+    pub async fn accept_connection(
+        &self,
+        device_address: &str,
+        connection_id: &str,
+    ) -> Result<bool> {
         let req = serde_json::json!({
             "device_address": device_address,
             "connection_id": connection_id,
@@ -171,7 +187,11 @@ impl DaemonClient {
         Ok(resp.get("code").and_then(|c| c.as_i64()) == Some(0))
     }
 
-    pub async fn reject_connection(&self, device_address: &str, connection_id: &str) -> Result<bool> {
+    pub async fn reject_connection(
+        &self,
+        device_address: &str,
+        connection_id: &str,
+    ) -> Result<bool> {
         let req = serde_json::json!({
             "device_address": device_address,
             "connection_id": connection_id,
@@ -183,13 +203,12 @@ impl DaemonClient {
         Ok(resp.get("code").and_then(|c| c.as_i64()) == Some(0))
     }
 
-
     /// Start the authenticated cast bus. A successful response only means that
     /// the daemon is listening; callers must wait for connection_ids and media
     /// engine events before reporting a picture.
     pub async fn cast_start(&self, device_id: &str) -> Result<CastStatus> {
         let body = self
-            .cast_request(
+            .control_request(
                 "POST",
                 "/cast/start",
                 Some(&serde_json::json!({"device_id": device_id}).to_string()),
@@ -200,7 +219,7 @@ impl DaemonClient {
 
     pub async fn cast_status(&self, device_id: &str) -> Result<CastStatus> {
         let body = self
-            .cast_request(
+            .control_request(
                 "POST",
                 "/cast/status",
                 Some(&serde_json::json!({"device_id": device_id}).to_string()),
@@ -211,7 +230,7 @@ impl DaemonClient {
 
     pub async fn cast_stop(&self, device_id: &str) -> Result<()> {
         let body = self
-            .cast_request(
+            .control_request(
                 "POST",
                 "/cast/stop",
                 Some(&serde_json::json!({"device_id": device_id}).to_string()),
@@ -227,7 +246,7 @@ impl DaemonClient {
         payload: &serde_json::Value,
     ) -> Result<()> {
         let body = self
-            .cast_request(
+            .control_request(
                 "POST",
                 "/cast/send",
                 Some(
@@ -267,7 +286,7 @@ impl DaemonClient {
         max: usize,
     ) -> Result<Vec<CastIncoming>> {
         let body = self
-            .cast_request(
+            .control_request(
                 "POST",
                 "/cast/receive",
                 Some(
@@ -280,8 +299,8 @@ impl DaemonClient {
                 ),
             )
             .await?;
-        let response: serde_json::Value = serde_json::from_str(&body)
-            .with_context(|| "invalid /cast/receive response")?;
+        let response: serde_json::Value =
+            serde_json::from_str(&body).with_context(|| "invalid /cast/receive response")?;
         if response.get("code").and_then(|v| v.as_i64()) != Some(0) {
             return Err(anyhow!(
                 "{}",
@@ -311,7 +330,7 @@ impl DaemonClient {
         fps: u32,
     ) -> Result<()> {
         let body = self
-            .cast_request(
+            .control_request(
                 "POST",
                 "/cast/configure",
                 Some(
@@ -327,10 +346,131 @@ impl DaemonClient {
             .await?;
         ensure_ok(&body)
     }
-    // Cast workers run on TOKIO_RT. Unlike the legacy UI RPC adapter this
+    pub async fn kms_start(
+        &self,
+        device_id: &str,
+        width: u32,
+        height: u32,
+        direction: u8,
+    ) -> Result<()> {
+        self.control_request("POST", "/kms/start", Some(&serde_json::json!({
+            "device_id": device_id, "width": width, "height": height, "direction": direction,
+        }).to_string())).await?;
+        Ok(())
+    }
+
+    pub async fn kms_status(&self, device_id: &str) -> Result<KmsStatus> {
+        let body = self
+            .control_request(
+                "POST",
+                "/kms/status",
+                Some(&serde_json::json!({"device_id": device_id}).to_string()),
+            )
+            .await?;
+        let response: serde_json::Value = serde_json::from_str(&body)?;
+        serde_json::from_value(
+            response
+                .get("data")
+                .context("KMS status lacks data")?
+                .clone(),
+        )
+        .context("invalid KMS status")
+    }
+
+    pub async fn kms_receive(
+        &self,
+        device_id: &str,
+        connection_id: u64,
+    ) -> Result<Option<(f64, f64)>> {
+        #[derive(serde::Deserialize)]
+        struct CrossBack {
+            pct_x: f64,
+            pct_y: f64,
+        }
+        #[derive(serde::Deserialize)]
+        struct Data {
+            cross_back: Option<CrossBack>,
+        }
+        let body = self
+            .control_request(
+                "POST",
+                "/kms/receive",
+                Some(
+                    &serde_json::json!({
+                        "device_id": device_id, "connection_id": connection_id,
+                    })
+                    .to_string(),
+                ),
+            )
+            .await?;
+        let response: serde_json::Value = serde_json::from_str(&body)?;
+        let data: Data = serde_json::from_value(
+            response
+                .get("data")
+                .context("KMS receive lacks data")?
+                .clone(),
+        )?;
+        match data.cross_back {
+            Some(position) if position.pct_x.is_finite() && position.pct_y.is_finite() => {
+                Ok(Some((position.pct_x, position.pct_y)))
+            }
+            Some(_) => Err(anyhow!("invalid KMS return coordinates")),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn kms_input(
+        &self,
+        device_id: &str,
+        connection_id: u64,
+        event: &oplus_connect_daemon::kms::input::InputEvent,
+    ) -> Result<()> {
+        self.control_request(
+            "POST",
+            "/kms/input",
+            Some(
+                &serde_json::json!({
+                    "device_id": device_id, "connection_id": connection_id, "event": event,
+                })
+                .to_string(),
+            ),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn kms_release(&self, device_id: &str, connection_id: u64) -> Result<()> {
+        self.control_request(
+            "POST",
+            "/kms/release",
+            Some(
+                &serde_json::json!({"device_id": device_id, "connection_id": connection_id})
+                    .to_string(),
+            ),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn kms_stop(&self, device_id: &str) -> Result<()> {
+        self.control_request(
+            "POST",
+            "/kms/stop",
+            Some(&serde_json::json!({"device_id": device_id}).to_string()),
+        )
+        .await?;
+        Ok(())
+    }
+
+    // Cast and KMS workers run on TOKIO_RT. Unlike the legacy UI RPC adapter this
     // socket is dropped on cancellation, and its deadline covers the daemon's
     // 15-second command deadline without occupying a blocking worker.
-    async fn cast_request(&self, method: &str, path: &str, body: Option<&str>) -> Result<String> {
+    async fn control_request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+    ) -> Result<String> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         tokio::time::timeout(Duration::from_secs(17), async {
             let mut stream = tokio::net::UnixStream::connect(&self.socket_path).await?;
@@ -355,8 +495,8 @@ impl DaemonClient {
 }
 
 fn parse_cast_status(body: &str) -> Result<CastStatus> {
-    let response: serde_json::Value = serde_json::from_str(body)
-        .with_context(|| "invalid cast status response")?;
+    let response: serde_json::Value =
+        serde_json::from_str(body).with_context(|| "invalid cast status response")?;
     if response.get("code").and_then(|v| v.as_i64()) != Some(0) {
         return Err(anyhow!(
             "{}",
@@ -374,8 +514,8 @@ fn parse_cast_status(body: &str) -> Result<CastStatus> {
 /// IPC routes answer with `{"code":0,"msg":"success"}`; older ones used
 /// `status`. A successful request must not surface as a connection failure.
 fn ensure_ok(body: &str) -> Result<()> {
-    let value: serde_json::Value = serde_json::from_str(body)
-        .context("守护进程返回了无效的确认消息")?;
+    let value: serde_json::Value =
+        serde_json::from_str(body).context("守护进程返回了无效的确认消息")?;
     let code = value
         .get("code")
         .or_else(|| value.get("status"))

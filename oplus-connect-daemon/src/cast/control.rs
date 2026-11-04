@@ -214,7 +214,9 @@ impl CastRegistry {
 
 impl Controller {
     pub fn try_next(&mut self) -> Option<BusCommand> {
-        self.pending.take().or_else(|| self.receiver.try_recv().ok())
+        self.pending
+            .take()
+            .or_else(|| self.receiver.try_recv().ok())
     }
 
     pub async fn wait_command(&mut self) {

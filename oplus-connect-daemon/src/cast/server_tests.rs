@@ -552,7 +552,11 @@ async fn time_sync_replies_with_captured_server_response_time_schema() {
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let address = socket.local_addr().unwrap();
     let (shutdown, receiver) = watch::channel(false);
-    let task = tokio::spawn(time_sync_loop(socket, "127.0.0.1".parse().unwrap(), receiver));
+    let task = tokio::spawn(time_sync_loop(
+        socket,
+        "127.0.0.1".parse().unwrap(),
+        receiver,
+    ));
     let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     client
         .send_to(br#"{"client_request_time":1793624310515}"#, address)

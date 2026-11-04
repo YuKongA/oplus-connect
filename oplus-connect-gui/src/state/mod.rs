@@ -77,6 +77,8 @@ pub struct DeviceInfo {
     pub device_id: String,
     pub device_name: String,
     pub device_model: String,
+    #[serde(default)]
+    pub device_type: String,
     pub brand: String,
     pub os_version: String,
     pub battery: u8,
@@ -155,7 +157,12 @@ pub struct CastViewState {
 
 impl Default for CastViewState {
     fn default() -> Self {
-        Self { device_id: String::new(), generation: 0, phase: CastPhase::Idle, detail: "尚未投屏".into() }
+        Self {
+            device_id: String::new(),
+            generation: 0,
+            phase: CastPhase::Idle,
+            detail: "尚未投屏".into(),
+        }
     }
 }
 
@@ -188,7 +195,10 @@ pub enum AppEvent {
     Toast(String),
     DaemonStartup(Result<(), String>),
     ConnectionRequestResolved,
-    CastChanged { generation: u64, event: CastEvent },
+    CastChanged {
+        generation: u64,
+        event: CastEvent,
+    },
 }
 
 pub struct AppState {
@@ -204,7 +214,7 @@ pub struct AppState {
     // Consumed once by RootView for the Kit notification stack.
     pub toast_message: Option<String>,
 
-        pub daemon_running: bool,
+    pub daemon_running: bool,
     // Set until /status answers or startup fails/times out.
     pub daemon_starting: bool,
     // True while a PC-initiated LAN connection waits for the phone/user.
@@ -396,7 +406,11 @@ impl AppState {
     }
 
     pub fn add_notification_record(&mut self, mut record: NotificationRecord) {
-        if let Some(pos) = self.notification_history.iter().position(|r| r.key == record.key) {
+        if let Some(pos) = self
+            .notification_history
+            .iter()
+            .position(|r| r.key == record.key)
+        {
             let previous = self.notification_history.remove(pos);
             // A same-key update often carries only text. Keep the app icon the
             // phone sent with the original Add instead of dropping it.
@@ -472,7 +486,11 @@ mod cast_tests {
 
     #[test]
     fn stopped_and_old_generations_cannot_reopen_the_cast_window() {
-        let mut state = CastViewState { generation: 7, phase: CastPhase::Negotiating, ..Default::default() };
+        let mut state = CastViewState {
+            generation: 7,
+            phase: CastPhase::Negotiating,
+            ..Default::default()
+        };
         assert!(state.accepts_frames(7));
         assert!(!state.accepts_frames(6));
         for phase in [CastPhase::Stopping, CastPhase::Idle, CastPhase::Failed] {
@@ -513,7 +531,10 @@ mod notification_icon_tests {
 
         assert_eq!(state.notification_history.len(), 1);
         assert!(state.notification_history[0].icon.is_some());
-        assert_eq!(state.notification_history[0].icon_base64.as_deref(), Some("cG5n"));
+        assert_eq!(
+            state.notification_history[0].icon_base64.as_deref(),
+            Some("cG5n")
+        );
     }
 
     #[test]

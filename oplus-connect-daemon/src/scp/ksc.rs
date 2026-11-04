@@ -23,7 +23,9 @@ pub struct Ksc {
 }
 
 fn path() -> PathBuf {
-    crate::net_utils::config_dir().join("oppo-connect").join("ksc.bin")
+    crate::net_utils::config_dir()
+        .join("oppo-connect")
+        .join("ksc.bin")
 }
 
 impl Ksc {

@@ -97,6 +97,32 @@ pub fn save_cast_settings(audio: bool, input: bool, h265: bool) {
     }
 }
 
+fn kms_settings_path() -> PathBuf {
+    oplus_connect_daemon::net_utils::config_dir()
+        .join("oppo-connect")
+        .join("kms-settings.json")
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct KmsSettings {
+    #[serde(default)]
+    exit_direction: crate::kms_settings::ExitDirection,
+}
+
+pub fn load_kms_direction() -> crate::kms_settings::ExitDirection {
+    fs::read(kms_settings_path())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<KmsSettings>(&bytes).ok())
+        .unwrap_or_default()
+        .exit_direction
+}
+
+pub fn save_kms_direction(exit_direction: crate::kms_settings::ExitDirection) -> io::Result<()> {
+    let bytes =
+        serde_json::to_vec_pretty(&KmsSettings { exit_direction }).map_err(io::Error::other)?;
+    save_bytes(&kms_settings_path(), &bytes)
+}
+
 fn normalize(devices: &mut [DeviceInfo]) {
     for device in devices {
         device.is_connected = false;
@@ -206,11 +232,29 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
+    #[test]
+    fn kms_direction_defaults_left_and_persists_direction_changes() {
+        use crate::kms_settings::ExitDirection;
+        let defaults: KmsSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(defaults.exit_direction, ExitDirection::Left);
+        let path = temp_path();
+        for direction in [ExitDirection::Right, ExitDirection::Left] {
+            let settings = KmsSettings {
+                exit_direction: direction,
+            };
+            save_bytes(&path, &serde_json::to_vec(&settings).unwrap()).unwrap();
+            let restored: KmsSettings = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(restored.exit_direction, direction);
+        }
+        fs::remove_file(path).unwrap();
+    }
+
     fn device(id: &str, name: &str) -> DeviceInfo {
         DeviceInfo {
             device_id: id.into(),
             device_name: name.into(),
             device_model: "PLZ110".into(),
+            device_type: "phone".into(),
             brand: "OnePlus".into(),
             os_version: "ColorOS 17".into(),
             battery: 87,

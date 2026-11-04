@@ -1,8 +1,8 @@
 #[cfg(unix)]
-use oplus_connect_daemon::ipc::{event_hub::EventHub, runtime::RuntimeDir, uds_http::UdsHttpServer};
-use oplus_connect_daemon::{
-    clipboard::ClipboardSync, discovery, probe, state::AppState,
+use oplus_connect_daemon::ipc::{
+    event_hub::EventHub, runtime::RuntimeDir, uds_http::UdsHttpServer,
 };
+use oplus_connect_daemon::{clipboard::ClipboardSync, discovery, probe, state::AppState};
 use tokio::{net::TcpListener, task::JoinSet};
 use tracing::{Level, info};
 use tracing_subscriber::FmtSubscriber;
@@ -23,17 +23,9 @@ async fn main() -> Result<(), Error> {
     #[cfg(unix)]
     let event_hub = EventHub::bind(state.clone(), &directory)?;
     #[cfg(unix)]
-    let uds_server = UdsHttpServer::bind(
-        state.clone(),
-        &directory,
-        "oplus-dsp-ipc",
-    )?;
+    let uds_server = UdsHttpServer::bind(state.clone(), &directory, "oplus-dsp-ipc")?;
     #[cfg(unix)]
-    let rc_server = UdsHttpServer::bind(
-        state.clone(),
-        &directory,
-        "dsprc-ipc",
-    )?;
+    let rc_server = UdsHttpServer::bind(state.clone(), &directory, "dsprc-ipc")?;
 
     let mut control = Vec::new();
     let mut data = Vec::new();

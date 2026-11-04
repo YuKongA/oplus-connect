@@ -13,11 +13,7 @@ fn main() {
             gpui_kit::init(cx);
             oplus_connect_gui::theme::Theme::init(cx);
 
-            let bounds = Bounds::centered(
-                None,
-                size(px(1020.0), px(680.0)),
-                cx,
-            );
+            let bounds = Bounds::centered(None, size(px(1020.0), px(680.0)), cx);
 
             let window_options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -32,10 +28,8 @@ fn main() {
                 ..gpui_kit::component::TitleBar::window_options()
             };
 
-            gpui_kit::open_window(window_options, cx, |_, cx| {
-                cx.new(|cx| RootView::new(cx))
-            })
-            .expect("Failed to open main window");
+            gpui_kit::open_window(window_options, cx, |_, cx| cx.new(|cx| RootView::new(cx)))
+                .expect("Failed to open main window");
 
             cx.activate(true);
         });

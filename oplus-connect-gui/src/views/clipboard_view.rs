@@ -1,12 +1,12 @@
 use crate::models::*;
 use crate::state::AppState;
 use crate::theme::Theme;
-use gpui_kit::*;
 use gpui_kit::assets::IconName;
-use gpui_kit::component::Icon;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_kit::component::tab::{Tab, TabBar};
+use gpui_kit::component::Icon;
 use gpui_kit::component::{Disableable, Selectable, WindowExt};
+use gpui_kit::*;
 
 pub struct ClipboardView;
 
@@ -18,7 +18,10 @@ impl ClipboardView {
     ) -> impl IntoElement {
         let filtered = state.filtered_clipboard_records();
         let total_count = state.clipboard_history.len();
-        let has_clearable_records = state.clipboard_history.iter().any(|record| !record.is_favorite);
+        let has_clearable_records = state
+            .clipboard_history
+            .iter()
+            .any(|record| !record.is_favorite);
 
         div()
             .flex_1()
@@ -28,7 +31,7 @@ impl ClipboardView {
             .p(px(20.0))
             .gap(px(16.0))
             .overflow_hidden()
-                        .child(
+            .child(
                 div()
                     .flex()
                     .items_center()
@@ -59,15 +62,13 @@ impl ClipboardView {
                             .size(px(28.0))
                             .p(px(0.0))
                             .tooltip("清空剪贴板历史记录")
-                            .child(
-                                Icon::new(IconName::Trash)
-                                    .size(px(16.0))
-                                    .text_color(if has_clearable_records {
-                                        Theme::text_secondary()
-                                    } else {
-                                        Theme::text_muted()
-                                    }),
-                            )
+                            .child(Icon::new(IconName::Trash).size(px(16.0)).text_color(
+                                if has_clearable_records {
+                                    Theme::text_secondary()
+                                } else {
+                                    Theme::text_muted()
+                                },
+                            ))
                             .accessibility_label("清空剪贴板历史记录")
                             .disabled(!has_clearable_records)
                             .on_click(cx.listener(|_, _, window, cx| {
@@ -75,7 +76,7 @@ impl ClipboardView {
                             })),
                     ),
             )
-                        .child(
+            .child(
                 TabBar::new("clipboard-filter-tabs")
                     .underline()
                     .selected_index(Self::filter_index(state.clipboard_filter))
@@ -88,7 +89,7 @@ impl ClipboardView {
                     .child(Tab::new().label("电脑端"))
                     .child(Tab::new().label("移动端")),
             )
-                        .child(
+            .child(
                 div()
                     .id("clipboard-scroll-list")
                     .flex_1()
@@ -187,7 +188,7 @@ impl ClipboardView {
                 s.bg(Theme::bg_card_hover())
                     .border_color(Theme::border_subtle())
             })
-                        .child(
+            .child(
                 div()
                     .flex()
                     .items_center()
@@ -228,19 +229,23 @@ impl ClipboardView {
                                     .child(format!("{} 字符", record.content.chars().count())),
                             ),
                     )
-                                        .child(
+                    .child(
                         div()
                             .flex()
                             .items_center()
                             .flex_shrink_0()
                             .gap(px(6.0))
-                                                        .child(
+                            .child(
                                 Button::new(copy_btn_id)
                                     .ghost()
                                     .compact()
                                     .size(px(28.0))
                                     .p(px(0.0))
-                                    .tooltip(if is_recently_copied { "已复制" } else { "复制" })
+                                    .tooltip(if is_recently_copied {
+                                        "已复制"
+                                    } else {
+                                        "复制"
+                                    })
                                     .child(
                                         Icon::new(IconName::Copy)
                                             .size(px(16.0))
@@ -264,17 +269,31 @@ impl ClipboardView {
                                     .toggled(is_favorite)
                                     .size(px(28.0))
                                     .p(px(0.0))
-                                    .tooltip(if is_favorite { "取消收藏" } else { "收藏" })
+                                    .tooltip(if is_favorite {
+                                        "取消收藏"
+                                    } else {
+                                        "收藏"
+                                    })
                                     .child(
-                                        Icon::new(if is_favorite { IconName::StarFill } else { IconName::Star })
-                                            .size(px(16.0))
-                                            .text_color(if is_favorite {
+                                        Icon::new(if is_favorite {
+                                            IconName::StarFill
+                                        } else {
+                                            IconName::Star
+                                        })
+                                        .size(px(16.0))
+                                        .text_color(
+                                            if is_favorite {
                                                 rgb(0xeab308).into()
                                             } else {
                                                 Theme::text_secondary()
-                                            }),
+                                            },
+                                        ),
                                     )
-                                    .accessibility_label(if is_favorite { "取消收藏" } else { "收藏剪贴板记录" })
+                                    .accessibility_label(if is_favorite {
+                                        "取消收藏"
+                                    } else {
+                                        "收藏剪贴板记录"
+                                    })
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.state.toggle_clipboard_favorite(&id_for_fav);
                                         cx.notify();
@@ -300,7 +319,7 @@ impl ClipboardView {
                             ),
                     ),
             )
-                        .child(
+            .child(
                 div()
                     .pt(px(8.0))
                     .border_t_1()

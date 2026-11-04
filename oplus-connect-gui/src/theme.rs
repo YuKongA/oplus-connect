@@ -1,5 +1,5 @@
 use gpui_kit::component::{Theme as KitTheme, ThemeMode};
-use gpui_kit::{App, Hsla, rgb, rgba};
+use gpui_kit::{rgb, rgba, App, Hsla};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Neutral palette aligned with GPUI Kit's default theme. Kit owns component
@@ -42,7 +42,11 @@ impl Theme {
     pub fn set_dark(dark: bool, cx: &mut App) {
         THEME_IS_DARK.store(dark, Ordering::Relaxed);
         KitTheme::change(
-            if dark { ThemeMode::Dark } else { ThemeMode::Light },
+            if dark {
+                ThemeMode::Dark
+            } else {
+                ThemeMode::Light
+            },
             None,
             cx,
         );
@@ -52,7 +56,7 @@ impl Theme {
         THEME_IS_DARK.load(Ordering::Relaxed)
     }
 
-        pub fn bg_base() -> Hsla {
+    pub fn bg_base() -> Hsla {
         if Self::is_dark() {
             rgb(0x0a0a0a).into()
         } else {
@@ -124,7 +128,7 @@ impl Theme {
         }
     }
 
-        pub fn primary() -> Hsla {
+    pub fn primary() -> Hsla {
         if Self::is_dark() {
             rgb(0xfafafa).into()
         } else {
@@ -204,7 +208,7 @@ impl Theme {
         rgba(0xef444426).into()
     }
 
-        pub fn text_primary() -> Hsla {
+    pub fn text_primary() -> Hsla {
         if Self::is_dark() {
             rgb(0xfafafa).into()
         } else {
@@ -236,7 +240,7 @@ impl Theme {
         }
     }
 
-        pub fn border_subtle() -> Hsla {
+    pub fn border_subtle() -> Hsla {
         if Self::is_dark() {
             rgba(0xffffff14).into()
         } else {

@@ -1121,11 +1121,11 @@ Panta 主循环直接等待各控制器的命令队列，避免跨设备共享�
 不能将“没有已接入的文本路径”归因为 GPUI 无 IME 能力。右键未实现；
 端到端延迟与长时间稳定性未测量。
 
-#### KMS Rust 协议层（2026-11-03）
+#### KMS Rust 协议层与平板键鼠共享（2026-11-04）
 
-`oplus-connect-daemon/src/kms/mod.rs` 实现编解码与异步 TCP 分帧读取；
-`kms/server.rs`、`kms/control.rs` 已接入显式 IPC 启停、动态监听和 Panta 通告。
-`kms/input.rs` 提供显式输入事件发送；尚未捕获全局键鼠，也未提供 GUI 开关。
+`kms/` 实现平板键鼠共享的编解码、动态监听、Panta 通告和显式输入发送。
+GUI 通过 KDE/Wayland InputCapture + EIS 捕获全局键鼠，并只向协议确认的
+tablet（EPI category `10`）提供此入口；手机仍使用独立投屏链路。
 
 24 字节帧头精确布局如下（多字节整数均为大端）：
 
@@ -1164,23 +1164,27 @@ magic 尝试恢复。序号分配、超时、设备身份校验和连接生命�
 
 | 路径 | 请求 |
 | --- | --- |
-| `/kms/start` | `{"device_id":"设备 PDID","width":3840,"height":2160,"direction":1}` |
+| `/kms/start` | `{"device_id":"设备 PDID","width":3840,"height":2160,"direction":1}`；`direction` 范围 1..=4（1=Left, 2=Right, 3=Above, 4=Below） |
 | `/kms/status` | `{"device_id":"设备 PDID"}` |
+| `/kms/receive` | `{"device_id":"设备 PDID","connection_id":1}`；消费一次 Pad→电脑的跨回事件 |
 | `/kms/stop` | `{"device_id":"设备 PDID"}` |
 
-尺寸范围为 1..16384；当前只接受已抓到的 direction=1。无已认证数据通道、重复
-启动或会话未就绪时返回错误，不自动开启。Start 成功表示 listener 已绑定，且
-确认的 unite session 已发出追加 `Oplus_KeyMouseLink` 的 topic sync 和
-`kms_ability_sync/pc_device_info`，不表示平板已完成连接。响应只含设备、地址和
-状态，不含 randomPwd/testData。状态为 listening/handshaking/connected/closed；
-没有运行的 KMS 服务时 status/local_addr 为 null。
+尺寸范围为 1..16384；`direction` 经逆向官方 `screenshare.exe`（`handleArrangePosition`）
+证实对应平板相对电脑的方位（1=Left, 2=Right, 3=Above, 4=Below），并在 arrange 中同步发给平板。KMS 启动前
+要求已认证的平板 owner；手机或未知设备不会绑定服务。Start 成功表示 listener 已绑定，
+且确认的 unite session 已发出追加 `Oplus_KeyMouseLink` 的 topic sync 和
+`kms_ability_sync/pc_device_info`，不表示平板已完成连接。响应只含设备、地址和状态，
+不含 randomPwd/testData。状态为 listening/handshaking/connected/closed；没有运行的
+KMS 服务时 status/local_addr 为 null。
 
 服务绑定 Panta 连接的具体本地地址和动态端口，只接受同一 peer IP；INFO_SYNC
 要求 deviceid 一致且 supportEncrypt=1。设备 ID 是明文一致性检查，**不是密码学
 身份认证**。完成 resolution 后发送加密 arrange/resolution；心跳 type4/5 为
-明文、sequence=0，type100 接受 alive。入站 type2 指针消息仅保留最新快照，
-不触发本机输入。握手限时10秒、空闲90秒、心跳间隔30秒、写入限时5秒；这些是
-本实现的保守超时策略，不是已定案的官方常量。心跳 tick 不取消正在读取的半帧。
+明文、sequence=0，type100 接受 alive。daemon 不注入本机输入；收到合法的
+Pad→电脑 type-2 pointer cross-back 后只保留最新一次
+跨回快照，由 `/kms/receive` 按 connection_id 消费。握手限时10秒、空闲90秒、
+心跳间隔30秒、写入限时5秒；这些是本实现的保守超时策略，不是已定案的官方常量。
+心跳 tick 不取消正在读取的半帧。
 
 每个设备只有一个 Panta 控制 owner；有界队列串行处理启停，Start 等通告写完才
 回复，取消的请求不会遗留服务。Stop 关闭 listener/连接并恢复原 topic 列表；
@@ -1191,7 +1195,7 @@ Panta EOF/任务取消会销毁 owner 和 KMS 服务。不虚构未确认的远�
 心跳 echo、重复启动拒绝、停止后的 EOF/端口关闭/topic 撤销、重启密码轮换和
 Panta EOF 清理。此验证未连接真机，不能替代平板互通验收。
 
-#### KMS 显式输入与释放
+#### KMS 输入、释放与自由移入移出
 
 先调用 `/kms/status`，仅在 connected 状态下读取非空 `connection_id`。
 它标识一次成功的 KMS TCP 握手，不是 Panta session ID；每次重连或重启都改变。
@@ -1207,13 +1211,13 @@ POST `/kms/input` 请求：
 | --- | --- | --- |
 | move | delta_x、delta_y（i32） | 3 / 0 |
 | key | key_code（非零 Windows VK u8）、modifier（u32）、pressed | 3 / 3 |
-| button | button_type（抓包值0/1）、pressed | 3 / 1 |
+| button | button_type（0左、1右、2中、6后退、8前进）、pressed | 3 / 1 |
 | scroll | delta_x、delta_y（i32） | 3 / 5 |
 | enter | pct_x、pct_y（有限浮点数，边缘穿越允许超过1） | 2 / 6 |
 
-所有输入使用 platform=2 并加密发送。button 的 clickCount=0；scroll 的
-isContinuous=false、momentumPhase/scrollPhase=-1；enter 的 left_key=0。
-这些是已抓到的离散鼠标模式，不声称支持触控板惯性滚动或额外鼠标按钮。
+所有输入使用 platform=2 并加密发送。button 的 clickCount=0，支持 0(左)、1(右)、
+2(中)、6(后退) 与 8(前进)；scroll 的 isContinuous=false、momentumPhase/scrollPhase=-1；
+enter 的 left_key=0。这些值通过逆向官方 `screenshare.exe`（0x1400fabe0）确认。
 
 POST `/kms/release` 使用 `{"device_id":"设备 PDID","connection_id":1}`，
 为成功发出的、仍按下的键和按钮补发释放事件。重复 key-down 仅保留一份按下状态。
@@ -1224,9 +1228,22 @@ POST `/kms/release` 使用 `{"device_id":"设备 PDID","connection_id":1}`，
 未连接、队列满或写失败返回错误；重连前残留输入被拒绝。输入发送和心跳不会取消
 正在读取的半帧。按下状态采用固定大小存储，不记录输入历史。
 
-隔离 smoke 已覆盖：真实 IPC 发送后由独立 Python GCM 解码 move/enter/scroll/
-key/button、显式 release 的 key-up/button-up、Stop 的 key-up 后 EOF，以及 Stop/
-Start、KMS TCP 重连后旧连接标识拒绝。未进行平板真机输入验收。
+GUI 默认从电脑左侧移出，设置页提供向左、向右两种方位。左侧移出发送 `pctX=1`，
+右侧移出发送 `pctX=0`，`pctY` 保持电脑光标高度。Pad 回传的 pointer 坐标按 Pad
+握手分辨率归一化，GUI 以对应边缘固定 7 像素内缩位置释放电脑光标，随后重新等待下一次
+边缘激活。键盘事件（包括 Escape）在指针位于 Pad 时全部发送给 Pad，不会被本机拦截；
+回移只由 Pad 的 cross-back 事件触发。
+
+逆向官方 `screenshare.exe` 表明，键鼠共享下鼠标钩子仅激活了左右边缘（`setCrossEdge: 3`，
+即 `1|2` 掩码）；官方 `Above/Below` 仅用于扩展屏（虚拟显示器）。实测表明向 Pad 发送垂直进入
+坐标时，平板端驱动会因缺少垂直迟滞而在 20 毫秒内反弹回传，引发两端边缘高频震荡。因此键鼠共享
+仅保留左右两个可靠方向。
+
+历史隔离 smoke 覆盖真实 IPC 与独立 Python GCM 解码；此次新增真实 TCP 回归测试
+覆盖跨回快照一次性消费、Enter 清除旧跨回和重连后拒绝旧 connection 标识。
+初版平板真机已验证 KMS TCP 握手和设备类型识别；用户反馈光标间歇不出现，已修正
+相对边缘坐标及 portal/EIS 激活排序。修订版的双向边缘连续操作仍待真机验收，
+不将编译、单元测试或 TCP 已连接等同于 Pad 光标显示正常。
 
 ---
 

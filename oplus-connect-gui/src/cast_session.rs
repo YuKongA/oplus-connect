@@ -2,7 +2,8 @@
 //! handed to the GPUI cast window, which sizes itself from the phone's own
 //! resolution.
 use crate::cast_media::{
-    probe_config, spawn_receiver, MediaEvent, MediaReceiver, ReceiverConfig, SignalingMessage, VideoFrame,
+    probe_config, spawn_receiver, MediaEvent, MediaReceiver, ReceiverConfig, SignalingMessage,
+    VideoFrame,
 };
 use crate::client::CastRequestRejected;
 use crate::client::DaemonClient;
@@ -58,7 +59,10 @@ pub struct InputSender {
 }
 
 impl InputSender {
-    pub fn send(&self, frame: Vec<u8>) -> std::result::Result<(), mpsc::error::TrySendError<Vec<u8>>> {
+    pub fn send(
+        &self,
+        frame: Vec<u8>,
+    ) -> std::result::Result<(), mpsc::error::TrySendError<Vec<u8>>> {
         if self.is_closed() {
             return Err(mpsc::error::TrySendError::Closed(frame));
         }
@@ -88,7 +92,10 @@ pub fn start(
     let (cancel, cancel_rx) = watch::channel(false);
     let (done_tx, done) = watch::channel(false);
     let (input_tx, inputs) = mpsc::channel(INPUT_CAPACITY);
-    let input = InputSender { sender: input_tx, cancel: cancel.clone() };
+    let input = InputSender {
+        sender: input_tx,
+        cancel: cancel.clone(),
+    };
     let config = ReceiverConfig::default();
     *ACTIVE_SESSION
         .lock()
@@ -146,7 +153,16 @@ async fn run_session(
     let start_result = client.cast_start(device_id).await;
     let result = match start_result {
         Ok(_) if !*cancel.borrow() => {
-            pump_session(device_id, events, frames, inputs, config, &client, &mut cancel).await
+            pump_session(
+                device_id,
+                events,
+                frames,
+                inputs,
+                config,
+                &client,
+                &mut cancel,
+            )
+            .await
         }
         Ok(_) => Ok(()),
         Err(error) if error.downcast_ref::<CastRequestRejected>().is_some() => {
@@ -289,7 +305,10 @@ async fn pump_session(
                 }
             }
         }
-        let event = if let Some((width, height)) = video_peer.and_then(|id| peers.get(&id)).and_then(|peer| peer.dimensions) {
+        let event = if let Some((width, height)) = video_peer
+            .and_then(|id| peers.get(&id))
+            .and_then(|peer| peer.dimensions)
+        {
             CastEvent::Displaying { width, height }
         } else if peers.is_empty() {
             CastEvent::Phase(CastPhase::Waiting)
@@ -324,8 +343,7 @@ async fn run_peer(
     mut cancel: watch::Receiver<bool>,
 ) -> Result<()> {
     let h265 = config.h265_enabled;
-    let mut receiver =
-        tokio::task::spawn_blocking(move || spawn_receiver(config)).await??;
+    let mut receiver = tokio::task::spawn_blocking(move || spawn_receiver(config)).await??;
     let result = tokio::select! {
         biased;
         _ = cancelled(&mut cancel) => Ok(()),
@@ -368,7 +386,9 @@ async fn pump_peer(
         }
         let status = receiver.status();
         if status.input_ready != last_input_ready {
-            events.send(PeerEvent::InputReady(id, status.input_ready)).await?;
+            events
+                .send(PeerEvent::InputReady(id, status.input_ready))
+                .await?;
             last_input_ready = status.input_ready;
         }
         if let Some(error) = status.last_error {
@@ -438,7 +458,9 @@ async fn pump_peer(
         }
         let mut outgoing = Vec::new();
         for _ in 0..8 {
-            let Some(message) = receiver.try_outgoing() else { break };
+            let Some(message) = receiver.try_outgoing() else {
+                break;
+            };
             if let SignalingMessage::Sdp { type_, sdp } = &message {
                 tracing::info!(
                     connection_id = id,
@@ -501,10 +523,7 @@ fn signaling_from_json(payload: &Value) -> Result<Option<SignalingMessage>> {
                     .context("ICE 消息缺少 candidate")?
                     .to_owned(),
                 sdp_mline_index: u32::try_from(index)?,
-                mid: payload
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
+                mid: payload.get("id").and_then(Value::as_str).map(str::to_owned),
             }))
         }
         _ => {

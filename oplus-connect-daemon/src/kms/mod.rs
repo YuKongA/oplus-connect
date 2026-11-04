@@ -4,8 +4,8 @@
 //! lifetimes and timeouts; Panta owns topic negotiation. No input is captured.
 //! Header fields are not authenticated by the official protocol (empty AAD).
 
-pub mod server;
 pub mod input;
+pub mod server;
 pub use input::InputEvent;
 pub mod control;
 

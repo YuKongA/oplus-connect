@@ -9,19 +9,29 @@ pub mod window_frame;
 use crate::models::NavTab;
 use crate::state::AppState;
 use crate::theme::Theme;
-use gpui_kit::*;
-use gpui_kit::component::WindowExt;
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
+use gpui_kit::component::WindowExt;
+use gpui_kit::*;
 
 pub struct MainContainer;
 
 impl MainContainer {
     pub fn render(
         state: &AppState,
+        kms: &crate::kms_session::KmsViewState,
         codec: Option<
-            &Entity<gpui_kit::component::select::SelectState<
-                gpui_kit::component::searchable_list::SearchableVec<&'static str>,
-            >>,
+            &Entity<
+                gpui_kit::component::select::SelectState<
+                    gpui_kit::component::searchable_list::SearchableVec<&'static str>,
+                >,
+            >,
+        >,
+        kms_direction: Option<
+            &Entity<
+                gpui_kit::component::select::SelectState<
+                    gpui_kit::component::searchable_list::SearchableVec<&'static str>,
+                >,
+            >,
         >,
         window: &mut Window,
         cx: &mut Context<crate::RootView>,
@@ -34,10 +44,12 @@ impl MainContainer {
                 notification_view::NotificationView::render(state, window, cx).into_any_element()
             }
             NavTab::DeviceDetail => {
-                device_detail_view::DeviceDetailView::render(state, window, cx).into_any_element()
+                device_detail_view::DeviceDetailView::render(state, kms, window, cx)
+                    .into_any_element()
             }
             NavTab::Settings => {
-                settings_view::SettingsView::render(state, codec, window, cx).into_any_element()
+                settings_view::SettingsView::render(state, codec, kms_direction, window, cx)
+                    .into_any_element()
             }
         };
 
@@ -47,31 +59,31 @@ impl MainContainer {
             .flex()
             .flex_col()
             .overflow_hidden()
-                        .child(window_frame::WindowFrame::render_titlebar(state, window, cx))
+            .child(window_frame::WindowFrame::render_titlebar(
+                state, window, cx,
+            ))
+            .child(
+                div().flex_1().min_h_0().overflow_hidden().child(
+                    h_resizable("main-sidebar-split")
                         .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_hidden()
-                    .child(
-                        h_resizable("main-sidebar-split")
-                            .child(
-                                resizable_panel()
-                                    .size(px(230.0))
-                                    .size_range(px(200.0)..px(360.0))
-                                    .fixed()
-                                    .child(window_frame::WindowFrame::render_sidebar(state, window, cx)),
-                            )
-                            .child(
-                                resizable_panel().child(
-                                    div()
-                                        .size_full()
-                                        .min_w_0()
-                                        .overflow_hidden()
-                                        .child(active_view),
-                                ),
+                            resizable_panel()
+                                .size(px(230.0))
+                                .size_range(px(200.0)..px(360.0))
+                                .fixed()
+                                .child(window_frame::WindowFrame::render_sidebar(
+                                    state, window, cx,
+                                )),
+                        )
+                        .child(
+                            resizable_panel().child(
+                                div()
+                                    .size_full()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .child(active_view),
                             ),
-                    ),
+                        ),
+                ),
             )
             .child(
                 canvas(
@@ -86,5 +98,4 @@ impl MainContainer {
                 .inset_0(),
             )
     }
-
 }

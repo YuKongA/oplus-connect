@@ -1,9 +1,12 @@
+use crate::cast::control::CastRegistry;
+use crate::kms::control::KmsRegistry;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use tokio::sync::{RwLock, broadcast};
-use crate::kms::control::KmsRegistry;
-use crate::cast::control::CastRegistry;
 
 static NEXT_LIFECYCLE_TOKEN: AtomicU64 = AtomicU64::new(1);
 
@@ -21,6 +24,8 @@ pub struct DeviceInfo {
     pub device_id: String,
     pub device_name: String,
     pub device_model: String,
+    #[serde(default)]
+    pub device_type: String,
     pub brand: String,
     pub os_version: String,
     pub battery: u8,
@@ -29,6 +34,15 @@ pub struct DeviceInfo {
     pub ip_address: Option<String>,
     pub is_connected: bool,
     pub last_seen: u64,
+}
+
+/// SCP Sync field 4 and EPI tag 10 share the captured phone/tablet categories.
+pub fn device_type_name(category: u64) -> &'static str {
+    match category {
+        8 => "phone",
+        10 => "tablet",
+        _ => "unknown",
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,18 +189,17 @@ impl AppState {
     /// Schedules removal after the SCP handshake socket closes. The data channel
     /// may still be connecting, so removal waits briefly; `attach_data_session`
     /// cancels it. A handshake that never opens a data channel is cleaned up.
-    pub async fn schedule_device_removal(
-        &self,
-        device_id: &str,
-        delay: std::time::Duration,
-    ) {
+    pub async fn schedule_device_removal(&self, device_id: &str, delay: std::time::Duration) {
         let device_id = device_id.to_ascii_uppercase();
         let sessions = self.device_sessions.read().await;
         if sessions.contains_key(&device_id) {
             return;
         }
         let generation = next_lifecycle_token();
-        self.pending_removals.write().await.insert(device_id.clone(), generation);
+        self.pending_removals
+            .write()
+            .await
+            .insert(device_id.clone(), generation);
         drop(sessions);
         let state = self.clone();
         tokio::spawn(async move {
@@ -234,21 +247,46 @@ impl AppState {
         let Ok(val) = serde_json::from_str::<serde_json::Value>(event_json) else {
             return;
         };
-        let event_type = val.get("event").and_then(|v| v.as_str()).unwrap_or_default();
+        let event_type = val
+            .get("event")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
         match event_type {
             "notification_callback" => {
                 if let Some(data) = val.get("data") {
-                    let key = data.get("key").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-                    let label = data.get("label").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-                    let title = data.get("title").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-                    let content = data.get("content").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-                    let icon = data.get("icon").and_then(|v| v.as_str()).map(|s| s.to_string());
-                    let timestamp = data.get("timestamp").and_then(|v| v.as_u64()).unwrap_or_else(|| {
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs()
-                    });
+                    let key = data
+                        .get("key")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let label = data
+                        .get("label")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let title = data
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let content = data
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let icon = data
+                        .get("icon")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let timestamp = data
+                        .get("timestamp")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or_else(|| {
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs()
+                        });
                     if !key.is_empty() {
                         let item = NotificationItem {
                             key,
@@ -286,9 +324,21 @@ impl AppState {
                 }
             }
             "clipboard_callback" => {
-                let content = val.get("content").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-                let source = val.get("source").and_then(|v| v.as_str()).unwrap_or("local").to_string();
-                let item_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("text").to_string();
+                let content = val
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let source = val
+                    .get("source")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("local")
+                    .to_string();
+                let item_type = val
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("text")
+                    .to_string();
                 if !content.is_empty() {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -340,6 +390,7 @@ mod tests {
                 device_id: "3B161P013CM00000".into(),
                 device_name: "一加 15T".into(),
                 device_model: "PLZ110".into(),
+                device_type: "phone".into(),
                 brand: String::new(),
                 os_version: String::new(),
                 battery: 90,
@@ -379,6 +430,7 @@ mod tests {
                 device_id: "C77C702EC021".into(),
                 device_name: "一加 15T".into(),
                 device_model: "2B1488".into(),
+                device_type: "phone".into(),
                 brand: String::new(),
                 os_version: String::new(),
                 battery: 90,
@@ -415,6 +467,7 @@ mod tests {
                 device_id: "C77C702EC021".into(),
                 device_name: "一加 15T".into(),
                 device_model: "2B1488".into(),
+                device_type: "phone".into(),
                 brand: String::new(),
                 os_version: String::new(),
                 battery: 90,
@@ -492,4 +545,3 @@ mod tests {
         assert_eq!(remote.as_deref(), Some("Copied from phone"));
     }
 }
-

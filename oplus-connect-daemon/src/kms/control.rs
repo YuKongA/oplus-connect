@@ -1,6 +1,6 @@
 //! KMS control ownership shared by authenticated Panta sessions and IPC.
 use crate::kms::input::InputEvent;
-use crate::kms::server::{Server, ServerConfig, SessionStatus};
+use crate::kms::server::{CrossBack, Server, ServerConfig, SessionStatus};
 use crate::panta;
 use serde::Serialize;
 use std::{
@@ -10,7 +10,7 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot};
 
-const QUEUE_CAPACITY: usize = 16;
+const QUEUE_CAPACITY: usize = 128;
 
 pub enum BusCommand {
     Start {
@@ -31,6 +31,10 @@ pub enum BusCommand {
     Release {
         generation: u64,
         reply: oneshot::Sender<Result<(), String>>,
+    },
+    Receive {
+        generation: u64,
+        reply: oneshot::Sender<Result<Option<CrossBack>, String>>,
     },
 }
 
@@ -183,13 +187,28 @@ impl KmsRegistry {
     ) -> Result<(), String> {
         let sender = self.sender_for_device(device_id)?;
         let (reply, result) = oneshot::channel();
-        sender
-            .try_send(BusCommand::Input {
-                generation: connection_id,
-                event,
-                reply,
-            })
-            .map_err(|_| "authenticated Panta bus control queue is closed or full".to_string())?;
+        let is_move = matches!(event, InputEvent::Move { .. });
+        if let Err(error) = sender.try_send(BusCommand::Input {
+            generation: connection_id,
+            event,
+            reply,
+        }) {
+            match error {
+                mpsc::error::TrySendError::Full(_) if is_move => {
+                    tracing::debug!(
+                        device_id,
+                        "KMS queue saturated; dropping intermediate motion under network backpressure"
+                    );
+                    return Ok(());
+                }
+                mpsc::error::TrySendError::Full(_) => {
+                    return Err("authenticated Panta bus control queue is full".to_string());
+                }
+                mpsc::error::TrySendError::Closed(_) => {
+                    return Err("authenticated Panta bus control queue is closed".to_string());
+                }
+            }
+        }
         tokio::time::timeout(crate::kms::server::WRITE_TIMEOUT, result)
             .await
             .map_err(|_| "timed out waiting for authenticated Panta bus".to_string())?
@@ -201,6 +220,24 @@ impl KmsRegistry {
         let (reply, result) = oneshot::channel();
         sender
             .try_send(BusCommand::Release {
+                generation: connection_id,
+                reply,
+            })
+            .map_err(|_| "authenticated Panta bus control queue is closed or full".to_string())?;
+        tokio::time::timeout(crate::kms::server::WRITE_TIMEOUT, result)
+            .await
+            .map_err(|_| "timed out waiting for authenticated Panta bus".to_string())?
+            .map_err(|_| "authenticated Panta bus closed".to_string())?
+    }
+    pub async fn receive(
+        &self,
+        device_id: &str,
+        connection_id: u64,
+    ) -> Result<Option<CrossBack>, String> {
+        let sender = self.sender_for_device(device_id)?;
+        let (reply, result) = oneshot::channel();
+        sender
+            .try_send(BusCommand::Receive {
                 generation: connection_id,
                 reply,
             })
@@ -303,7 +340,9 @@ impl BusRegistration {
 
 impl Controller {
     pub fn try_next(&mut self) -> Option<BusCommand> {
-        self.pending.take().or_else(|| self.receiver.try_recv().ok())
+        self.pending
+            .take()
+            .or_else(|| self.receiver.try_recv().ok())
     }
 
     pub async fn wait_command(&mut self) {
@@ -312,6 +351,9 @@ impl Controller {
         }
     }
     pub async fn start(&mut self, config: ServerConfig) -> Result<StartPublication, String> {
+        if self.peer_type != 10 {
+            return Err("KMS requires a tablet peer (EPI category 10)".into());
+        }
         if self.server.is_some() {
             return Err("KMS session already active".to_string());
         }
@@ -338,10 +380,7 @@ impl Controller {
             &server,
         );
         self.server = Some(server);
-        Ok(StartPublication {
-            info,
-            device_info,
-        })
+        Ok(StartPublication { info, device_info })
     }
     pub async fn send_input(
         &mut self,
@@ -373,6 +412,19 @@ impl Controller {
             .release_input_for_generation(connection_id)
             .await
             .map_err(|error| format!("KMS input release failed: {error}"))
+    }
+    pub async fn receive(&self, connection_id: u64) -> Result<Option<CrossBack>, String> {
+        let server = self
+            .server
+            .as_ref()
+            .ok_or_else(|| "KMS session is not active".to_string())?;
+        if server.connection_id() != Some(connection_id) {
+            return Err("KMS connection ID is stale".to_string());
+        }
+        server
+            .receive_cross_back_for_generation(connection_id)
+            .await
+            .map_err(|error| format!("KMS receive failed: {error}"))
     }
 
     pub async fn stop(&mut self) -> Result<(), String> {
@@ -540,6 +592,35 @@ mod tests {
             panic!("missing queued input")
         };
         assert!(reply.is_closed());
+    }
+    #[tokio::test]
+    async fn start_rejects_phone_and_unknown_categories_without_binding() {
+        for category in [0, 8] {
+            let registry = KmsRegistry::new();
+            let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+            let mut controller = registry
+                .register_bus("tablet-name-is-not-a-capability", ip, ip)
+                .unwrap()
+                .into_controller(
+                    "TABLET-NAME-IS-NOT-A-CAPABILITY".into(),
+                    "OPPO Pad Mini".into(),
+                    category,
+                    "PC".into(),
+                    "local".into(),
+                );
+            let result = controller
+                .start(ServerConfig {
+                    device_id: "TABLET-NAME-IS-NOT-A-CAPABILITY".into(),
+                    peer_ip: ip,
+                    bind_ip: ip,
+                    width: 1920,
+                    height: 1080,
+                    direction: 1,
+                })
+                .await;
+            assert!(result.is_err());
+            assert!(controller.server.is_none());
+        }
     }
 }
 fn normalize(id: &str) -> String {

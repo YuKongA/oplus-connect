@@ -8,7 +8,7 @@ use serde::Deserialize;
 use std::io;
 
 /// A single input event in the KMS native protocol.
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, serde::Serialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum InputEvent {
     Move {
@@ -41,7 +41,7 @@ impl InputEvent {
             Self::Key { key_code, .. } if *key_code == 0 => {
                 Err(invalid("KMS key code must be nonzero"))
             }
-            Self::Button { button_type, .. } if *button_type > 1 => {
+            Self::Button { button_type, .. } if !matches!(*button_type, 0 | 1 | 2 | 6 | 8) => {
                 Err(invalid("unsupported KMS button type"))
             }
             Self::Enter { pct_x, pct_y } if !pct_x.is_finite() || !pct_y.is_finite() => {
@@ -225,14 +225,26 @@ mod tests {
             .validate()
             .is_err()
         );
-        assert!(
-            InputEvent::Button {
-                button_type: 2,
-                pressed: true
-            }
-            .validate()
-            .is_err()
-        );
+        for valid in [0, 1, 2, 6, 8] {
+            assert!(
+                InputEvent::Button {
+                    button_type: valid,
+                    pressed: true
+                }
+                .validate()
+                .is_ok()
+            );
+        }
+        for invalid_type in [3, 4, 5, 7, 9, 255] {
+            assert!(
+                InputEvent::Button {
+                    button_type: invalid_type,
+                    pressed: true
+                }
+                .validate()
+                .is_err()
+            );
+        }
         assert!(
             InputEvent::Enter {
                 pct_x: f64::NAN,

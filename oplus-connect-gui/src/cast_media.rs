@@ -7,8 +7,8 @@
 use anyhow::{anyhow, bail, Context, Result};
 use gstreamer as gst;
 use gstreamer_sdp as gst_sdp;
-use gstreamer_webrtc as gst_webrtc;
 use gstreamer_video::{self as gst_video, prelude::*};
+use gstreamer_webrtc as gst_webrtc;
 use std::{
     collections::VecDeque,
     sync::{
@@ -92,23 +92,33 @@ fn display_size(width: u32, height: u32, par: gst::Fraction) -> (u32, u32) {
     let width = width.max(2) as f64 * ratio;
     let height = height.max(2) as f64;
     let scale = (MAX_SIDE / width.max(height)).min(1.0);
-    (((width * scale) as u32 & !1).max(2), ((height * scale) as u32 & !1).max(2))
+    (
+        ((width * scale) as u32 & !1).max(2),
+        ((height * scale) as u32 & !1).max(2),
+    )
 }
 
 fn packed_bgra(plane: &[u8], stride: i32, width: u32, height: u32) -> Result<Vec<u8>> {
-    let row_bytes = (width as usize).checked_mul(4).context("BGRA row size overflow")?;
+    let row_bytes = (width as usize)
+        .checked_mul(4)
+        .context("BGRA row size overflow")?;
     let stride = usize::try_from(stride).context("negative BGRA stride")?;
     let height = height as usize;
     if row_bytes == 0 || height == 0 || stride < row_bytes {
         bail!("invalid BGRA dimensions or stride");
     }
-    let required = (height - 1).checked_mul(stride)
+    let required = (height - 1)
+        .checked_mul(stride)
         .and_then(|offset| offset.checked_add(row_bytes))
         .context("BGRA plane size overflow")?;
     if plane.len() < required {
         bail!("BGRA plane is smaller than its negotiated layout");
     }
-    let mut data = Vec::with_capacity(row_bytes.checked_mul(height).context("BGRA size overflow")?);
+    let mut data = Vec::with_capacity(
+        row_bytes
+            .checked_mul(height)
+            .context("BGRA size overflow")?,
+    );
     for row in 0..height {
         let offset = row * stride;
         data.extend_from_slice(&plane[offset..offset + row_bytes]);
@@ -208,7 +218,13 @@ pub fn probe_config(config: &ReceiverConfig) -> Result<()> {
     // Audio elements are only required when the cast audio switch is on.
     let mut required: Vec<&str> = required.to_vec();
     if config.audio_enabled {
-        required.extend(["rtpopusdepay", "opusdec", "audioconvert", "audioresample", "autoaudiosink"]);
+        required.extend([
+            "rtpopusdepay",
+            "opusdec",
+            "audioconvert",
+            "audioresample",
+            "autoaudiosink",
+        ]);
     }
     if config.h265_enabled {
         required.extend(["rtph265depay", "h265parse", "vah265dec"]);
@@ -247,8 +263,14 @@ pub fn spawn_receiver(config: ReceiverConfig) -> Result<MediaReceiver> {
     let thread = thread::Builder::new()
         .name("oplus-media-receiver".into())
         .spawn(move || {
-            let result =
-                run_pipeline(incoming_rx, input_rx, outgoing_tx, &worker_stop, &worker_status, &config);
+            let result = run_pipeline(
+                incoming_rx,
+                input_rx,
+                outgoing_tx,
+                &worker_stop,
+                &worker_status,
+                &config,
+            );
             if let Err(error) = result {
                 if !worker_stop.load(Ordering::Acquire) {
                     let detail = format!("{error:#}");
@@ -293,7 +315,9 @@ impl MediaReceiver {
         if !self.status.input_ready.load(Ordering::Acquire) {
             bail!("cast data channel is not open");
         }
-        let permit = self.inputs.try_reserve()
+        let permit = self
+            .inputs
+            .try_reserve()
             .map_err(|_| anyhow!("cast input queue is closed or full"))?;
         let mut message = Vec::with_capacity(frame.len() + 8);
         message.extend_from_slice(frame);
@@ -390,7 +414,13 @@ fn mline_summary(sdp: &str) -> String {
             if let Some(previous) = current.take() {
                 lines.push(previous);
             }
-            current = Some(section.split_whitespace().take(2).collect::<Vec<_>>().join(" "));
+            current = Some(
+                section
+                    .split_whitespace()
+                    .take(2)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
             continue;
         }
         if let Some(mid) = line.strip_prefix("a=mid:") {
@@ -400,7 +430,11 @@ fn mline_summary(sdp: &str) -> String {
             continue;
         }
         if let Some(section) = current.as_mut() {
-            if line == "a=sendonly" || line == "a=recvonly" || line == "a=inactive" || line == "a=sendrecv" {
+            if line == "a=sendonly"
+                || line == "a=recvonly"
+                || line == "a=inactive"
+                || line == "a=sendrecv"
+            {
                 section.push_str(&format!(" {}", &line[2..]));
             }
         }
@@ -509,7 +543,9 @@ fn normalize_offer(sdp: &str) -> String {
         }
         if let Some(rest) = line.strip_prefix("m=") {
             let mut parts = rest.split_whitespace();
-            let bundled = source.clone().take_while(|line| !line.starts_with("m="))
+            let bundled = source
+                .clone()
+                .take_while(|line| !line.starts_with("m="))
                 .any(|line| line == "a=bundle-only");
             if let (Some(kind), Some("0"), true) = (parts.next(), parts.next(), bundled) {
                 let mut rewritten = format!("m={kind} 9");
@@ -548,23 +584,37 @@ fn patch_audio_section(lines: &mut Vec<String>) {
             end += 1;
         }
         if lines[start].starts_with("m=audio ")
-            && lines[start..end].iter().any(|line| line.starts_with("a=mid:"))
-            && lines[start..end].iter().any(|line| line.starts_with("a=rtpmap:111 "))
+            && lines[start..end]
+                .iter()
+                .any(|line| line.starts_with("a=mid:"))
+            && lines[start..end]
+                .iter()
+                .any(|line| line.starts_with("a=rtpmap:111 "))
         {
             for index in (start..end).rev() {
-                if lines[index].starts_with("a=extmap:") || lines[index].starts_with("a=fmtp:111 ") {
+                if lines[index].starts_with("a=extmap:") || lines[index].starts_with("a=fmtp:111 ")
+                {
                     lines.remove(index);
                     end -= 1;
                 }
             }
-            let rtpmap = start + lines[start..end].iter()
-                .position(|line| line.starts_with("a=rtpmap:111 ")).unwrap();
+            let rtpmap = start
+                + lines[start..end]
+                    .iter()
+                    .position(|line| line.starts_with("a=rtpmap:111 "))
+                    .unwrap();
             lines[rtpmap] = "a=rtpmap:111 opus/48000/2".to_string();
             lines.insert(rtpmap + 1, FMTP.to_string());
             end += 1;
-            let mid = start + lines[start..end].iter()
-                .position(|line| line.starts_with("a=mid:")).unwrap();
-            lines.splice(mid + 1..mid + 1, EXTMAPS.iter().map(|line| (*line).to_string()));
+            let mid = start
+                + lines[start..end]
+                    .iter()
+                    .position(|line| line.starts_with("a=mid:"))
+                    .unwrap();
+            lines.splice(
+                mid + 1..mid + 1,
+                EXTMAPS.iter().map(|line| (*line).to_string()),
+            );
             end += EXTMAPS.len();
         }
         start = end;
@@ -572,7 +622,9 @@ fn patch_audio_section(lines: &mut Vec<String>) {
 }
 
 fn audio_only_without_data(sdp: &gst_sdp::SDPMessageRef) -> bool {
-    let session_direction = sdp.attributes().map(|attribute| attribute.key())
+    let session_direction = sdp
+        .attributes()
+        .map(|attribute| attribute.key())
         .find(|key| matches!(*key, "inactive" | "recvonly" | "sendonly" | "sendrecv"))
         .unwrap_or("sendrecv");
     let mut audio = false;
@@ -580,7 +632,9 @@ fn audio_only_without_data(sdp: &gst_sdp::SDPMessageRef) -> bool {
         if media.media() == Some("application") {
             return false;
         }
-        let direction = media.attributes().map(|attribute| attribute.key())
+        let direction = media
+            .attributes()
+            .map(|attribute| attribute.key())
             .find(|key| matches!(*key, "inactive" | "recvonly" | "sendonly" | "sendrecv"))
             .unwrap_or(session_direction);
         if matches!(direction, "inactive" | "recvonly") {
@@ -633,8 +687,8 @@ fn attach_video(
          {parse} name=parser ! {decoder} name=decoder ! vapostproc name=scale ! \
          capsfilter name=display ! appsink name=frames max-buffers=2 drop=true sync=false"
     );
-    let bin = gst::parse::bin_from_description(&description, true)
-        .context("creating VA decode bin")?;
+    let bin =
+        gst::parse::bin_from_description(&description, true).context("creating VA decode bin")?;
     let sink = bin
         .static_pad("sink")
         .ok_or_else(|| anyhow!("decode bin has no sink pad"))?;
@@ -664,10 +718,14 @@ fn attach_video(
                     tracing::debug!("cast video scaled caps {:?}", event.caps());
                     if let Some(structure) = event.caps().structure(0) {
                         if let Ok(width) = structure.get::<i32>("width") {
-                            scale_status.width.store(width.max(0) as u32, Ordering::Relaxed);
+                            scale_status
+                                .width
+                                .store(width.max(0) as u32, Ordering::Relaxed);
                         }
                         if let Ok(height) = structure.get::<i32>("height") {
-                            scale_status.height.store(height.max(0) as u32, Ordering::Relaxed);
+                            scale_status
+                                .height
+                                .store(height.max(0) as u32, Ordering::Relaxed);
                         }
                     }
                 }
@@ -702,9 +760,15 @@ fn attach_video(
                     Ok(VideoFrame {
                         width: mapped.width(),
                         height: mapped.height(),
-                        data: packed_bgra(mapped.plane_data(0)?, stride, mapped.width(), mapped.height())?,
+                        data: packed_bgra(
+                            mapped.plane_data(0)?,
+                            stride,
+                            mapped.width(),
+                            mapped.height(),
+                        )?,
                     })
-                })().map_err(|error| {
+                })()
+                .map_err(|error| {
                     frame_status.fail(format!("mapping decoded video: {error:#}"));
                     gst::FlowError::Error
                 })?;
@@ -741,17 +805,14 @@ fn attach_video(
                                 structure.get::<i32>("height"),
                             ) {
                                 if width > 0 && height > 0 {
-                                    let par = structure.get::<gst::Fraction>("pixel-aspect-ratio")
+                                    let par = structure
+                                        .get::<gst::Fraction>("pixel-aspect-ratio")
                                         .unwrap_or_else(|_| gst::Fraction::new(1, 1));
                                     let (scaled_width, scaled_height) =
                                         display_size(width as u32, height as u32, par);
-                                    if decoded_status
-                                        .display_width
-                                        .load(Ordering::Relaxed)
+                                    if decoded_status.display_width.load(Ordering::Relaxed)
                                         == scaled_width
-                                        && decoded_status
-                                            .display_height
-                                            .load(Ordering::Relaxed)
+                                        && decoded_status.display_height.load(Ordering::Relaxed)
                                             == scaled_height
                                     {
                                         return gst::PadProbeReturn::Ok;
@@ -817,8 +878,7 @@ fn run_pipeline(
     config: &ReceiverConfig,
 ) -> Result<()> {
     let mids: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let ice_pending: Arc<Mutex<VecDeque<SignalingMessage>>> =
-        Arc::new(Mutex::new(VecDeque::new()));
+    let ice_pending: Arc<Mutex<VecDeque<SignalingMessage>>> = Arc::new(Mutex::new(VecDeque::new()));
     let pipeline = gst::Pipeline::with_name("oplus-media-receiver");
     let _guard = PipelineGuard(pipeline.clone());
     let webrtc = gst::ElementFactory::make("webrtcbin")
@@ -882,35 +942,32 @@ fn run_pipeline(
         // Attach on the first CAPS event, when the media type is known.
         let pipeline = weak.clone();
         let status = pad_status.clone();
-        pad.add_probe(
-            gst::PadProbeType::EVENT_DOWNSTREAM,
-            move |pad, info| {
-                let Some(gst::PadProbeData::Event(event)) = info.data.as_ref() else {
-                    return gst::PadProbeReturn::Ok;
+        pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |pad, info| {
+            let Some(gst::PadProbeData::Event(event)) = info.data.as_ref() else {
+                return gst::PadProbeReturn::Ok;
+            };
+            let gst::EventView::Caps(event) = event.view() else {
+                return gst::PadProbeReturn::Ok;
+            };
+            let caps = event.caps().to_owned();
+            let media = caps
+                .structure(0)
+                .and_then(|structure| structure.get::<&str>("media").ok())
+                .map(str::to_owned)
+                .unwrap_or_default();
+            tracing::debug!("cast media pad caps media={media}");
+            if let Some(pipeline) = pipeline.upgrade() {
+                let result = if media == "audio" {
+                    attach_audio(&pipeline, pad)
+                } else {
+                    attach_video(&pipeline, pad, &caps, &status)
                 };
-                let gst::EventView::Caps(event) = event.view() else {
-                    return gst::PadProbeReturn::Ok;
-                };
-                let caps = event.caps().to_owned();
-                let media = caps
-                    .structure(0)
-                    .and_then(|structure| structure.get::<&str>("media").ok())
-                    .map(str::to_owned)
-                    .unwrap_or_default();
-                tracing::debug!("cast media pad caps media={media}");
-                if let Some(pipeline) = pipeline.upgrade() {
-                    let result = if media == "audio" {
-                        attach_audio(&pipeline, pad)
-                    } else {
-                        attach_video(&pipeline, pad, &caps, &status)
-                    };
-                    if let Err(error) = result {
-                        status.fail(format!("{error:#}"));
-                    }
+                if let Err(error) = result {
+                    status.fail(format!("{error:#}"));
                 }
-                gst::PadProbeReturn::Remove
-            },
-        );
+            }
+            gst::PadProbeReturn::Remove
+        });
     });
     let ice_status = status.clone();
     let ice_mids = mids.clone();
@@ -928,7 +985,8 @@ fn run_pipeline(
                 // All candidates share one FIFO; only the worker flushes it,
                 // after publishing SDP, so callbacks cannot overtake it.
                 let mut pending = ice_pending_handler
-                    .lock().unwrap_or_else(|error| error.into_inner());
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
                 if pending.len() >= MAX_PENDING_ICE {
                     ice_status.fail("too many pending outgoing ICE candidates");
                 } else {
@@ -952,7 +1010,9 @@ fn run_pipeline(
             gst_webrtc::WebRTCPeerConnectionState::Failed => {
                 connection_status.fail("WebRTC peer connection failed")
             }
-            gst_webrtc::WebRTCPeerConnectionState::Closed if !connection_stop.load(Ordering::Acquire) => {
+            gst_webrtc::WebRTCPeerConnectionState::Closed
+                if !connection_stop.load(Ordering::Acquire) =>
+            {
                 connection_status.fail("WebRTC peer connection closed unexpectedly");
             }
             _ => {}
@@ -1007,8 +1067,7 @@ fn run_pipeline(
                 .unwrap_or(0);
             message.extend_from_slice(&now.to_be_bytes());
             tracing::debug!("reverse control send {} bytes", message.len());
-            if let Err(error) =
-                channel.send_data_full(Some(&gst::glib::Bytes::from_owned(message)))
+            if let Err(error) = channel.send_data_full(Some(&gst::glib::Bytes::from_owned(message)))
             {
                 bail!("reverse control send failed: {error}");
             }
@@ -1082,12 +1141,18 @@ fn run_pipeline(
                         .src()
                         .map(|source| source.path_string())
                         .unwrap_or_default();
-                    let sctp_source = error.src()
+                    let sctp_source = error
+                        .src()
                         .and_then(|source| source.downcast_ref::<gst::Element>())
                         .and_then(|element| element.factory())
-                        .is_some_and(|factory| matches!(factory.name().as_str(), "sctpenc" | "sctpdec"));
+                        .is_some_and(|factory| {
+                            matches!(factory.name().as_str(), "sctpenc" | "sctpdec")
+                        });
                     if optional_sctp && sctp_source {
-                        tracing::warn!("audio-only peer rejected its unused SCTP transport: {}", error.error());
+                        tracing::warn!(
+                            "audio-only peer rejected its unused SCTP transport: {}",
+                            error.error()
+                        );
                         continue;
                     }
                     bail!(
@@ -1107,7 +1172,10 @@ fn run_pipeline(
 
 #[cfg(test)]
 mod tests {
-    use super::{audio_only_without_data, display_size, packed_bgra, flush_pending_ice, normalize_offer, offer_mids, SignalingMessage};
+    use super::{
+        audio_only_without_data, display_size, flush_pending_ice, normalize_offer, offer_mids,
+        packed_bgra, SignalingMessage,
+    };
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
@@ -1117,14 +1185,20 @@ mod tests {
         let square = gstreamer::Fraction::new(1, 1);
         assert_eq!(display_size(1080, 2344, square), (718, 1560));
         assert_eq!(display_size(2344, 1080, square), (1560, 718));
-        assert_eq!(display_size(720, 576, gstreamer::Fraction::new(16, 15)), (768, 576));
+        assert_eq!(
+            display_size(720, 576, gstreamer::Fraction::new(16, 15)),
+            (768, 576)
+        );
         assert_eq!(display_size(1, 1, square), (2, 2));
     }
 
     #[test]
     fn bgra_copy_removes_padding_and_rejects_invalid_planes() {
         let plane = [1, 2, 3, 4, 99, 99, 99, 99, 5, 6, 7, 8];
-        assert_eq!(packed_bgra(&plane, 8, 1, 2).unwrap(), [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(
+            packed_bgra(&plane, 8, 1, 2).unwrap(),
+            [1, 2, 3, 4, 5, 6, 7, 8]
+        );
         assert!(packed_bgra(&plane[..11], 8, 1, 2).is_err());
         assert!(packed_bgra(&plane, 3, 1, 2).is_err());
         assert!(packed_bgra(&plane, -8, 1, 2).is_err());
@@ -1164,18 +1238,36 @@ mod tests {
             audio_only_without_data(&sdp)
         };
         assert!(permits(audio));
-        assert!(permits(&format!("{audio}m=video 9 UDP/TLS/RTP/SAVPF 100\r\na=inactive\r\n")));
-        assert!(!permits(&format!("{audio}m=video 9 UDP/TLS/RTP/SAVPF 100\r\na=sendonly\r\n")));
-        assert!(!permits(&format!("{audio}m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n")));
+        assert!(permits(&format!(
+            "{audio}m=video 9 UDP/TLS/RTP/SAVPF 100\r\na=inactive\r\n"
+        )));
+        assert!(!permits(&format!(
+            "{audio}m=video 9 UDP/TLS/RTP/SAVPF 100\r\na=sendonly\r\n"
+        )));
+        assert!(!permits(&format!(
+            "{audio}m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n"
+        )));
         assert!(!permits("v=0\r\nm=audio 0 UDP/TLS/RTP/SAVPF 111\r\n"));
     }
 
     #[tokio::test]
     async fn full_ice_queue_preserves_order_until_capacity_returns() {
         let (tx, mut rx) = mpsc::channel(1);
-        tx.try_send(SignalingMessage::Sdp { type_: "offer".into(), sdp: "v=0".into() }).unwrap();
-        let first = SignalingMessage::Ice { candidate: "first".into(), sdp_mline_index: 0, mid: Some("video0".into()) };
-        let second = SignalingMessage::Ice { candidate: "second".into(), sdp_mline_index: 0, mid: Some("video0".into()) };
+        tx.try_send(SignalingMessage::Sdp {
+            type_: "offer".into(),
+            sdp: "v=0".into(),
+        })
+        .unwrap();
+        let first = SignalingMessage::Ice {
+            candidate: "first".into(),
+            sdp_mline_index: 0,
+            mid: Some("video0".into()),
+        };
+        let second = SignalingMessage::Ice {
+            candidate: "second".into(),
+            sdp_mline_index: 0,
+            mid: Some("video0".into()),
+        };
         let pending = Arc::new(Mutex::new(VecDeque::from([first.clone(), second.clone()])));
         flush_pending_ice(&tx, &pending).unwrap();
         assert_eq!(pending.lock().unwrap().len(), 2);
@@ -1203,8 +1295,14 @@ mod tests {
         })
         .unwrap();
         flush_pending_ice(&tx, &pending).unwrap();
-        assert!(matches!(rx.try_recv().unwrap(), SignalingMessage::Sdp { .. }));
-        assert!(matches!(rx.try_recv().unwrap(), SignalingMessage::Ice { .. }));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            SignalingMessage::Sdp { .. }
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            SignalingMessage::Ice { .. }
+        ));
         assert!(pending.lock().unwrap().is_empty());
     }
 
@@ -1224,7 +1322,10 @@ a=mid:application2\r\n";
     #[test]
     fn offer_normalization_matches_the_captured_wire_details() {
         let output = normalize_offer(OFFER);
-        assert!(output.contains("m=video 9 UDP/TLS/RTP/SAVPF 102"), "{output}");
+        assert!(
+            output.contains("m=video 9 UDP/TLS/RTP/SAVPF 102"),
+            "{output}"
+        );
         assert!(
             output.contains("m=application 9 UDP/DTLS/SCTP webrtc-datachannel"),
             "{output}"
@@ -1233,11 +1334,10 @@ a=mid:application2\r\n";
         assert!(!output.contains("rtcp-mux-only"), "{output}");
         // Mids and BUNDLE must stay exactly as webrtcbin generated them, because
         // set-local-description matches transceivers by mid.
-        assert!(output.contains("a=group:BUNDLE audio0 video1 application2"), "{output}");
-        assert_eq!(
-            offer_mids(&output),
-            ["audio0", "video1", "application2"]
+        assert!(
+            output.contains("a=group:BUNDLE audio0 video1 application2"),
+            "{output}"
         );
+        assert_eq!(offer_mids(&output), ["audio0", "video1", "application2"]);
     }
 }
-

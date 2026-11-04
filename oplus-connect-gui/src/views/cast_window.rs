@@ -1,6 +1,6 @@
 use crate::cast_input;
-use crate::cast_session::InputSender;
 use crate::cast_media::VideoFrame;
+use crate::cast_session::InputSender;
 use gpui_kit::component::TitleBar as KitTitleBar;
 use gpui_kit::*;
 use smallvec::SmallVec;
@@ -54,9 +54,17 @@ impl CastWindow {
                         continue;
                     };
                     state.budget -= delta as f32;
-                    if sender.send(cast_input::scroll(
-                        0, delta, state.x, state.y, state.width, state.height,
-                    )).is_err() {
+                    if sender
+                        .send(cast_input::scroll(
+                            0,
+                            delta,
+                            state.x,
+                            state.y,
+                            state.width,
+                            state.height,
+                        ))
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -107,20 +115,30 @@ impl CastWindow {
             return;
         }
         let meta = cast_input::meta_state(
-            event.modifiers.shift, event.modifiers.control, event.modifiers.alt,
+            event.modifiers.shift,
+            event.modifiers.control,
+            event.modifiers.alt,
         );
         let input = self.input.as_ref();
-        self.keyboard.key_changed(cast_input::android_keycode(&event.key), meta, pressed, |frame| {
-            if let Some(input) = input {
-                let _ = input.send(frame.to_vec());
-            }
-        });
+        self.keyboard.key_changed(
+            cast_input::android_keycode(&event.key),
+            meta,
+            pressed,
+            |frame| {
+                if let Some(input) = input {
+                    let _ = input.send(frame.to_vec());
+                }
+            },
+        );
     }
 
     fn send_pointer(&mut self, action: u8, x: i32, y: i32) {
         let now = std::time::Instant::now();
         // Always forward presses and releases, even at the same coordinates.
-        let throttle = matches!(action, cast_input::ACTION_MOVE | cast_input::ACTION_HOVER_MOVE);
+        let throttle = matches!(
+            action,
+            cast_input::ACTION_MOVE | cast_input::ACTION_HOVER_MOVE
+        );
         if action == cast_input::ACTION_HOVER_MOVE {
             if let Some(at) = self.release_at {
                 if at.elapsed() < std::time::Duration::from_millis(250) {
@@ -189,14 +207,16 @@ impl Drop for CastWindow {
 impl Render for CastWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.subscriptions.is_empty() {
-            self.subscriptions.push(cx.on_blur(&self.focus, window, |this, _, _| {
-                this.release_input();
-            }));
-            self.subscriptions.push(cx.observe_window_activation(window, |this, window, _| {
-                if !window.is_window_active() {
+            self.subscriptions
+                .push(cx.on_blur(&self.focus, window, |this, _, _| {
                     this.release_input();
-                }
-            }));
+                }));
+            self.subscriptions
+                .push(cx.observe_window_activation(window, |this, window, _| {
+                    if !window.is_window_active() {
+                        this.release_input();
+                    }
+                }));
         }
         let title = div()
             .flex()
@@ -312,20 +332,24 @@ impl Render for CastWindow {
                     .on_key_up(cx.listener(|this, event: &KeyUpEvent, _window, _cx| {
                         this.key_changed(&event.keystroke, false);
                     }))
-                    .on_modifiers_changed(cx.listener(|this, event: &ModifiersChangedEvent, _window, _cx| {
-                        if !this.input_enabled {
-                            return;
-                        }
-                        let meta = cast_input::meta_state(
-                            event.modifiers.shift, event.modifiers.control, event.modifiers.alt,
-                        );
-                        let input = this.input.as_ref();
-                        this.keyboard.modifiers_changed(meta, |frame| {
-                            if let Some(input) = input {
-                                let _ = input.send(frame.to_vec());
+                    .on_modifiers_changed(cx.listener(
+                        |this, event: &ModifiersChangedEvent, _window, _cx| {
+                            if !this.input_enabled {
+                                return;
                             }
-                        });
-                    }))
+                            let meta = cast_input::meta_state(
+                                event.modifiers.shift,
+                                event.modifiers.control,
+                                event.modifiers.alt,
+                            );
+                            let input = this.input.as_ref();
+                            this.keyboard.modifiers_changed(meta, |frame| {
+                                if let Some(input) = input {
+                                    let _ = input.send(frame.to_vec());
+                                }
+                            });
+                        },
+                    ))
                     .children(self.frame.clone().map(|frame| {
                         img(ImageSource::Render(frame))
                             .object_fit(ObjectFit::Contain)

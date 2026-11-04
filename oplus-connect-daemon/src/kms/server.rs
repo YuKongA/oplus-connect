@@ -36,7 +36,7 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_BODY_LEN: u32 = 64 * 1024;
 
-const INPUT_QUEUE_CAPACITY: usize = 16;
+const INPUT_QUEUE_CAPACITY: usize = 128;
 
 fn next_connection_id() -> u64 {
     loop {
@@ -81,7 +81,7 @@ pub enum SessionStatus {
     Closed,
 }
 
-/// Latest inbound MotionEvent payload. Coordinates belong to the peer display;
+/// Latest inbound pointer payload. Coordinates belong to the peer display;
 /// this is observation only and never causes local pointer movement.
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
 pub struct PeerPointerEvent {
@@ -108,6 +108,20 @@ pub struct PeerPointer {
     pub y: f64,
 }
 
+/// A supported peer-to-host cross-back event, returned once by `/kms/receive`.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq)]
+pub struct CrossBack {
+    pub pct_x: f64,
+    pub pct_y: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CrossBackSnapshot {
+    generation: u64,
+    pct_x: f64,
+    pct_y: f64,
+}
+
 fn parse_pointer_event(body: &[u8]) -> io::Result<PeerPointerEvent> {
     // The frame codec caps the incoming JSON at 64 KiB before allocation.
     // Bound retained points as well; keep only the latest event, never history.
@@ -127,6 +141,33 @@ fn parse_pointer_event(body: &[u8]) -> io::Result<PeerPointerEvent> {
     Ok(event)
 }
 
+fn cross_back_pct(
+    event: &PeerPointerEvent,
+    peer_width: u32,
+    peer_height: u32,
+) -> Option<(f64, f64)> {
+    let point = event.pts.first()?;
+    if event.pts.len() != 1
+        || point.tool_t != 3
+        || !point.x.is_finite()
+        || !point.y.is_finite()
+        || peer_width == 0
+        || peer_height == 0
+        || point.x < 0.0
+        || point.x > f64::from(peer_width)
+        || point.y < 0.0
+        || point.y > f64::from(peer_height)
+    {
+        return None;
+    }
+    if !matches!(event.act, 2 | 7) {
+        return None;
+    }
+    let pct_x = point.x / f64::from(peer_width);
+    let pct_y = point.y / f64::from(peer_height);
+    (pct_x.is_finite() && pct_y.is_finite()).then_some((pct_x, pct_y))
+}
+
 /// Owns the only worker; dropping it aborts that worker and its TCP streams.
 /// Intentionally neither Debug nor Serialize: the password stays private.
 pub struct Server {
@@ -136,6 +177,7 @@ pub struct Server {
     test_data: String,
     status: watch::Receiver<SessionStatus>,
     latest_pointer: watch::Sender<Option<Arc<PeerPointerEvent>>>,
+    latest_cross_back: watch::Sender<Option<CrossBackSnapshot>>,
     input_tx: mpsc::Sender<InputCommand>,
     shutdown_tx: watch::Sender<bool>,
     connection_id: Arc<AtomicU64>,
@@ -172,7 +214,7 @@ impl Server {
             || config.peer_ip.is_unspecified()
             || !(1..=16384).contains(&config.width)
             || !(1..=16384).contains(&config.height)
-            || config.direction != 1
+            || !(1..=4).contains(&config.direction)
         {
             return Err(io::Error::new(
                 ErrorKind::InvalidInput,
@@ -205,6 +247,7 @@ impl Server {
         let test_data = STANDARD.encode(&test_frame[HEADER_LEN..]);
         let (status_tx, status) = watch::channel(SessionStatus::Listening);
         let (latest_pointer, _) = watch::channel(None);
+        let (latest_cross_back, _) = watch::channel(None);
         let (input_tx, input_rx) = mpsc::channel(INPUT_QUEUE_CAPACITY);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let connection_id = Arc::new(AtomicU64::new(0));
@@ -214,6 +257,7 @@ impl Server {
             codec,
             status_tx,
             latest_pointer.clone(),
+            latest_cross_back.clone(),
             timing,
             input_rx,
             shutdown_rx,
@@ -226,6 +270,7 @@ impl Server {
             test_data,
             status,
             latest_pointer,
+            latest_cross_back,
             input_tx,
             shutdown_tx,
             connection_id,
@@ -325,7 +370,23 @@ impl Server {
             .map_err(|_| timed_out("KMS input release timeout"))?
             .map_err(|_| closed())?
     }
-
+    /// Nonblocking snapshot consumption, scoped to the authenticated TCP token.
+    pub async fn receive_cross_back_for_generation(
+        &self,
+        generation: u64,
+    ) -> io::Result<Option<CrossBack>> {
+        if self.connection_id() != Some(generation) {
+            return Err(not_connected());
+        }
+        let snapshot = self.latest_cross_back.send_replace(None);
+        let result = snapshot
+            .filter(|snapshot| snapshot.generation == generation)
+            .map(|snapshot| CrossBack {
+                pct_x: snapshot.pct_x,
+                pct_y: snapshot.pct_y,
+            });
+        Ok(result)
+    }
     pub async fn shutdown(&mut self) {
         if self.closed {
             return;
@@ -337,6 +398,7 @@ impl Server {
             let _ = (&mut self.task).await;
         }
         self.latest_pointer.send_replace(None);
+        self.latest_cross_back.send_replace(None);
     }
 }
 
@@ -352,6 +414,7 @@ async fn accept_loop(
     codec: Codec,
     status: watch::Sender<SessionStatus>,
     latest_pointer: watch::Sender<Option<Arc<PeerPointerEvent>>>,
+    latest_cross_back: watch::Sender<Option<CrossBackSnapshot>>,
     timing: Timing,
     mut input_rx: mpsc::Receiver<InputCommand>,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -393,6 +456,7 @@ async fn accept_loop(
                 &codec,
                 &status,
                 &latest_pointer,
+                &latest_cross_back,
                 timing,
                 &mut input_rx,
                 &mut shutdown_rx,
@@ -412,6 +476,7 @@ async fn accept_loop(
         connection_id.store(0, Ordering::Release);
         drain_pending_commands(&mut input_rx);
         latest_pointer.send_replace(None);
+        latest_cross_back.send_replace(None);
         if *shutdown_rx.borrow() {
             break;
         }
@@ -451,13 +516,13 @@ struct Heartbeat {
     heartbeat_id: u64,
 }
 
-fn parse_resolution(body: &[u8]) -> io::Result<()> {
+fn parse_resolution(body: &[u8]) -> io::Result<(u32, u32)> {
     let resolution: Resolution<'_> =
         serde_json::from_slice(body).map_err(|_| invalid("invalid KMS resolution"))?;
     if resolution.sync_t != "resolution" || resolution.width == 0 || resolution.height == 0 {
         return Err(invalid("invalid KMS resolution"));
     }
-    Ok(())
+    Ok((resolution.width, resolution.height))
 }
 
 async fn handle_connection(
@@ -466,6 +531,7 @@ async fn handle_connection(
     codec: &Codec,
     status: &watch::Sender<SessionStatus>,
     latest_pointer: &watch::Sender<Option<Arc<PeerPointerEvent>>>,
+    latest_cross_back: &watch::Sender<Option<CrossBackSnapshot>>,
     timing: Timing,
     input_rx: &mut mpsc::Receiver<InputCommand>,
     shutdown_rx: &mut watch::Receiver<bool>,
@@ -475,6 +541,8 @@ async fn handle_connection(
     let deadline = Instant::now() + timing.handshake;
     // Timeout cancellation always closes this stream; it is never reused after
     // a partially consumed handshake frame.
+    // The peer resolution, not the host arrangement, defines normalized return coordinates.
+    let (mut peer_width, mut peer_height);
     {
         let handshake = timeout_at(deadline, async {
             let first = codec
@@ -508,7 +576,8 @@ async fn handle_connection(
                 handshake.await
             }
         };
-        handshake_result.map_err(|_| timed_out("KMS handshake timeout"))??;
+        (peer_width, peer_height) =
+            handshake_result.map_err(|_| timed_out("KMS handshake timeout"))??;
     }
 
     let (mut reader, mut writer) = stream.split();
@@ -535,7 +604,9 @@ async fn handle_connection(
         timing.write,
     )
     .await?;
-    connection_id.store(next_connection_id(), Ordering::Release);
+    let generation = next_connection_id();
+    connection_id.store(generation, Ordering::Release);
+    latest_cross_back.send_replace(None);
     status.send_replace(SessionStatus::Connected);
 
     let mut heartbeat =
@@ -563,6 +634,9 @@ async fn handle_connection(
                                 if connection_id.load(Ordering::Acquire) != generation {
                                     let _ = reply.send(Err(not_connected()));
                                     continue;
+                                }
+                                if matches!(&event, InputEvent::Enter { .. }) {
+                                    latest_cross_back.send_replace(None);
                                 }
                                 match send_input_event(codec, &mut writer, &mut output, &event, timing.write).await {
                                     Ok(()) => {
@@ -623,9 +697,20 @@ async fn handle_connection(
                     .map_err(|_| invalid("invalid KMS heartbeat echo"))?;
             }
             100 if frame.body == b"alive" => {}
-            1 => parse_resolution(frame.body)?,
+            1 => {
+                let (width, height) = parse_resolution(frame.body)?;
+                peer_width = width;
+                peer_height = height;
+            }
             2 => {
                 let event = parse_pointer_event(frame.body)?;
+                if let Some((pct_x, pct_y)) = cross_back_pct(&event, peer_width, peer_height) {
+                    latest_cross_back.send_replace(Some(CrossBackSnapshot {
+                        generation,
+                        pct_x,
+                        pct_y,
+                    }));
+                }
                 latest_pointer.send_replace(Some(Arc::new(event)));
             }
             _ => return Err(invalid("unsupported KMS control frame")),
@@ -636,7 +721,7 @@ async fn handle_connection(
 struct InputState {
     keys: [bool; 256],
     key_modifiers: [u32; 256],
-    buttons: [bool; 2],
+    buttons: [bool; 16],
 }
 
 impl Default for InputState {
@@ -644,7 +729,7 @@ impl Default for InputState {
         Self {
             keys: [false; 256],
             key_modifiers: [0; 256],
-            buttons: [false; 2],
+            buttons: [false; 16],
         }
     }
 }
@@ -662,7 +747,11 @@ impl InputState {
             InputEvent::Button {
                 button_type,
                 pressed,
-            } => self.buttons[*button_type as usize] = *pressed,
+            } => {
+                if let Some(slot) = self.buttons.get_mut(*button_type as usize) {
+                    *slot = *pressed;
+                }
+            }
             _ => {}
         }
     }
@@ -709,7 +798,8 @@ async fn release_all<W: AsyncWrite + Unpin>(
             state.key_modifiers[code as usize] = 0;
         }
     }
-    for button in 0..=1u8 {
+    const SUPPORTED_BUTTONS: [u8; 5] = [0, 1, 2, 6, 8];
+    for &button in &SUPPORTED_BUTTONS {
         if state.buttons[button as usize] {
             let event = InputEvent::Button {
                 button_type: button,

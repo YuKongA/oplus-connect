@@ -8,6 +8,7 @@ OPLUS 互联是面向 OPPO / OnePlus 设备的 Linux 原生客户端
 - 剪贴板双向同步
 - 手机消息通知镜像
 - 手机投屏：视频、音频与键鼠反控
+- 平板键鼠共享：键鼠双向自由穿梭
 
 ## 构建与运行
 
@@ -27,7 +28,7 @@ cargo run --release --manifest-path oplus-connect-gui/Cargo.toml
 
 单独调试后端：`cargo run --manifest-path oplus-connect-daemon/Cargo.toml`。
 
-发布构建为动态链接，运行时依赖需由打包声明。
+发布构建为动态链接，运行时依赖需由打包声明。平板键鼠共享基于 Wayland InputCapture portal v2，使用时需系统授权
 
 ## 配置
 

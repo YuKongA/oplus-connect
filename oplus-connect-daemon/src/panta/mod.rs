@@ -711,10 +711,12 @@ struct BusTopics {
 
 impl BusTopics {
     fn sync_json(&self) -> String {
-        let mut value: serde_json::Value = serde_json::from_str(OFFICIAL_WINDOWS_TOPIC_SYNC_JSON)
-            .expect("valid base topic sync");
+        let mut value: serde_json::Value =
+            serde_json::from_str(OFFICIAL_WINDOWS_TOPIC_SYNC_JSON).expect("valid base topic sync");
         for role in ["pub", "sub"] {
-            let topics = value["dbs_msg_payload"][role].as_array_mut().expect("topic array");
+            let topics = value["dbs_msg_payload"][role]
+                .as_array_mut()
+                .expect("topic array");
             for (enabled, name) in [(self.kms, "Oplus_KeyMouseLink"), (self.cast, "Oplus_Cast")] {
                 if enabled {
                     topics.push(serde_json::json!({"dbs_topic_name":name,"dbs_topic_tag":0}));
@@ -1041,7 +1043,10 @@ mod utc_timestamp_tests {
 /// wrong span; prefer the object that owns `dbs_msg_payload`.
 fn payload_json_start(body: &[u8]) -> Option<usize> {
     const MARKER: &[u8] = b"\"dbs_msg_payload\"";
-    if let Some(position) = body.windows(MARKER.len()).position(|window| window == MARKER) {
+    if let Some(position) = body
+        .windows(MARKER.len())
+        .position(|window| window == MARKER)
+    {
         return body[..position].iter().rposition(|byte| *byte == b'{');
     }
     body.iter().position(|byte| *byte == b'{')
@@ -1706,7 +1711,16 @@ pub async fn serve<F, Fut>(
     F: Fn(String) -> Fut,
     Fut: Future<Output = Option<Vec<u8>>>,
 {
-    serve_with_events(sock, peer, hostname, service_count, ksc_for_device, None, None).await;
+    serve_with_events(
+        sock,
+        peer,
+        hostname,
+        service_count,
+        ksc_for_device,
+        None,
+        None,
+    )
+    .await;
 }
 
 struct DataSessionGuard {
@@ -1716,9 +1730,7 @@ struct DataSessionGuard {
 
 impl Drop for DataSessionGuard {
     fn drop(&mut self) {
-        if let (Some(state), Some((device_id, token))) =
-            (self.state.take(), self.attached.take())
-        {
+        if let (Some(state), Some((device_id, token))) = (self.state.take(), self.attached.take()) {
             // Cancellation skips the async epilogue. Only this session's token
             // is removed, so delayed cleanup cannot detach a reconnect.
             tokio::spawn(async move {
@@ -1763,7 +1775,8 @@ pub async fn serve_with_events<F, Fut>(
         // the cleanup is waiting for state locks.
         let _ = tokio::spawn(async move {
             state.detach_data_session(&device_id, token).await;
-        }).await;
+        })
+        .await;
     }
 }
 
@@ -1866,19 +1879,41 @@ async fn run_session<F, Fut>(
         std::env::var("OPLUS_CLIPBOARD_ALLOW_UNCONFIRMED").as_deref() == Ok("1");
 
     loop {
-        if let (Some(controller), Some(peer_id)) = (kms_controller.as_mut(), authenticated_device_id) {
+        if let (Some(controller), Some(peer_id)) =
+            (kms_controller.as_mut(), authenticated_device_id)
+        {
             if local_session_confirmed && link_info_sent {
-                for _ in 0..16 {
-                    let Some(command) = controller.try_next() else { break; };
+                for _ in 0..64 {
+                    let Some(command) = controller.try_next() else {
+                        break;
+                    };
                     match command {
                         crate::kms::control::BusCommand::Start { config, reply } => {
-                            if reply.is_closed() { continue; }
+                            if reply.is_closed() {
+                                continue;
+                            }
                             match controller.start(config).await {
                                 Ok(publication) => {
                                     bus_topics.kms = true;
-                                    for (route_head, json) in [(0x2a, bus_topics.sync_json()), (0x52, publication.device_info)] {
-                                        let frame = build_data_bus_with(local_session, our_id, peer_id, route_head, &json);
-                                        if !matches!(tokio::time::timeout(crate::kms::server::WRITE_TIMEOUT, write_frame(&mut sock, &frame)).await, Ok(Ok(()))) {
+                                    for (route_head, json) in [
+                                        (0x2a, bus_topics.sync_json()),
+                                        (0x52, publication.device_info),
+                                    ] {
+                                        let frame = build_data_bus_with(
+                                            local_session,
+                                            our_id,
+                                            peer_id,
+                                            route_head,
+                                            &json,
+                                        );
+                                        if !matches!(
+                                            tokio::time::timeout(
+                                                crate::kms::server::WRITE_TIMEOUT,
+                                                write_frame(&mut sock, &frame)
+                                            )
+                                            .await,
+                                            Ok(Ok(()))
+                                        ) {
                                             controller.abort().await;
                                             return;
                                         }
@@ -1886,47 +1921,105 @@ async fn run_session<F, Fut>(
                                     if reply.send(Ok(publication.info)).is_err() {
                                         let _ = controller.stop().await;
                                         bus_topics.kms = false;
-                                        let frame = build_data_bus_with(local_session, our_id, peer_id, 0x2a, &bus_topics.sync_json());
-                                        if !matches!(tokio::time::timeout(crate::kms::server::WRITE_TIMEOUT, write_frame(&mut sock, &frame)).await, Ok(Ok(()))) { return; }
+                                        let frame = build_data_bus_with(
+                                            local_session,
+                                            our_id,
+                                            peer_id,
+                                            0x2a,
+                                            &bus_topics.sync_json(),
+                                        );
+                                        if !matches!(
+                                            tokio::time::timeout(
+                                                crate::kms::server::WRITE_TIMEOUT,
+                                                write_frame(&mut sock, &frame)
+                                            )
+                                            .await,
+                                            Ok(Ok(()))
+                                        ) {
+                                            return;
+                                        }
                                     }
                                 }
-                                Err(error) => { let _ = reply.send(Err(error)); }
+                                Err(error) => {
+                                    let _ = reply.send(Err(error));
+                                }
                             }
                         }
                         crate::kms::control::BusCommand::Stop { reply } => {
-                            if reply.is_closed() { continue; }
+                            if reply.is_closed() {
+                                continue;
+                            }
                             match controller.stop().await {
                                 Ok(()) => {
                                     bus_topics.kms = false;
-                                    let frame = build_data_bus_with(local_session, our_id, peer_id, 0x2a, &bus_topics.sync_json());
-                                    if !matches!(tokio::time::timeout(crate::kms::server::WRITE_TIMEOUT, write_frame(&mut sock, &frame)).await, Ok(Ok(()))) { return; }
+                                    let frame = build_data_bus_with(
+                                        local_session,
+                                        our_id,
+                                        peer_id,
+                                        0x2a,
+                                        &bus_topics.sync_json(),
+                                    );
+                                    if !matches!(
+                                        tokio::time::timeout(
+                                            crate::kms::server::WRITE_TIMEOUT,
+                                            write_frame(&mut sock, &frame)
+                                        )
+                                        .await,
+                                        Ok(Ok(()))
+                                    ) {
+                                        return;
+                                    }
                                     let _ = reply.send(Ok(()));
                                 }
-                                Err(error) => { let _ = reply.send(Err(error)); }
+                                Err(error) => {
+                                    let _ = reply.send(Err(error));
+                                }
                             }
                         }
-                        crate::kms::control::BusCommand::Status { reply } => { let _ = reply.send(controller.status()); }
-                        crate::kms::control::BusCommand::Input { generation, event, reply } => {
-                            if reply.is_closed() { continue; }
+                        crate::kms::control::BusCommand::Status { reply } => {
+                            let _ = reply.send(controller.status());
+                        }
+                        crate::kms::control::BusCommand::Input {
+                            generation,
+                            event,
+                            reply,
+                        } => {
+                            if reply.is_closed() {
+                                continue;
+                            }
                             let result = controller.send_input(generation, event).await;
                             let _ = reply.send(result);
                         }
                         crate::kms::control::BusCommand::Release { generation, reply } => {
-                            if reply.is_closed() { continue; }
+                            if reply.is_closed() {
+                                continue;
+                            }
                             let result = controller.release_input(generation).await;
                             let _ = reply.send(result);
                         }
+                        crate::kms::control::BusCommand::Receive { generation, reply } => {
+                            if reply.is_closed() {
+                                continue;
+                            }
+                            let _ = reply.send(controller.receive(generation).await);
+                        }
+                    }
                 }
             }
         }
-        }
-        if let (Some(controller), Some(peer_id)) = (cast_controller.as_mut(), authenticated_device_id) {
+        if let (Some(controller), Some(peer_id)) =
+            (cast_controller.as_mut(), authenticated_device_id)
+        {
             if local_session_confirmed && link_info_sent {
                 for _ in 0..16 {
-                    let Some(command) = controller.try_next() else { break; };
+                    let Some(command) = controller.try_next() else {
+                        break;
+                    };
                     match command {
                         crate::cast::control::BusCommand::Start { reply } => {
-                            if reply.is_closed() { continue; }
+                            if reply.is_closed() {
+                                continue;
+                            }
                             match controller.start().await {
                                 Ok(publication) => {
                                     if reply.is_closed() {
@@ -1935,10 +2028,28 @@ async fn run_session<F, Fut>(
                                     }
                                     bus_topics.cast = true;
                                     let messages = std::iter::once((0x2a, bus_topics.sync_json()))
-                                        .chain(publication.messages.into_iter().map(|json| (0x52, json)));
+                                        .chain(
+                                            publication
+                                                .messages
+                                                .into_iter()
+                                                .map(|json| (0x52, json)),
+                                        );
                                     for (route_head, json) in messages {
-                                        let frame = build_data_bus_with(local_session, our_id, peer_id, route_head, &json);
-                                        if !matches!(tokio::time::timeout(crate::cast::control::BUS_WRITE_TIMEOUT, write_frame(&mut sock, &frame)).await, Ok(Ok(()))) {
+                                        let frame = build_data_bus_with(
+                                            local_session,
+                                            our_id,
+                                            peer_id,
+                                            route_head,
+                                            &json,
+                                        );
+                                        if !matches!(
+                                            tokio::time::timeout(
+                                                crate::cast::control::BUS_WRITE_TIMEOUT,
+                                                write_frame(&mut sock, &frame)
+                                            )
+                                            .await,
+                                            Ok(Ok(()))
+                                        ) {
                                             let _ = controller.stop().await;
                                             return;
                                         }
@@ -1946,44 +2057,106 @@ async fn run_session<F, Fut>(
                                     if reply.send(Ok(publication.info)).is_err() {
                                         let _ = controller.stop().await;
                                         bus_topics.cast = false;
-                                        for (route_head, json) in [(0x52, crate::cast::control::disconnect_message()), (0x2a, bus_topics.sync_json())] {
-                                            let frame = build_data_bus_with(local_session, our_id, peer_id, route_head, &json);
-                                            if !matches!(tokio::time::timeout(crate::cast::control::BUS_WRITE_TIMEOUT, write_frame(&mut sock, &frame)).await, Ok(Ok(()))) { return; }
+                                        for (route_head, json) in [
+                                            (0x52, crate::cast::control::disconnect_message()),
+                                            (0x2a, bus_topics.sync_json()),
+                                        ] {
+                                            let frame = build_data_bus_with(
+                                                local_session,
+                                                our_id,
+                                                peer_id,
+                                                route_head,
+                                                &json,
+                                            );
+                                            if !matches!(
+                                                tokio::time::timeout(
+                                                    crate::cast::control::BUS_WRITE_TIMEOUT,
+                                                    write_frame(&mut sock, &frame)
+                                                )
+                                                .await,
+                                                Ok(Ok(()))
+                                            ) {
+                                                return;
+                                            }
                                         }
                                     }
                                 }
-                                Err(error) => { let _ = reply.send(Err(error)); }
+                                Err(error) => {
+                                    let _ = reply.send(Err(error));
+                                }
                             }
                         }
                         crate::cast::control::BusCommand::Stop { reply } => {
-                            if reply.is_closed() { continue; }
+                            if reply.is_closed() {
+                                continue;
+                            }
                             match controller.stop().await {
                                 Ok(()) => {
                                     bus_topics.cast = false;
-                                    for (route_head, json) in [(0x52, crate::cast::control::disconnect_message()), (0x2a, bus_topics.sync_json())] {
-                                        let frame = build_data_bus_with(local_session, our_id, peer_id, route_head, &json);
-                                        if !matches!(tokio::time::timeout(crate::cast::control::BUS_WRITE_TIMEOUT, write_frame(&mut sock, &frame)).await, Ok(Ok(()))) { return; }
+                                    for (route_head, json) in [
+                                        (0x52, crate::cast::control::disconnect_message()),
+                                        (0x2a, bus_topics.sync_json()),
+                                    ] {
+                                        let frame = build_data_bus_with(
+                                            local_session,
+                                            our_id,
+                                            peer_id,
+                                            route_head,
+                                            &json,
+                                        );
+                                        if !matches!(
+                                            tokio::time::timeout(
+                                                crate::cast::control::BUS_WRITE_TIMEOUT,
+                                                write_frame(&mut sock, &frame)
+                                            )
+                                            .await,
+                                            Ok(Ok(()))
+                                        ) {
+                                            return;
+                                        }
                                     }
                                     let _ = reply.send(Ok(()));
                                 }
-                                Err(error) => { let _ = reply.send(Err(error)); }
+                                Err(error) => {
+                                    let _ = reply.send(Err(error));
+                                }
                             }
                         }
                         crate::cast::control::BusCommand::Status { reply } => {
                             let _ = reply.send(Ok(controller.status()));
                         }
-                        crate::cast::control::BusCommand::Send { connection_id, payload, reply } => {
-                            if reply.is_closed() { continue; }
+                        crate::cast::control::BusCommand::Send {
+                            connection_id,
+                            payload,
+                            reply,
+                        } => {
+                            if reply.is_closed() {
+                                continue;
+                            }
                             let result = controller.send(connection_id, payload).await;
                             let _ = reply.send(result);
                         }
-                        crate::cast::control::BusCommand::ConfigureVideo { connection_id, width, fps, reply } => {
-                            if reply.is_closed() { continue; }
-                            let result = controller.configure_video(connection_id, width, fps).await;
+                        crate::cast::control::BusCommand::ConfigureVideo {
+                            connection_id,
+                            width,
+                            fps,
+                            reply,
+                        } => {
+                            if reply.is_closed() {
+                                continue;
+                            }
+                            let result =
+                                controller.configure_video(connection_id, width, fps).await;
                             let _ = reply.send(result);
                         }
-                        crate::cast::control::BusCommand::Receive { connection_id, max, reply } => {
-                            if reply.is_closed() { continue; }
+                        crate::cast::control::BusCommand::Receive {
+                            connection_id,
+                            max,
+                            reply,
+                        } => {
+                            if reply.is_closed() {
+                                continue;
+                            }
                             let _ = reply.send(controller.receive(connection_id, max));
                         }
                     }
@@ -1995,7 +2168,9 @@ async fn run_session<F, Fut>(
                 // 15 s control timeout.
                 let reason = "phone data channel is not ready; reconnect the device".to_string();
                 for _ in 0..16 {
-                    let Some(command) = controller.try_next() else { break; };
+                    let Some(command) = controller.try_next() else {
+                        break;
+                    };
                     match command {
                         crate::cast::control::BusCommand::Status { reply } => {
                             let _ = reply.send(Ok(controller.status()));
@@ -2170,19 +2345,21 @@ async fn run_session<F, Fut>(
 
         while let Some(body) = take_frame(&mut buf) {
             match body.first().copied() {
-                Some(MSG_EPI_ANSWER) => {
-                    match parse_answer(&body) {
-                        Some(answer) => {
-                            epi_name = answer.friendly_name.clone();
-                            epi_type = answer.device_category;
-                            info!(
-                                "panta[{}]: EPI answer id={} name={} product={} category={} profiles={}",
-                                peer, answer.endpoint_id, answer.friendly_name, answer.product,
-                                answer.device_category, answer.service_profile_count
-                            );
-                        }
-                        None => warn!("panta[{}]: malformed EPI answer", peer),
+                Some(MSG_EPI_ANSWER) => match parse_answer(&body) {
+                    Some(answer) => {
+                        epi_name = answer.friendly_name.clone();
+                        epi_type = answer.device_category;
+                        info!(
+                            "panta[{}]: EPI answer id={} name={} product={} category={} profiles={}",
+                            peer,
+                            answer.endpoint_id,
+                            answer.friendly_name,
+                            answer.product,
+                            answer.device_category,
+                            answer.service_profile_count
+                        );
                     }
+                    None => warn!("panta[{}]: malformed EPI answer", peer),
                 },
                 Some(MSG_AUTH_REQUEST) => {
                     let Some(request) = parse_auth_request(&body) else {
@@ -2250,18 +2427,31 @@ async fn run_session<F, Fut>(
                             peer
                         );
                         if authenticated_device_id.is_none() {
-                            if let (Some(state), Some(device_id)) = (lifecycle, pending_auth_device_id) {
+                            if let (Some(state), Some(device_id)) =
+                                (lifecycle, pending_auth_device_id)
+                            {
                                 authenticated_device_id = Some(device_id);
                                 let device_id = hex(&device_id);
                                 let token = state.attach_data_session(&device_id).await;
                                 if let Ok(local_addr) = sock.local_addr() {
-                                    if let Some(registration) = state.kms.register_bus(&device_id, peer.ip(), local_addr.ip()) {
+                                    if let Some(registration) = state.kms.register_bus(
+                                        &device_id,
+                                        peer.ip(),
+                                        local_addr.ip(),
+                                    ) {
                                         kms_controller = Some(registration.into_controller(
-                                            device_id.clone(), epi_name.clone(), epi_type,
-                                            hostname.to_string(), crate::net_utils::pdid(),
+                                            device_id.clone(),
+                                            epi_name.clone(),
+                                            epi_type,
+                                            hostname.to_string(),
+                                            crate::net_utils::pdid(),
                                         ));
                                     }
-                                    cast_controller = state.cast.register_bus(&device_id, peer.ip(), local_addr.ip());
+                                    cast_controller = state.cast.register_bus(
+                                        &device_id,
+                                        peer.ip(),
+                                        local_addr.ip(),
+                                    );
                                 }
                                 *attached_device = Some((device_id, token));
                             }
@@ -2844,16 +3034,26 @@ mod tests {
     #[test]
     fn cast_and_kms_topic_ownership_compose_in_both_stop_orders() {
         for stop_cast_first in [true, false] {
-            let mut topics = BusTopics { kms: true, cast: true };
+            let mut topics = BusTopics {
+                kms: true,
+                cast: true,
+            };
             for step in 0..3 {
                 let value: serde_json::Value = serde_json::from_str(&topics.sync_json()).unwrap();
                 for role in ["pub", "sub"] {
-                    let names: Vec<&str> = value["dbs_msg_payload"][role].as_array().unwrap().iter()
-                        .map(|topic| topic["dbs_topic_name"].as_str().unwrap()).collect();
+                    let names: Vec<&str> = value["dbs_msg_payload"][role]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|topic| topic["dbs_topic_name"].as_str().unwrap())
+                        .collect();
                     assert_eq!(names.contains(&"Oplus_KeyMouseLink"), topics.kms);
                     assert_eq!(names.contains(&"Oplus_Cast"), topics.cast);
                     assert!(names.contains(&"Oplus_MacConnect"));
-                    assert_eq!(names.len(), 2 + usize::from(topics.kms) + usize::from(topics.cast));
+                    assert_eq!(
+                        names.len(),
+                        2 + usize::from(topics.kms) + usize::from(topics.cast)
+                    );
                 }
                 match (step, stop_cast_first) {
                     (0, true) | (1, false) => topics.cast = false,

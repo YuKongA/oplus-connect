@@ -1,4 +1,5 @@
 use crate::client::DaemonClient;
+use crate::kms_session::{KmsPhase, KmsViewState};
 use crate::models::*;
 use crate::state::AppState;
 use crate::theme::Theme;
@@ -13,6 +14,7 @@ pub struct DeviceDetailView;
 impl DeviceDetailView {
     pub fn render(
         state: &AppState,
+        kms: &KmsViewState,
         _window: &mut Window,
         cx: &mut Context<crate::RootView>,
     ) -> impl IntoElement {
@@ -42,31 +44,29 @@ impl DeviceDetailView {
                             .text_color(Theme::text_primary())
                             .child("设备详情"),
                     )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(Theme::text_muted())
-                            .child(if device_count == 0 {
-                                "当前无已连接设备".to_string()
-                            } else {
-                                format!("已连接 {connected_count} 台 · 已保存 {device_count} 台")
-                            }),
-                    ),
+                    .child(div().text_xs().text_color(Theme::text_muted()).child(
+                        if device_count == 0 {
+                            "当前无已连接设备".to_string()
+                        } else {
+                            format!("已连接 {connected_count} 台 · 已保存 {device_count} 台")
+                        },
+                    )),
             )
             .child(if state.known_devices.is_empty() {
                 Self::render_no_device_view().into_any_element()
             } else {
-                Self::render_device_list(state, cx).into_any_element()
+                Self::render_device_list(state, kms, cx).into_any_element()
             })
     }
 
     fn render_device_list(
         state: &AppState,
+        kms: &KmsViewState,
         cx: &mut Context<crate::RootView>,
     ) -> impl IntoElement {
         let mut list = div().flex().flex_col().gap(px(16.0));
         for (index, device) in state.known_devices.iter().enumerate() {
-            list = list.child(Self::render_device_card(device, state, cx, index));
+            list = list.child(Self::render_device_card(device, state, kms, cx, index));
         }
         list
     }
@@ -74,6 +74,7 @@ impl DeviceDetailView {
     fn render_device_card(
         device: &DeviceInfo,
         state: &AppState,
+        kms: &KmsViewState,
         cx: &mut Context<crate::RootView>,
         index: usize,
     ) -> impl IntoElement {
@@ -90,7 +91,11 @@ impl DeviceDetailView {
             "Wi-Fi"
         };
         let meta = format!("{link} · {ip_display}");
-        let status_label = if is_connected { "已连接" } else { "未连接" };
+        let status_label = if is_connected {
+            "已连接"
+        } else {
+            "未连接"
+        };
         let status_color = if is_connected {
             Theme::primary()
         } else {
@@ -109,108 +114,151 @@ impl DeviceDetailView {
 
         let mut card = div()
             .p(px(16.0))
-                    .rounded_xl()
-                    .bg(Theme::bg_card())
-                    .border_1()
-                    .border_color(Theme::border_card())
+            .rounded_xl()
+            .bg(Theme::bg_card())
+            .border_1()
+            .border_color(Theme::border_card())
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
                     .flex()
                     .items_center()
-                    .justify_between()
+                    .gap(px(16.0))
+                    .min_w_0()
+                    .child(
+                        Icon::new(IconName::Smartphone)
+                            .size(px(40.0))
+                            .text_color(icon_color)
+                            .flex_shrink_0(),
+                    )
                     .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .gap(px(16.0))
+                            .flex_1()
                             .min_w_0()
-                            .child(
-                                Icon::new(IconName::Smartphone)
-                                    .size(px(40.0))
-                                    .text_color(icon_color)
-                                    .flex_shrink_0(),
-                            )
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.0))
                             .child(
                                 div()
-                                    .flex_1()
-                                    .min_w_0()
                                     .flex()
-                                    .flex_col()
-                                    .gap(px(4.0))
+                                    .items_center()
+                                    .gap(px(8.0))
                                     .child(
                                         div()
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(8.0))
-                                            .child(
-                                                div()
-                                                    .text_lg()
-                                                    .font_weight(FontWeight::BOLD)
-                                                    .text_color(Theme::text_primary())
-                                                    .child(device.device_name.clone()),
-                                            )
-                                            .child(
-                                                div()
-                                                    .px(px(8.0))
-                                                    .py(px(2.0))
-                                                    .rounded_full()
-                                                    .bg(status_bg)
-                                                    .text_xs()
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .text_color(status_color)
-                                                    .child(status_label),
-                                            ),
+                                            .text_lg()
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(Theme::text_primary())
+                                            .child(device.device_name.clone()),
                                     )
                                     .child(
                                         div()
+                                            .px(px(8.0))
+                                            .py(px(2.0))
+                                            .rounded_full()
+                                            .bg(status_bg)
                                             .text_xs()
-                                            .text_color(Theme::text_secondary())
-                                            .child(meta),
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(status_color)
+                                            .child(status_label),
                                     ),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(Theme::text_secondary())
+                                    .child(meta),
                             ),
-                    );
+                    ),
+            );
 
         if is_connected {
             let device_id = device.device_id.clone();
-            let casting = state.cast.device_id == device.device_id && state.cast.active();
-            let cast_label = if casting {
-                match state.cast.phase {
-                    CastPhase::Stopping => "停止中…",
-                    CastPhase::Displaying => "停止投屏",
-                    _ => "投屏启动中",
-                }
-            } else {
-                "开始投屏"
-            };
-            let cast_id = device_id.clone();
             let mut actions = div().flex().items_center().gap(px(8.0));
-            actions = actions.child(
-                Button::new(("btn-cast", index))
-                    .primary()
-                    .disabled((state.cast.active() && !casting) || state.cast.phase == CastPhase::Stopping)
-                    .label(cast_label)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if this.state.cast.active() {
-                            this.stop_cast(cx);
-                        } else {
-                            this.start_cast(cast_id.clone(), cx);
-                        }
-                        cx.notify();
-                    })),
-            );
+            if device.device_type == "phone" {
+                let casting = state.cast.device_id == device.device_id && state.cast.active();
+                let cast_label = if casting {
+                    match state.cast.phase {
+                        CastPhase::Stopping => "停止中…",
+                        CastPhase::Displaying => "停止投屏",
+                        _ => "投屏启动中",
+                    }
+                } else {
+                    "开始投屏"
+                };
+                let cast_id = device_id.clone();
+                actions = actions.child(
+                    Button::new(("btn-cast", index))
+                        .primary()
+                        .disabled(
+                            (state.cast.active() && !casting)
+                                || state.cast.phase == CastPhase::Stopping,
+                        )
+                        .label(cast_label)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if this.state.cast.active() {
+                                this.stop_cast(cx);
+                            } else {
+                                this.start_cast(cast_id.clone(), cx);
+                            }
+                            cx.notify();
+                        })),
+                );
+            } else if device.device_type == "tablet" {
+                let sharing = kms.device_id == device.device_id && kms.active();
+                let label = if sharing {
+                    match kms.phase {
+                        KmsPhase::Stopping => "停止中…",
+                        KmsPhase::Armed | KmsPhase::Sharing => "停止键鼠共享",
+                        _ => "共享启动中",
+                    }
+                } else {
+                    "开始键鼠共享"
+                };
+                let kms_id = device_id.clone();
+                actions = actions.child(
+                    Button::new(("btn-kms", index))
+                        .primary()
+                        .disabled((kms.active() && !sharing) || kms.phase == KmsPhase::Stopping)
+                        .label(label)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if this.kms.active() {
+                                this.stop_kms(cx);
+                            } else {
+                                this.start_kms(kms_id.clone(), cx);
+                            }
+                        })),
+                );
+            }
             actions = actions.child(
                 Button::new(("btn-disconnect", index))
                     .secondary()
                     .label("断开")
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        if this.state.cast.device_id == device_id { this.stop_cast(cx); }
+                        if this.state.cast.device_id == device_id {
+                            this.stop_cast(cx);
+                        }
+                        if this.kms.device_id == device_id {
+                            this.stop_kms(cx);
+                        }
                         let device_id = device_id.clone();
                         cx.spawn(async move |this, app| {
                             let client = DaemonClient::new();
-                            let result = app.background_executor().spawn(async move { client.disconnect_device(&device_id).await }).await;
+                            let result = app
+                                .background_executor()
+                                .spawn(async move { client.disconnect_device(&device_id).await })
+                                .await;
                             let _ = this.update(app, |view, cx| {
-                                view.state.set_toast(if result.is_ok() { "正在断开…" } else { "断开失败" });
+                                view.state.set_toast(if result.is_ok() {
+                                    "正在断开…"
+                                } else {
+                                    "断开失败"
+                                });
                                 cx.notify();
                             });
-                        }).detach();
+                        })
+                        .detach();
                     })),
             );
             card = card.child(actions);
@@ -218,8 +266,7 @@ impl DeviceDetailView {
             card = card.child(Self::render_disconnected_actions(device, state, cx, index));
         }
 
-        let result = div().flex().flex_col().gap(px(8.0)).child(card);
-        result
+        div().flex().flex_col().gap(px(8.0)).child(card)
     }
 
     fn render_disconnected_actions(
@@ -247,7 +294,11 @@ impl DeviceDetailView {
             Button::new(("btn-reverse-connect", index))
                 .primary()
                 .disabled(pending)
-                .label(if pending { "等待手机确认…" } else { "连接" })
+                .label(if pending {
+                    "等待手机确认…"
+                } else {
+                    "连接"
+                })
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if this.state.connect_pending {
                         return;
@@ -261,9 +312,7 @@ impl DeviceDetailView {
                         let client = DaemonClient::new();
                         let result = app
                             .background_executor()
-                            .spawn(async move {
-                                client.connect_device(&address, &device_id).await
-                            })
+                            .spawn(async move { client.connect_device(&address, &device_id).await })
                             .await;
                         if let Err(error) = result {
                             let _ = this.update(app, |view, cx| {

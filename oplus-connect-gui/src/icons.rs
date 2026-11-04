@@ -54,9 +54,7 @@ mod tests {
         let engine = base64::engine::general_purpose::STANDARD;
         let bare = engine.encode(PNG);
         assert!(decode_notification_icon(&bare).is_some());
-        assert!(
-            decode_notification_icon(&format!("data:image/png;base64,{bare}")).is_some()
-        );
+        assert!(decode_notification_icon(&format!("data:image/png;base64,{bare}")).is_some());
     }
 
     #[test]

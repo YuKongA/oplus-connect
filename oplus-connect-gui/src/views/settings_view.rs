@@ -1,10 +1,10 @@
 use crate::state::AppState;
 use crate::theme::Theme;
 use crate::RootView;
-use gpui_kit::*;
 use gpui_kit::component::group_box::{GroupBox, GroupBoxVariants};
-use gpui_kit::component::switch::Switch;
 use gpui_kit::component::select::Select;
+use gpui_kit::component::switch::Switch;
+use gpui_kit::*;
 
 pub struct SettingsView;
 
@@ -12,9 +12,18 @@ impl SettingsView {
     pub fn render(
         state: &AppState,
         codec: Option<
-            &Entity<gpui_kit::component::select::SelectState<
-                gpui_kit::component::searchable_list::SearchableVec<&'static str>,
-            >>,
+            &Entity<
+                gpui_kit::component::select::SelectState<
+                    gpui_kit::component::searchable_list::SearchableVec<&'static str>,
+                >,
+            >,
+        >,
+        kms_direction: Option<
+            &Entity<
+                gpui_kit::component::select::SelectState<
+                    gpui_kit::component::searchable_list::SearchableVec<&'static str>,
+                >,
+            >,
         >,
         _window: &mut Window,
         cx: &mut Context<RootView>,
@@ -48,7 +57,11 @@ impl SettingsView {
                             .accessibility_label("深色模式")
                             .on_change(cx.listener(|this, next, _, cx| {
                                 Theme::set_dark(*next, cx);
-                                this.state.set_toast(if *next { "深色模式" } else { "浅色模式" });
+                                this.state.set_toast(if *next {
+                                    "深色模式"
+                                } else {
+                                    "浅色模式"
+                                });
                                 cx.notify();
                             })),
                     )),
@@ -57,7 +70,7 @@ impl SettingsView {
                 GroupBox::new()
                     .id("settings-cast")
                     .outline()
-                    .title("投屏")
+                    .title("手机投屏")
                     .child(Self::switch_row(
                         "键盘与鼠标",
                         "在投屏窗口中操作手机",
@@ -76,7 +89,7 @@ impl SettingsView {
                     ))
                     .child(Self::switch_row(
                         "音频",
-                        "播放手机声音；下一次投屏生效",
+                        "电脑播放手机声音",
                         Switch::new("toggle-cast-audio")
                             .checked(state.cast_audio)
                             .accessibility_label("投屏音频")
@@ -92,17 +105,31 @@ impl SettingsView {
                     ))
                     .child(Self::control_row(
                         "编码方式",
-                        "下一次投屏生效",
+                        "请优先使用 H.265",
                         // Fixed trigger width so this row lines up with the
                         // switch column; the popup matches it exactly.
-                        div().w(px(160.0)).children(
-                            codec.map(|state| {
-                                Select::new(state)
-                                    .w_full()
-                                    .menu_width(px(160.0))
-                                    .menu_max_h(rems(9.0))
-                            }),
-                        ),
+                        div().w(px(160.0)).children(codec.map(|state| {
+                            Select::new(state)
+                                .w_full()
+                                .menu_width(px(160.0))
+                                .menu_max_h(rems(9.0))
+                        })),
+                    )),
+            )
+            .child(
+                GroupBox::new()
+                    .id("settings-kms")
+                    .outline()
+                    .title("平板键鼠共享")
+                    .child(Self::control_row(
+                        "光标移出方向",
+                        "从所选方向移出屏幕进入平板",
+                        div().w(px(160.0)).children(kms_direction.map(|state| {
+                            Select::new(state)
+                                .w_full()
+                                .menu_width(px(160.0))
+                                .menu_max_h(rems(9.0))
+                        })),
                     )),
             )
             .child(
@@ -139,7 +166,7 @@ impl SettingsView {
                                 div()
                                     .text_xs()
                                     .text_color(Theme::text_secondary())
-                                    .child("ColorOS 设备互联客户端，支持剪贴板与通知。"),
+                                    .child("ColorOS 设备互联客户端，支持剪贴板、通知、投屏与键鼠共享。"),
                             )
                             .child(
                                 div()
@@ -151,11 +178,7 @@ impl SettingsView {
             )
     }
 
-    fn switch_row(
-        title: &'static str,
-        desc: &'static str,
-        control: Switch,
-    ) -> impl IntoElement {
+    fn switch_row(title: &'static str, desc: &'static str, control: Switch) -> impl IntoElement {
         div()
             .w_full()
             .flex()
@@ -175,12 +198,7 @@ impl SettingsView {
                             .text_color(Theme::text_primary())
                             .child(title),
                     )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(Theme::text_muted())
-                            .child(desc),
-                    ),
+                    .child(div().text_xs().text_color(Theme::text_muted()).child(desc)),
             )
             .child(control.color(Theme::primary()))
     }
@@ -209,12 +227,7 @@ impl SettingsView {
                             .text_color(Theme::text_primary())
                             .child(title),
                     )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(Theme::text_muted())
-                            .child(desc),
-                    ),
+                    .child(div().text_xs().text_color(Theme::text_muted()).child(desc)),
             )
             .child(control)
     }

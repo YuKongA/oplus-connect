@@ -57,12 +57,20 @@ async fn connect_at(addr: SocketAddr, device_id: String, state: AppState) -> Res
     let result = connect_inner(addr, device_id, &state).await;
     if let Err(error) = &result {
         warn!("reverse connect to {} failed: {}", addr, error);
-        broadcast(&state, "connect_failed", serde_json::json!({ "reason": error }));
+        broadcast(
+            &state,
+            "connect_failed",
+            serde_json::json!({ "reason": error }),
+        );
     }
     result
 }
 
-async fn connect_inner(addr: SocketAddr, device_id: String, state: &AppState) -> Result<(), String> {
+async fn connect_inner(
+    addr: SocketAddr,
+    device_id: String,
+    state: &AppState,
+) -> Result<(), String> {
     info!("reverse connect: dialling {}", addr);
     let mut sock = tokio::time::timeout(STEP_TIMEOUT, TcpStream::connect(addr))
         .await
@@ -94,12 +102,7 @@ async fn connect_inner(addr: SocketAddr, device_id: String, state: &AppState) ->
         .unwrap_or(48999);
     let mut custom_data = Vec::new();
     write_varint_field(&mut custom_data, 1, data_port as u64);
-    let mut sync = ScpSyncData::new(
-        crate::net_utils::hostname(),
-        custom_data,
-        6,
-        "000001",
-    );
+    let mut sync = ScpSyncData::new(crate::net_utils::hostname(), custom_data, 6, "000001");
     sync.key_type = 3;
     sync.active_trigger_mode = 1;
     send(
@@ -187,8 +190,10 @@ async fn connect_inner(addr: SocketAddr, device_id: String, state: &AppState) ->
     crate::probe::remember_session_ksc(&device_id, &channel_ksc).await;
 
     // Business interaction: the phone may still require user confirmation.
-    let mut interaction =
-        ScpFrame::new(CMD_ACTIVE_CONNECTION, channel.encrypt(b"interact hello").map_err(err)?);
+    let mut interaction = ScpFrame::new(
+        CMD_ACTIVE_CONNECTION,
+        channel.encrypt(b"interact hello").map_err(err)?,
+    );
     interaction.is_encrypted = true;
     interaction.is_business = true;
     send(&mut sock, interaction).await?;
@@ -210,6 +215,7 @@ async fn connect_inner(addr: SocketAddr, device_id: String, state: &AppState) ->
         device_id: device_id.clone(),
         device_name: phone.name.clone(),
         device_model: phone.model.clone(),
+        device_type: crate::state::device_type_name(phone.device_type).into(),
         brand: String::new(),
         os_version: String::new(),
         battery: 100,
@@ -244,6 +250,7 @@ async fn connect_inner(addr: SocketAddr, device_id: String, state: &AppState) ->
 struct PhoneSync {
     name: String,
     model: String,
+    device_type: u64,
 }
 
 fn parse_phone_sync(frame: &[u8]) -> Result<PhoneSync, String> {
@@ -255,6 +262,7 @@ fn parse_phone_sync(frame: &[u8]) -> Result<PhoneSync, String> {
     Ok(PhoneSync {
         name: sync.device_name,
         model: sync.model_id,
+        device_type: sync.device_type as u64,
     })
 }
 
@@ -395,24 +403,28 @@ mod tests {
 
     #[test]
     fn parses_sync_identity_from_the_phone() {
-        let frame = hex("40340020000000007b08ad120801121c0a0ae4b880e58aa02031355410032008280132063242313438383801");
+        let frame = hex(
+            "40340020000000007b08ad120801121c0a0ae4b880e58aa02031355410032008280132063242313438383801",
+        );
         let phone = parse_phone_sync(&frame).unwrap();
         assert_eq!(phone.name, "一加 15T");
         assert_eq!(phone.model, "2B1488");
+        assert_eq!(crate::state::device_type_name(phone.device_type), "phone");
     }
 
     #[test]
     fn extracts_phone_error_reason() {
         let wrap = ScpWrapData {
             msg_type: 0xFFFF,
-            data: hex("08faacd191011085141a3373796e6320736563757265206d657373616765206661696c65642e205b43616e63656c6c6174696f6e457863657074696f6e5d"),
+            data: hex(
+                "08faacd191011085141a3373796e6320736563757265206d657373616765206661696c65642e205b43616e63656c6c6174696f6e457863657074696f6e5d",
+            ),
         };
         assert_eq!(
             error_reason(&wrap).as_deref(),
             Some("sync secure message failed. [CancellationException]")
         );
     }
-
 
     #[tokio::test]
     async fn reports_connected_only_after_phone_accepts() {
@@ -511,10 +523,8 @@ mod tests {
             ready_tx.send(()).unwrap();
             allow_rx.await.unwrap();
 
-            let mut accept = ScpFrame::new(
-                CMD_ACTIVE_CONNECTION,
-                channel.encrypt(b"accept").unwrap(),
-            );
+            let mut accept =
+                ScpFrame::new(CMD_ACTIVE_CONNECTION, channel.encrypt(b"accept").unwrap());
             accept.is_encrypted = true;
             accept.is_business = true;
             sock.write_all(&accept.encode()).await.unwrap();
@@ -522,9 +532,10 @@ mod tests {
         });
 
         let client_state = state.clone();
-        let client = tokio::spawn(async move {
-            connect_at(addr, "C77C702EC021".into(), client_state).await
-        });
+        let client =
+            tokio::spawn(
+                async move { connect_at(addr, "C77C702EC021".into(), client_state).await },
+            );
 
         tokio::time::timeout(Duration::from_secs(5), ready_rx)
             .await

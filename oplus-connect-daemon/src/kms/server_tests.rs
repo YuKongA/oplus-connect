@@ -363,7 +363,7 @@ async fn rejects_unspecified_bind_and_unsupported_direction_or_dimensions() {
             ..config()
         },
         ServerConfig {
-            direction: 2,
+            direction: 5,
             ..config()
         },
     ] {
@@ -393,6 +393,99 @@ async fn wait_pointer(server: &Server, event_time: u64) -> Arc<PeerPointerEvent>
     })
     .await
     .unwrap()
+}
+
+#[tokio::test]
+async fn cross_back_is_normalized_consumed_and_scoped_to_connection() {
+    let mut server = Server::bind(config()).await.unwrap();
+    let (mut stream, codec) = connected(&server).await;
+    let generation = server.connection_id().unwrap();
+    stream
+        .write_all(&encode(&codec, 2, PEER_POINTER))
+        .await
+        .unwrap();
+    wait_pointer(&server, 279847801).await;
+    assert!(
+        server
+            .receive_cross_back_for_generation(generation + 1)
+            .await
+            .is_err()
+    );
+    let position = server
+        .receive_cross_back_for_generation(generation)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!((position.pct_x - 2519.0 / 2520.0).abs() < 1e-9);
+    assert!((position.pct_y - 379.5918 / 1680.0).abs() < 1e-9);
+    assert_eq!(
+        server
+            .receive_cross_back_for_generation(generation)
+            .await
+            .unwrap(),
+        None
+    );
+
+    let mut peer: serde_json::Value = serde_json::from_slice(PEER_POINTER).unwrap();
+    peer["event_t"] = json!(279847802u64);
+    stream
+        .write_all(&encode(&codec, 2, &serde_json::to_vec(&peer).unwrap()))
+        .await
+        .unwrap();
+    wait_pointer(&server, 279847802).await;
+    server
+        .send_input_for_generation(
+            generation,
+            InputEvent::Enter {
+                pct_x: 1.0,
+                pct_y: 0.5,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        server
+            .receive_cross_back_for_generation(generation)
+            .await
+            .unwrap(),
+        None
+    );
+    peer["event_t"] = json!(279847803u64);
+    peer["pts"][0]["y"] = json!(840.0);
+    stream
+        .write_all(&encode(&codec, 2, &serde_json::to_vec(&peer).unwrap()))
+        .await
+        .unwrap();
+    wait_pointer(&server, 279847803).await;
+    assert_eq!(
+        server
+            .receive_cross_back_for_generation(generation)
+            .await
+            .unwrap()
+            .unwrap()
+            .pct_y,
+        0.5
+    );
+
+    drop(stream);
+    wait_status(&server, SessionStatus::Listening).await;
+    let (_stream, _codec) = connected(&server).await;
+    let next_generation = server.connection_id().unwrap();
+    assert_ne!(next_generation, generation);
+    assert!(
+        server
+            .receive_cross_back_for_generation(generation)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        server
+            .receive_cross_back_for_generation(next_generation)
+            .await
+            .unwrap(),
+        None
+    );
+    server.shutdown().await;
 }
 
 #[tokio::test]

@@ -25,7 +25,16 @@ pub const META_ALT: u32 = 0x12;
 /// Android `META_CTRL_ON | META_CTRL_LEFT_ON`.
 pub const META_CTRL: u32 = 0x3000;
 
-fn frame(kind: u16, class: u8, flag: u8, action: u8, code: u8, meta: u32, x: i32, y: i32) -> [u8; 24] {
+fn frame(
+    kind: u16,
+    class: u8,
+    flag: u8,
+    action: u8,
+    code: u8,
+    meta: u32,
+    x: i32,
+    y: i32,
+) -> [u8; 24] {
     let mut frame = [0u8; 24];
     frame[..4].copy_from_slice(&MAGIC);
     frame[4..6].copy_from_slice(&kind.to_be_bytes());
@@ -57,7 +66,16 @@ pub fn touch(action: u8, x: i32, y: i32, width: u32, height: u32) -> Vec<u8> {
 
 /// Key press (`pressed`) or release with the Android keycode and meta state.
 pub fn key(keycode: u8, meta: u32, pressed: bool) -> [u8; 24] {
-    frame(TYPE_KEY, CLASS_KEY, u8::from(!pressed), 0, keycode, meta, 0, 0)
+    frame(
+        TYPE_KEY,
+        CLASS_KEY,
+        u8::from(!pressed),
+        0,
+        keycode,
+        meta,
+        0,
+        0,
+    )
 }
 
 /// Wheel event: pointer position, its coordinate space, then the two scroll
@@ -132,7 +150,10 @@ pub(crate) struct KeyboardState {
 
 impl Default for KeyboardState {
     fn default() -> Self {
-        Self { held: [false; 256], modifiers: 0 }
+        Self {
+            held: [false; 256],
+            modifiers: 0,
+        }
     }
 }
 
@@ -154,7 +175,11 @@ impl KeyboardState {
         pressed: bool,
         mut emit: impl FnMut([u8; 24]),
     ) {
-        if let Some((bit, _)) = MODIFIER_KEYS.iter().copied().find(|(_, modifier)| Some(*modifier) == code) {
+        if let Some((bit, _)) = MODIFIER_KEYS
+            .iter()
+            .copied()
+            .find(|(_, modifier)| Some(*modifier) == code)
+        {
             if pressed {
                 meta |= bit;
             } else {
@@ -191,11 +216,7 @@ impl KeyboardState {
 
 /// Frame rectangle inside the window: the picture keeps its aspect ratio, so
 /// the offset is the letterbox margin when the window is not the phone's shape.
-pub fn picture_rect(
-    window: (f32, f32),
-    titlebar: f32,
-    phone: (u32, u32),
-) -> (f32, f32, f32) {
+pub fn picture_rect(window: (f32, f32), titlebar: f32, phone: (u32, u32)) -> (f32, f32, f32) {
     let (window_width, window_height) = window;
     let content_height = (window_height - titlebar).max(1.0);
     let phone_width = phone.0.max(1) as f32;
@@ -245,10 +266,15 @@ mod tests {
         keyboard.release(|frame| frames.push(frame));
         keyboard.release(|frame| frames.push(frame));
         keyboard.key_changed(Some(50), 0, false, |frame| frames.push(frame));
-        assert_eq!(frames, vec![
-            key(113, META_CTRL, true), key(50, META_CTRL, true),
-            key(50, 0, false), key(113, 0, false),
-        ]);
+        assert_eq!(
+            frames,
+            vec![
+                key(113, META_CTRL, true),
+                key(50, META_CTRL, true),
+                key(50, 0, false),
+                key(113, 0, false),
+            ]
+        );
     }
 
     #[test]
@@ -268,7 +294,10 @@ mod tests {
         keyboard.key_changed(Some(29), 0, true, |frame| frames.push(frame));
         keyboard.key_changed(Some(29), 0, false, |frame| frames.push(frame));
         keyboard.release(|frame| frames.push(frame));
-        assert_eq!(frames, vec![key(29, 0, true), key(29, 0, true), key(29, 0, false)]);
+        assert_eq!(
+            frames,
+            vec![key(29, 0, true), key(29, 0, true), key(29, 0, false)]
+        );
     }
 
     #[test]
@@ -278,9 +307,9 @@ mod tests {
         assert_eq!(
             touch(ACTION_HOVER_MOVE, 468, 1370, 720, 1560),
             vec![
-                0x81, 0x03, 0x01, 0x07, 0x00, 0x20, 0x02, 0x00, 0x00, 0x00, 0x07, 0x01, 0x00,
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xD4, 0x00, 0x00, 0x05, 0x5A, 0x00, 0x00,
-                0x02, 0xD0, 0x06, 0x18, 0x00, 0x00, 0x00, 0x00,
+                0x81, 0x03, 0x01, 0x07, 0x00, 0x20, 0x02, 0x00, 0x00, 0x00, 0x07, 0x01, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x01, 0xD4, 0x00, 0x00, 0x05, 0x5A, 0x00, 0x00, 0x02, 0xD0,
+                0x06, 0x18, 0x00, 0x00, 0x00, 0x00,
             ]
         );
     }
@@ -291,8 +320,8 @@ mod tests {
         assert_eq!(
             key(31, META_SHIFT, true),
             [
-                0x81, 0x03, 0x01, 0x07, 0x00, 0x0E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1F, 0x00,
-                0x00, 0x00, 0x41, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x81, 0x03, 0x01, 0x07, 0x00, 0x0E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1F, 0x00, 0x00,
+                0x00, 0x41, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             ]
         );
         assert_eq!(key(31, META_SHIFT, false)[7], 1);
@@ -313,7 +342,12 @@ mod tests {
     fn phone_coordinates_map_through_the_picture_rect() {
         // A 720x1560 phone in a 720-wide window: no letterbox, titlebar above.
         assert_eq!(
-            to_phone((360.0, 34.0 + 780.0), (720.0, 34.0 + 1560.0), 34.0, (720, 1560)),
+            to_phone(
+                (360.0, 34.0 + 780.0),
+                (720.0, 34.0 + 1560.0),
+                34.0,
+                (720, 1560)
+            ),
             (360, 780)
         );
         // Outside the picture clamps instead of sending negative coordinates.

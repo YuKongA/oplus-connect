@@ -256,10 +256,7 @@ impl Server {
             return Err(io::Error::new(ErrorKind::BrokenPipe, message));
         }
         result.await.map_err(|_| disconnected())??;
-        tracing::debug!(
-            "cast connection {connection_id} wrote {} bytes",
-            frame_len
-        );
+        tracing::debug!("cast connection {connection_id} wrote {} bytes", frame_len);
         Ok(())
     }
 
@@ -606,7 +603,14 @@ async fn serve_peer(
     let codec = identity.codec();
     timeout(
         HANDSHAKE_TIMEOUT,
-        handshake(&mut stream, id, time_sync_addr, &identity, &codec, &mut buffer),
+        handshake(
+            &mut stream,
+            id,
+            time_sync_addr,
+            &identity,
+            &codec,
+            &mut buffer,
+        ),
     )
     .await
     .map_err(|_| io::Error::new(ErrorKind::TimedOut, "cast authentication/pairing timed out"))??;
@@ -646,11 +650,17 @@ async fn serve_peer(
             return Ok(());
         }
         let message = decode_message(&codec, &mut buffer)?;
-        let command = message.get("cmd").and_then(|value| value.as_str()).unwrap_or("?");
+        let command = message
+            .get("cmd")
+            .and_then(|value| value.as_str())
+            .unwrap_or("?");
         match command {
             "customBroadcast" | "TimeSyncResult" => {
                 let text = serde_json::to_string(&message).unwrap_or_default();
-                tracing::info!("cast connection {id} control {command}: {}", &text[..text.len().min(400)]);
+                tracing::info!(
+                    "cast connection {id} control {command}: {}",
+                    &text[..text.len().min(400)]
+                );
             }
             _ => tracing::info!("cast connection {id} received {command}"),
         }

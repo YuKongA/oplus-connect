@@ -46,7 +46,10 @@ impl Drop for PeerLease {
         if let Some((peer_ip, connection_id)) = self.0.take() {
             tokio::spawn(async move {
                 let mut active = peers().lock().await;
-                if active.get(&peer_ip).is_some_and(|peer| peer.connection_id == connection_id) {
+                if active
+                    .get(&peer_ip)
+                    .is_some_and(|peer| peer.connection_id == connection_id)
+                {
                     active.remove(&peer_ip);
                 }
             });
@@ -769,7 +772,7 @@ async fn handle_frame(
                 // The phone names itself here, before SyncSecure. Keep these
                 // values for this connection rather than reporting placeholders.
                 let device_name = sync.device_name.clone();
-                let device_type = if sync.device_type == 10 { "tablet" } else { "phone" };
+                let device_type = crate::state::device_type_name(sync.device_type as u64);
                 *sync_identity = Some(sync);
                 send_sync_identity(
                     port,
@@ -839,6 +842,10 @@ async fn handle_frame(
                 device_id: secure.device_id.clone(),
                 device_name: identity.map(|s| s.device_name.clone()).unwrap_or_default(),
                 device_model: identity.map(|s| s.model_id.clone()).unwrap_or_default(),
+                device_type: crate::state::device_type_name(
+                    identity.map(|s| s.device_type as u64).unwrap_or(0),
+                )
+                .into(),
                 brand: String::new(),
                 os_version: String::new(),
                 battery: 100,
@@ -894,8 +901,8 @@ async fn handle_frame(
                             .unwrap_or_default();
                         let device_type = sync_identity
                             .as_ref()
-                            .map(|sync| if sync.device_type == 10 { "tablet" } else { "phone" })
-                            .unwrap_or("phone");
+                            .map(|sync| crate::state::device_type_name(sync.device_type as u64))
+                            .unwrap_or("unknown");
                         let payload = serde_json::json!({
                             "event": "onConnectRequested",
                             "data": {
@@ -1210,7 +1217,11 @@ mod tests {
         };
         let secure_body =
             ScpWrapData::new(crate::scp::proto::MSG_SYNC_SECURE, secure.encode()).encode();
-        let secure_ciphertext = server.secure_channel().unwrap().encrypt(&secure_body).unwrap();
+        let secure_ciphertext = server
+            .secure_channel()
+            .unwrap()
+            .encrypt(&secure_body)
+            .unwrap();
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let _client = TcpStream::connect(listener.local_addr().unwrap())
@@ -1591,11 +1602,19 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(serve_data_listener(listener));
         let mut client = TcpStream::connect(address).await.unwrap();
-        timeout(Duration::from_secs(1), read_panta_offer(&mut client)).await.unwrap();
+        timeout(Duration::from_secs(1), read_panta_offer(&mut client))
+            .await
+            .unwrap();
         task.abort();
         let _ = task.await;
         let mut byte = [0u8; 1];
-        assert_eq!(timeout(Duration::from_secs(1), client.read(&mut byte)).await.unwrap().unwrap(), 0);
+        assert_eq!(
+            timeout(Duration::from_secs(1), client.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -1608,23 +1627,47 @@ mod tests {
         let control = TcpStream::connect(address).await.unwrap();
         let peer_ip = address.ip().to_string();
         timeout(Duration::from_secs(1), async {
-            while !has_peer(&peer_ip).await { tokio::task::yield_now().await; }
-        }).await.unwrap();
+            while !has_peer(&peer_ip).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         let data_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut data = TcpStream::connect(data_listener.local_addr().unwrap()).await.unwrap();
+        let mut data = TcpStream::connect(data_listener.local_addr().unwrap())
+            .await
+            .unwrap();
         let (socket, peer) = data_listener.accept().await.unwrap();
         let tx = peers().lock().await.get(&peer_ip).unwrap().tx.clone();
-        tx.send(PeerCommand::DataConnection(socket, peer)).await.unwrap();
-        timeout(Duration::from_secs(1), read_panta_offer(&mut data)).await.unwrap();
+        tx.send(PeerCommand::DataConnection(socket, peer))
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), read_panta_offer(&mut data))
+            .await
+            .unwrap();
         drop(control);
         timeout(Duration::from_secs(1), async {
-            while has_peer(&peer_ip).await { tokio::task::yield_now().await; }
-        }).await.unwrap();
+            while has_peer(&peer_ip).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         let mut byte = [0u8; 1];
-        assert!(timeout(Duration::from_millis(20), data.read(&mut byte)).await.is_err());
+        assert!(
+            timeout(Duration::from_millis(20), data.read(&mut byte))
+                .await
+                .is_err()
+        );
         task.abort();
         let _ = task.await;
-        assert_eq!(timeout(Duration::from_secs(1), data.read(&mut byte)).await.unwrap().unwrap(), 0);
+        assert_eq!(
+            timeout(Duration::from_secs(1), data.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
