@@ -232,6 +232,7 @@ impl Controller {
         let server = Server::bind(ServerConfig {
             bind_ip: self.local_ip,
             peer_ip: self.peer_ip,
+            port: None,
         })
         .await
         .map_err(|error| error.to_string())?;

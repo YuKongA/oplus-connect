@@ -703,10 +703,11 @@ pub const OFFICIAL_WINDOWS_TOPIC_SYNC_JSON: &str = r#"{
 }"#;
 
 /// Topic sync replaces the entire set, so each authenticated bus owns both leases.
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct BusTopics {
     kms: bool,
     cast: bool,
+    expand_cast: bool,
 }
 
 impl BusTopics {
@@ -717,7 +718,11 @@ impl BusTopics {
             let topics = value["dbs_msg_payload"][role]
                 .as_array_mut()
                 .expect("topic array");
-            for (enabled, name) in [(self.kms, "Oplus_KeyMouseLink"), (self.cast, "Oplus_Cast")] {
+            for (enabled, name) in [
+                (self.kms, "Oplus_KeyMouseLink"),
+                (self.cast, "Oplus_Cast"),
+                (self.expand_cast, "Oplus_ExpandCast"),
+            ] {
                 if enabled {
                     topics.push(serde_json::json!({"dbs_topic_name":name,"dbs_topic_tag":0}));
                 }
@@ -1106,6 +1111,29 @@ pub fn clipboard_enabled_from(body: &[u8]) -> Option<bool> {
         _ => return None,
     };
     Some(flag == 1 || flag == "1" || flag == true)
+}
+pub fn expand_cast_tablet_resolution(body: &[u8]) -> Option<(u32, u32)> {
+    let start = payload_json_start(body)?;
+    let outer: serde_json::Value = serde_json::from_slice(&body[start..]).ok()?;
+    let payload = outer["dbs_msg_payload"].as_str()?;
+    let kv: serde_json::Value = serde_json::from_str(payload).ok()?;
+    if kv["key"].as_str()? != "ex_ability_sync" {
+        return None;
+    }
+    let value_str = kv["value"].as_str()?;
+    let val: serde_json::Value = serde_json::from_str(value_str).ok()?;
+    if val["msg_cmd"].as_str()? != "android_device_info" {
+        return None;
+    }
+    let body_str = val["msg_body"].as_str()?;
+    let body_json: serde_json::Value = serde_json::from_str(body_str).ok()?;
+    let width = body_json["width"].as_u64()? as u32;
+    let height = body_json["height"].as_u64()? as u32;
+    if width > 0 && height > 0 {
+        Some((width, height))
+    } else {
+        None
+    }
 }
 
 /// Extracts the phone notification's key, label, title, content, and optional icon.
@@ -1826,6 +1854,7 @@ async fn run_session<F, Fut>(
     let mut peer_oshare_agent = PEER_OSHARE_AGENT;
     let mut kms_controller: Option<crate::kms::control::Controller> = None;
     let mut cast_controller: Option<crate::cast::control::Controller> = None;
+    let mut expand_cast_controller: Option<crate::expand_cast::control::Controller> = None;
     let mut bus_topics = BusTopics::default();
     let mut epi_name = String::new();
     let mut epi_type = 0u8;
@@ -2192,6 +2221,152 @@ async fn run_session<F, Fut>(
                 }
             }
         }
+        if let (Some(controller), Some(peer_id)) =
+            (expand_cast_controller.as_mut(), authenticated_device_id)
+        {
+            if local_session_confirmed && link_info_sent {
+                for _ in 0..16 {
+                    let Some(command) = controller.try_next() else {
+                        break;
+                    };
+                    match command {
+                        crate::expand_cast::control::BusCommand::Start { reply } => {
+                            if reply.is_closed() {
+                                continue;
+                            }
+                            match controller.start().await {
+                                Ok(publication) => {
+                                    bus_topics.expand_cast = true;
+                                    for (route_head, json) in [
+                                        (0x2a, bus_topics.sync_json()),
+                                        (0x52, publication.general_track),
+                                        (0x52, publication.pc_device_info),
+                                    ] {
+                                        let frame = build_data_bus_with(
+                                            local_session,
+                                            our_id,
+                                            peer_id,
+                                            route_head,
+                                            &json,
+                                        );
+                                        if !matches!(
+                                            tokio::time::timeout(
+                                                crate::expand_cast::control::BUS_WRITE_TIMEOUT,
+                                                write_frame(&mut sock, &frame)
+                                            )
+                                            .await,
+                                            Ok(Ok(()))
+                                        ) {
+                                            let _ = controller.stop().await;
+                                            return;
+                                        }
+                                    }
+                                    let _ = reply.send(Ok(publication.info));
+                                }
+                                Err(err) => {
+                                    let _ = reply.send(Err(err));
+                                }
+                            }
+                        }
+                        crate::expand_cast::control::BusCommand::Stop { reply } => {
+                            if let Ok(close_msg) = controller.stop().await {
+                                bus_topics.expand_cast = false;
+                                for (route_head, json) in [
+                                    (0x52, close_msg),
+                                    (0x2a, bus_topics.sync_json()),
+                                ] {
+                                    let frame = build_data_bus_with(
+                                        local_session,
+                                        our_id,
+                                        peer_id,
+                                        route_head,
+                                        &json,
+                                    );
+                                    let _ = tokio::time::timeout(
+                                        crate::expand_cast::control::BUS_WRITE_TIMEOUT,
+                                        write_frame(&mut sock, &frame),
+                                    )
+                                    .await;
+                                }
+                            }
+                            let _ = reply.send(Ok(()));
+                        }
+                        crate::expand_cast::control::BusCommand::Status { reply } => {
+                            let _ = reply.send(controller.status());
+                        }
+                        crate::expand_cast::control::BusCommand::OnTabletDeviceInfo {
+                            width,
+                            height,
+                            reply,
+                        } => {
+                            match controller.on_tablet_device_info(width, height) {
+                                Ok(pc_auth_ready) => {
+                                    let frame = build_data_bus_with(
+                                        local_session,
+                                        our_id,
+                                        peer_id,
+                                        0x52,
+                                        &pc_auth_ready,
+                                    );
+                                    let _ = tokio::time::timeout(
+                                        crate::expand_cast::control::BUS_WRITE_TIMEOUT,
+                                        write_frame(&mut sock, &frame),
+                                    )
+                                    .await;
+                                    let _ = reply.send(Ok(pc_auth_ready));
+                                }
+                                Err(err) => {
+                                    let _ = reply.send(Err(err));
+                                }
+                            }
+                        }
+                        crate::expand_cast::control::BusCommand::SendSignal {
+                            connection_id,
+                            payload,
+                            reply,
+                        } => {
+                            let res = controller.send_signal(connection_id, payload).await;
+                            let _ = reply.send(res);
+                        }
+                        crate::expand_cast::control::BusCommand::ReceiveSignal {
+                            connection_id,
+                            max,
+                            reply,
+                        } => {
+                            let res = controller.receive_signal(connection_id, max);
+                            let _ = reply.send(res);
+                        }
+                    }
+                }
+            } else {
+                let reason = "tablet data channel is not ready; reconnect the device".to_string();
+                for _ in 0..16 {
+                    let Some(command) = controller.try_next() else {
+                        break;
+                    };
+                    match command {
+                        crate::expand_cast::control::BusCommand::Status { reply } => {
+                            let _ = reply.send(controller.status());
+                        }
+                        crate::expand_cast::control::BusCommand::Start { reply } => {
+                            let _ = reply.send(Err(reason.clone()));
+                        }
+                        crate::expand_cast::control::BusCommand::Stop { reply } => {
+                            let _ = reply.send(Err(reason.clone()));
+                        }
+                        crate::expand_cast::control::BusCommand::OnTabletDeviceInfo { reply, .. } => {
+                            let _ = reply.send(Err(reason.clone()));
+                        }
+                        crate::expand_cast::control::BusCommand::SendSignal { reply, .. } => {
+                            let _ = reply.send(Err(reason.clone()));
+                        }
+                        crate::expand_cast::control::BusCommand::ReceiveSignal { reply, .. } => {
+                            let _ = reply.send(Err(reason.clone()));
+                        }
+                    }
+                }
+            }
+        }
         if let (Some(state), Some((_, token))) = (lifecycle, attached_device.as_ref()) {
             if state.take_disconnect_request(*token).await {
                 info!("panta[{}]: closing session on user request", peer);
@@ -2209,6 +2384,12 @@ async fn run_session<F, Fut>(
             } => continue,
             _ = async {
                 match kms_controller.as_mut() {
+                    Some(controller) => controller.wait_command().await,
+                    None => std::future::pending().await,
+                }
+            }, if local_session_confirmed && link_info_sent => continue,
+            _ = async {
+                match expand_cast_controller.as_mut() {
                     Some(controller) => controller.wait_command().await,
                     None => std::future::pending().await,
                 }
@@ -2452,6 +2633,14 @@ async fn run_session<F, Fut>(
                                         peer.ip(),
                                         local_addr.ip(),
                                     );
+                                    expand_cast_controller = state.expand_cast.register_bus(
+                                        &device_id,
+                                        peer.ip(),
+                                        local_addr.ip(),
+                                        &epi_name,
+                                        hostname,
+                                        &crate::net_utils::pdid(),
+                                    ).map(|(c, _)| c);
                                 }
                                 *attached_device = Some((device_id, token));
                             }
@@ -2821,6 +3010,68 @@ async fn run_session<F, Fut>(
                                                 info!("panta[{}]: replied PcVersion", peer);
                                             }
                                         }
+                                        if (topic == "Oplus_ExpandCast" || topic.is_empty())
+                                            && key == "ex_ability_sync"
+                                        {
+                                            if let Some((width, height)) =
+                                                expand_cast_tablet_resolution(&plain)
+                                            {
+                                                if let (Some(controller), Some(peer_id)) = (
+                                                    expand_cast_controller.as_mut(),
+                                                    authenticated_device_id,
+                                                ) {
+                                                    if let Ok(pc_auth_ready) =
+                                                        controller.on_tablet_device_info(width, height)
+                                                    {
+                                                        let frame = build_data_bus_with(
+                                                            local_session,
+                                                            our_id,
+                                                            peer_id,
+                                                            0x52,
+                                                            &pc_auth_ready,
+                                                        );
+                                                        let _ = write_frame(&mut sock, &frame).await;
+
+                                                        // Send track and audio mode required by ColorOS to dismiss the loading screen
+                                                        let track = crate::expand_cast::control::expand_cast_dbs_json(
+                                                            "pc_general_track",
+                                                            serde_json::json!({
+                                                                "CaptureChannelInitFail": 0,
+                                                                "DualGpuMismatch": 0,
+                                                                "extMode": 1,
+                                                                "version": "17.20.3"
+                                                            }),
+                                                        );
+                                                        let frame_track = build_data_bus_with(
+                                                            local_session,
+                                                            our_id,
+                                                            peer_id,
+                                                            0x52,
+                                                            &track,
+                                                        );
+                                                        let _ = write_frame(&mut sock, &frame_track).await;
+
+                                                        let audio_mode = crate::expand_cast::control::expand_cast_dbs_json(
+                                                            "pc_audio_mode",
+                                                            serde_json::json!("audio_output_pc"),
+                                                        );
+                                                        let frame_audio = build_data_bus_with(
+                                                            local_session,
+                                                            our_id,
+                                                            peer_id,
+                                                            0x52,
+                                                            &audio_mode,
+                                                        );
+                                                        let _ = write_frame(&mut sock, &frame_audio).await;
+
+                                                        info!(
+                                                            "panta[{}]: sent pc_auth_ready, pc_general_track, and pc_audio_mode for ExpandCast ({}x{})",
+                                                            peer, width, height
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                     append_protocol_log(
                                         "oppo-business.log",
@@ -3037,6 +3288,7 @@ mod tests {
             let mut topics = BusTopics {
                 kms: true,
                 cast: true,
+                expand_cast: false,
             };
             for step in 0..3 {
                 let value: serde_json::Value = serde_json::from_str(&topics.sync_json()).unwrap();
@@ -3050,9 +3302,10 @@ mod tests {
                     assert_eq!(names.contains(&"Oplus_KeyMouseLink"), topics.kms);
                     assert_eq!(names.contains(&"Oplus_Cast"), topics.cast);
                     assert!(names.contains(&"Oplus_MacConnect"));
+                    assert_eq!(names.contains(&"Oplus_ExpandCast"), topics.expand_cast);
                     assert_eq!(
                         names.len(),
-                        2 + usize::from(topics.kms) + usize::from(topics.cast)
+                        2 + usize::from(topics.kms) + usize::from(topics.cast) + usize::from(topics.expand_cast)
                     );
                 }
                 match (step, stop_cast_first) {

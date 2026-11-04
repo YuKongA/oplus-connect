@@ -1,5 +1,6 @@
 use crate::cast::control::CastRegistry;
 use crate::kms::control::KmsRegistry;
+use crate::expand_cast::control::ExpandCastRegistry;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{
@@ -80,6 +81,7 @@ pub struct AppState {
     pending_removals: Arc<RwLock<HashMap<String, u64>>>,
     pub kms: Arc<KmsRegistry>,
     pub cast: Arc<CastRegistry>,
+    pub expand_cast: Arc<ExpandCastRegistry>,
 }
 
 impl AppState {
@@ -98,6 +100,7 @@ impl AppState {
             pending_removals: Arc::new(RwLock::new(HashMap::new())),
             kms: Arc::new(KmsRegistry::new()),
             cast: Arc::new(CastRegistry::new()),
+            expand_cast: Arc::new(ExpandCastRegistry::new()),
         }
     }
 

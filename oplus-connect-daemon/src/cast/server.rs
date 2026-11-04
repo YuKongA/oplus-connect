@@ -1,7 +1,7 @@
 //! Bounded ODMF signaling for one authenticated Panta owner, at most two TCP peers.
 //! Media negotiation is supplied by the controller; UDP time sync is peer-IP scoped.
 use super::{Codec, auth::Identity, invalid, read_frame, write_plain};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -34,9 +34,10 @@ static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 pub struct ServerConfig {
     pub bind_ip: IpAddr,
     pub peer_ip: IpAddr,
+    pub port: Option<u16>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ServerState {
     Listening,
@@ -45,7 +46,7 @@ pub enum ServerState {
     Closed,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionStatus {
     pub state: ServerState,
     /// IDs are unique per TCP connection and appear only after successful pairing.
@@ -99,6 +100,14 @@ pub struct Server {
 
 impl Server {
     pub async fn bind(config: ServerConfig) -> io::Result<Self> {
+        let identity = Arc::new(Identity::new());
+        Self::bind_with_identity(config, identity).await
+    }
+
+    pub async fn bind_with_identity(
+        config: ServerConfig,
+        identity: Arc<Identity>,
+    ) -> io::Result<Self> {
         if config.bind_ip.is_unspecified()
             || config.peer_ip.is_unspecified()
             || config.bind_ip.is_multicast()
@@ -110,12 +119,12 @@ impl Server {
                 "invalid cast listener configuration",
             ));
         }
-        let listener = TcpListener::bind(SocketAddr::new(config.bind_ip, 0)).await?;
+        let port = config.port.unwrap_or(0);
+        let listener = TcpListener::bind(SocketAddr::new(config.bind_ip, port)).await?;
         let local_addr = listener.local_addr()?;
         // Bind the advertised endpoint before publishing it to the owner.
         let time_sync_socket = UdpSocket::bind(SocketAddr::new(config.bind_ip, 0)).await?;
         let time_sync_addr = time_sync_socket.local_addr()?;
-        let identity = Arc::new(Identity::new());
         let codec = identity.codec();
         let shared = Arc::new(Mutex::new(Shared::default()));
         let (shutdown, shutdown_rx) = watch::channel(false);
@@ -156,6 +165,9 @@ impl Server {
     pub fn advertisement(&self) -> Value {
         self.identity.advertisement()
     }
+    pub fn connection_ids(&self) -> Vec<u64> {
+        self.status().connection_ids
+    }
 
     pub fn status(&self) -> SessionStatus {
         let shared = self.shared.lock().unwrap();
@@ -182,15 +194,13 @@ impl Server {
 
     /// Sends inner signaling JSON, not an ODMF envelope. Success means the frame
     /// was written, not that the remote media engine accepted the negotiation.
-    pub async fn send(&mut self, connection_id: u64, payload: Value) -> io::Result<()> {
+    pub async fn send(&self, connection_id: u64, payload: Value) -> io::Result<()> {
         if !payload.is_object() {
             return Err(invalid("cast signaling payload must be a JSON object"));
         }
-        tracing::debug!(
-            "cast send requested connection={connection_id} type={:?} payload_bytes={}",
-            payload.get("type"),
-            payload.to_string().len()
-        );
+        if payload.get("cmd").is_some() {
+            return self.send_envelope(connection_id, payload, false).await;
+        }
         let close = is_bye(&payload);
         let message =
             serde_json::to_string(&payload).map_err(|_| invalid("invalid cast signaling JSON"))?;
@@ -201,7 +211,7 @@ impl Server {
     /// Requests the captured rotate-with-content video mode. The negotiated
     /// codec and the phone still determine the actual output dimensions/rate.
     pub async fn configure_video(
-        &mut self,
+        &self,
         connection_id: u64,
         width: u32,
         fps: u32,
@@ -221,7 +231,7 @@ impl Server {
     }
 
     async fn send_envelope(
-        &mut self,
+        &self,
         connection_id: u64,
         envelope: Value,
         close: bool,
@@ -261,13 +271,13 @@ impl Server {
     }
 
     /// Nonblocking dequeue. Queues belong to a TCP token, never to a reconnect.
-    pub fn receive(&mut self, connection_id: u64) -> io::Result<Option<IncomingMessage>> {
+    pub fn receive(&self, connection_id: u64) -> io::Result<Option<IncomingMessage>> {
         Ok(self.receive_batch(connection_id, 1)?.pop())
     }
 
     /// Drain up to `max` messages in FIFO order, bounded by the queue capacity.
     pub fn receive_batch(
-        &mut self,
+        &self,
         connection_id: u64,
         max: usize,
     ) -> io::Result<Vec<IncomingMessage>> {

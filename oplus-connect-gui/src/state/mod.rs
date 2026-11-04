@@ -127,6 +127,15 @@ pub struct CastSessionStatus {
     pub connection_ids: Vec<u64>,
     pub last_error: Option<String>,
 }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpandCastStatus {
+    pub device_id: String,
+    pub status: String,
+    pub tablet_width: Option<u32>,
+    pub tablet_height: Option<u32>,
+    pub local_addr: Option<std::net::SocketAddr>,
+    pub connection_id: Option<u64>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", content = "payload", rename_all = "snake_case")]

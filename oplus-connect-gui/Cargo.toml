@@ -22,7 +22,7 @@ gstreamer-app = { version = "0.24", features = ["v1_24"] }
 gstreamer-video = { version = "0.24", features = ["v1_24"] }
 image = "0.25"
 smallvec = "1"
-ashpd = { version = "0.13.13", default-features = false, features = ["input_capture"] }
+ashpd = { version = "0.13.13", default-features = false, features = ["input_capture", "screencast"] }
 reis = { version = "0.7.1", features = ["tokio"] }
 futures-util = "0.3"
 zbus = { version = "5.13", default-features = false, features = ["tokio"] }

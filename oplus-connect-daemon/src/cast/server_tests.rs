@@ -11,6 +11,7 @@ async fn server() -> Server {
     Server::bind(ServerConfig {
         bind_ip: "127.0.0.1".parse().unwrap(),
         peer_ip: "127.0.0.1".parse().unwrap(),
+        port: None,
     })
     .await
     .unwrap()
@@ -272,6 +273,7 @@ async fn owner_ip_and_two_connection_limit_are_enforced() {
     let mut foreign = Server::bind(ServerConfig {
         bind_ip: "127.0.0.1".parse().unwrap(),
         peer_ip: "127.0.0.2".parse().unwrap(),
+        port: None,
     })
     .await
     .unwrap();

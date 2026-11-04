@@ -378,7 +378,7 @@ async fn pump_peer(
     let mut last_decoded = 0u64;
     let mut last_presented = 0u64;
     loop {
-        while let Some(event) = receiver.try_event() {
+        if let Some(event) = receiver.try_event() {
             match event {
                 MediaEvent::Error(error) => return Err(anyhow!(error)),
                 MediaEvent::Ended => return Ok(()),

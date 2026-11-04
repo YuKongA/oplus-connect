@@ -5,6 +5,8 @@ pub mod cast_input;
 pub mod cast_media;
 pub mod cast_session;
 pub mod cast_settings;
+pub mod expand_cast_media;
+pub mod expand_cast_session;
 pub mod client;
 pub mod icons;
 pub mod kms_capture;
@@ -46,7 +48,11 @@ static IN_PROCESS_DAEMON: std::sync::LazyLock<
 
 pub fn shutdown_in_process_daemon() {
     TOKIO_RT.block_on(async {
-        tokio::join!(cast_session::shutdown(), kms_session::shutdown());
+        tokio::join!(
+            cast_session::shutdown(),
+            kms_session::shutdown(),
+            expand_cast_session::shutdown()
+        );
         let mut handle = IN_PROCESS_DAEMON.lock().await;
         if let Some(h) = handle.take() {
             info!("Dropping in-process daemon handle and waiting for server cleanup...");
@@ -60,6 +66,8 @@ pub struct RootView {
     pub state: AppState,
     pub kms: kms_session::KmsViewState,
     kms_session: Option<kms_session::KmsSessionHandle>,
+    pub expand_cast: expand_cast_session::ExpandCastViewState,
+    expand_cast_session: Option<expand_cast_session::ExpandCastSessionHandle>,
     cast_session: Option<cast_session::CastSessionHandle>,
     cast_window: Option<WindowHandle<views::cast_window::CastWindow>>,
     cast_frame_size: (u32, u32),
@@ -127,6 +135,8 @@ impl RootView {
             state,
             kms: kms_session::KmsViewState::default(),
             kms_session: None,
+            expand_cast: expand_cast_session::ExpandCastViewState::default(),
+            expand_cast_session: None,
             cast_session: None,
             cast_window: None,
             cast_frame_size: (0, 0),
@@ -261,6 +271,87 @@ impl RootView {
             session.stop();
             self.kms.phase = kms_session::KmsPhase::Stopping;
             self.kms.detail = "正在释放按键并关闭键鼠共享…".into();
+            cx.notify();
+        }
+    }
+    pub fn start_expand_cast(&mut self, device_id: String, cx: &mut Context<Self>) {
+        if self.expand_cast.active()
+            || !self.state.known_devices.iter().any(|device| {
+                device.device_id == device_id
+                    && device.is_connected
+                    && device.device_type == "tablet"
+            })
+        {
+            return;
+        }
+        let generation = self.expand_cast.generation.wrapping_add(1);
+        self.expand_cast = expand_cast_session::ExpandCastViewState {
+            device_id: device_id.clone(),
+            generation,
+            phase: expand_cast_session::ExpandCastPhase::Preparing,
+            detail: "正在准备屏幕共享…".into(),
+            width: 2016,
+            height: 1344,
+        };
+        let (tx, mut rx) = mpsc::channel(16);
+        self.expand_cast_session = Some(expand_cast_session::start(device_id, tx));
+        cx.spawn(async move |this, app| {
+            while let Some(event) = rx.recv().await {
+                if this
+                    .update(app, |view, cx| {
+                        use expand_cast_session::{ExpandCastEvent, ExpandCastPhase};
+                        if view.expand_cast.generation != generation || !view.expand_cast.active() {
+                            return;
+                        }
+                        if view.expand_cast.phase == ExpandCastPhase::Stopping
+                            && !matches!(event, ExpandCastEvent::Closed | ExpandCastEvent::Error(_))
+                        {
+                            return;
+                        }
+                        match event {
+                            ExpandCastEvent::Phase(phase) => {
+                                view.expand_cast.phase = phase;
+                                view.expand_cast.detail = match phase {
+                                    ExpandCastPhase::WaitingForTablet => "等待平板连接 / 在系统弹窗中选择「镜像屏幕」或「虚拟扩展屏」…",
+                                    ExpandCastPhase::Streaming => "正在向平板共享屏幕",
+                                    ExpandCastPhase::Stopping => "正在停止共享屏幕…",
+                                    _ => "正在准备屏幕共享…",
+                                }
+                                .into();
+                            }
+                            ExpandCastEvent::Resolution(w, h) => {
+                                view.expand_cast.width = w;
+                                view.expand_cast.height = h;
+                            }
+                            ExpandCastEvent::Closed => {
+                                view.expand_cast_session = None;
+                                view.expand_cast.phase = ExpandCastPhase::Idle;
+                                view.expand_cast.detail = "屏幕共享已停止".into();
+                            }
+                            ExpandCastEvent::Error(error) => {
+                                view.expand_cast_session = None;
+                                view.expand_cast.phase = ExpandCastPhase::Failed;
+                                view.expand_cast.detail = error.clone();
+                                view.state.set_toast(error);
+                            }
+                        }
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub fn stop_expand_cast(&mut self, cx: &mut Context<Self>) {
+        if let Some(session) = &self.expand_cast_session {
+            session.stop();
+            self.expand_cast.phase = expand_cast_session::ExpandCastPhase::Stopping;
+            self.expand_cast.detail = "正在停止共享屏幕…".into();
             cx.notify();
         }
     }
@@ -938,6 +1029,7 @@ impl Render for RootView {
         views::MainContainer::render(
             &self.state,
             &self.kms,
+            &self.expand_cast,
             self.codec_select.as_ref(),
             self.kms_direction_select.as_ref(),
             window,

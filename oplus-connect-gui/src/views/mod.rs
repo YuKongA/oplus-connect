@@ -19,6 +19,7 @@ impl MainContainer {
     pub fn render(
         state: &AppState,
         kms: &crate::kms_session::KmsViewState,
+        expand_cast: &crate::expand_cast_session::ExpandCastViewState,
         codec: Option<
             &Entity<
                 gpui_kit::component::select::SelectState<
@@ -44,7 +45,7 @@ impl MainContainer {
                 notification_view::NotificationView::render(state, window, cx).into_any_element()
             }
             NavTab::DeviceDetail => {
-                device_detail_view::DeviceDetailView::render(state, kms, window, cx)
+                device_detail_view::DeviceDetailView::render(state, kms, expand_cast, window, cx)
                     .into_any_element()
             }
             NavTab::Settings => {

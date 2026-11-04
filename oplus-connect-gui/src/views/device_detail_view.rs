@@ -1,4 +1,5 @@
 use crate::client::DaemonClient;
+use crate::expand_cast_session::{ExpandCastPhase, ExpandCastViewState};
 use crate::kms_session::{KmsPhase, KmsViewState};
 use crate::models::*;
 use crate::state::AppState;
@@ -15,6 +16,7 @@ impl DeviceDetailView {
     pub fn render(
         state: &AppState,
         kms: &KmsViewState,
+        expand_cast: &ExpandCastViewState,
         _window: &mut Window,
         cx: &mut Context<crate::RootView>,
     ) -> impl IntoElement {
@@ -55,18 +57,19 @@ impl DeviceDetailView {
             .child(if state.known_devices.is_empty() {
                 Self::render_no_device_view().into_any_element()
             } else {
-                Self::render_device_list(state, kms, cx).into_any_element()
+                Self::render_device_list(state, kms, expand_cast, cx).into_any_element()
             })
     }
 
     fn render_device_list(
         state: &AppState,
         kms: &KmsViewState,
+        expand_cast: &ExpandCastViewState,
         cx: &mut Context<crate::RootView>,
     ) -> impl IntoElement {
         let mut list = div().flex().flex_col().gap(px(16.0));
         for (index, device) in state.known_devices.iter().enumerate() {
-            list = list.child(Self::render_device_card(device, state, kms, cx, index));
+            list = list.child(Self::render_device_card(device, state, kms, expand_cast, cx, index));
         }
         list
     }
@@ -75,6 +78,7 @@ impl DeviceDetailView {
         device: &DeviceInfo,
         state: &AppState,
         kms: &KmsViewState,
+        expand_cast: &ExpandCastViewState,
         cx: &mut Context<crate::RootView>,
         index: usize,
     ) -> impl IntoElement {
@@ -220,13 +224,38 @@ impl DeviceDetailView {
                 actions = actions.child(
                     Button::new(("btn-kms", index))
                         .primary()
-                        .disabled((kms.active() && !sharing) || kms.phase == KmsPhase::Stopping)
+                        .disabled((kms.active() && !sharing) || kms.phase == KmsPhase::Stopping || expand_cast.active())
                         .label(label)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if this.kms.active() {
                                 this.stop_kms(cx);
                             } else {
                                 this.start_kms(kms_id.clone(), cx);
+                            }
+                        })),
+                );
+
+                let ext_active = expand_cast.device_id == device.device_id && expand_cast.active();
+                let ext_label = if ext_active {
+                    match expand_cast.phase {
+                        ExpandCastPhase::Stopping => "停止中…",
+                        ExpandCastPhase::Streaming => "停止共享屏幕",
+                        _ => "共享启动中",
+                    }
+                } else {
+                    "共享屏幕"
+                };
+                let ext_id = device_id.clone();
+                actions = actions.child(
+                    Button::new(("btn-expand-cast", index))
+                        .primary()
+                        .disabled((expand_cast.active() && !ext_active) || expand_cast.phase == ExpandCastPhase::Stopping || kms.active())
+                        .label(ext_label)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if this.expand_cast.active() {
+                                this.stop_expand_cast(cx);
+                            } else {
+                                this.start_expand_cast(ext_id.clone(), cx);
                             }
                         })),
                 );
@@ -241,6 +270,9 @@ impl DeviceDetailView {
                         }
                         if this.kms.device_id == device_id {
                             this.stop_kms(cx);
+                        }
+                        if this.expand_cast.device_id == device_id {
+                            this.stop_expand_cast(cx);
                         }
                         let device_id = device_id.clone();
                         cx.spawn(async move |this, app| {

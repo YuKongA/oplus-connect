@@ -76,6 +76,28 @@ struct CastConfigureReq {
     width: u32,
     fps: u32,
 }
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExpandCastDeviceReq {
+    device_id: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExpandCastSendReq {
+    device_id: String,
+    connection_id: u64,
+    payload: serde_json::Value,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExpandCastReceiveReq {
+    device_id: String,
+    connection_id: u64,
+    #[serde(default)]
+    max: Option<usize>,
+}
 
 #[derive(serde::Deserialize)]
 struct DisconnectReq {
@@ -622,6 +644,102 @@ async fn handle_client(
                         "connection_id":request.connection_id,"payload":first,"payloads":payloads
                     }))).unwrap())
                 }
+                Err(message) => (
+                    409,
+                    serde_json::to_string(&ApiResponse::error(409, message)).unwrap(),
+                ),
+            }
+        }
+        ("POST", "/expand_cast/start" | "/expand_cast/status" | "/expand_cast/stop") => {
+            let request = match serde_json::from_str::<ExpandCastDeviceReq>(body) {
+                Ok(request) if !request.device_id.trim().is_empty() => request,
+                _ => {
+                    let response = ApiResponse::error(400, "Malformed expand_cast device request");
+                    return write_response(&mut stream, 400, &serde_json::to_string(&response)?)
+                        .await;
+                }
+            };
+            let result = match path {
+                "/expand_cast/start" => state
+                    .expand_cast
+                    .start(&request.device_id)
+                    .await
+                    .map(|info| serde_json::to_value(info).unwrap()),
+                "/expand_cast/status" => state
+                    .expand_cast
+                    .status(&request.device_id)
+                    .await
+                    .map(|info| serde_json::to_value(info).unwrap()),
+                _ => state
+                    .expand_cast
+                    .stop(&request.device_id)
+                    .await
+                    .map(|()| serde_json::Value::Null),
+            };
+            match result {
+                Ok(info) => (
+                    200,
+                    serde_json::to_string(&ApiResponse::success(info)).unwrap(),
+                ),
+                Err(message) => (
+                    409,
+                    serde_json::to_string(&ApiResponse::error(409, message)).unwrap(),
+                ),
+            }
+        }
+        ("POST", "/expand_cast/send") => {
+            let request = match serde_json::from_str::<ExpandCastSendReq>(body) {
+                Ok(request)
+                    if !request.device_id.trim().is_empty() && request.connection_id != 0 =>
+                {
+                    request
+                }
+                _ => {
+                    let response = ApiResponse::error(400, "Malformed expand_cast signaling request");
+                    return write_response(&mut stream, 400, &serde_json::to_string(&response)?)
+                        .await;
+                }
+            };
+            match state
+                .expand_cast
+                .send_signal(&request.device_id, request.connection_id, request.payload)
+                .await
+            {
+                Ok(()) => (200, serde_json::to_string(&ApiResponse::ok()).unwrap()),
+                Err(message) => (
+                    409,
+                    serde_json::to_string(&ApiResponse::error(409, message)).unwrap(),
+                ),
+            }
+        }
+        ("POST", "/expand_cast/receive") => {
+            let request = match serde_json::from_str::<ExpandCastReceiveReq>(body) {
+                Ok(request)
+                    if !request.device_id.trim().is_empty() && request.connection_id != 0 =>
+                {
+                    request
+                }
+                _ => {
+                    let response = ApiResponse::error(400, "Malformed expand_cast receive request");
+                    return write_response(&mut stream, 400, &serde_json::to_string(&response)?)
+                        .await;
+                }
+            };
+            let max = request.max.unwrap_or(16).clamp(1, 64);
+            match state
+                .expand_cast
+                .receive_signal(&request.device_id, request.connection_id, max)
+                .await
+            {
+                Ok(messages) => (
+                    200,
+                    serde_json::to_string(&ApiResponse::success(serde_json::json!({
+                        "device_id": request.device_id.trim().to_ascii_uppercase(),
+                        "connection_id": request.connection_id,
+                        "messages": messages,
+                    })))
+                    .unwrap(),
+                ),
                 Err(message) => (
                     409,
                     serde_json::to_string(&ApiResponse::error(409, message)).unwrap(),

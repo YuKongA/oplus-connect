@@ -2,6 +2,7 @@ pub mod cast;
 pub mod clipboard;
 pub mod discovery;
 pub mod kms;
+pub mod expand_cast;
 pub mod net_utils;
 pub mod panta;
 pub mod platform;

@@ -1245,6 +1245,25 @@ GUI 默认从电脑左侧移出，设置页提供向左、向右两种方位。�
 相对边缘坐标及 portal/EIS 激活排序。修订版的双向边缘连续操作仍待真机验收，
 不将编译、单元测试或 TCP 已连接等同于 Pad 光标显示正常。
 
+#### ExpandCast 平板扩展屏协议（2026-11-04）
+
+平板扩展屏（PC 桌面推流至平板作为第二屏幕）由 `Oplus_ExpandCast` 承载，
+运行逻辑与手机投屏相反（PC 作为视频源与发送端，平板作为全屏渲染与反控端）。
+
+1. **Panta 话题协商**：
+   - 话题：`Oplus_ExpandCast`，tag 为 0。
+   - PC 启动扩展屏后，依次发送：
+     - `pc_general_track`：声明扩展模式（`extMode: 1`）及显卡硬件；
+     - `pc_device_info`：携带 `mode: 1`、`connection_type: 16` 及 PC 基础信息。
+   - 平板收到后回复 `android_device_info`，携带物理分辨率（如 `{"width":2520,"height":1680}`）。
+   - PC 收到平板物理尺寸后，启动 ODMF 监听（固定端口 7239），并回发 `pc_auth_ready`（携带 P-256 ECDH 协商公钥）。
+
+2. **WebRTC 媒体与推流**：
+   - 平板连接 PC 7239 端口完成基于 ECDH 的身份认证，建立 WebRTC PeerConnection。
+   - PC 作为 Offerer，发送 Offer SDP（包含 H.264 PT100 视频轨道与 SCTP DataChannel 5000）；平板回复 Answer SDP。
+   - Linux 端通过 PipeWire / Screencast Portal 捕获画面，使用 VA-API 硬件编码器（`vah264enc`）向平板实时推流，目标码率 10 Mbps。
+   - 平板端的触控与手写笔操作通过 DataChannel 实时反传（采用与投屏反控相同的 24 字节帧格式）。
+
 ---
 
 ## 10. Windows harness

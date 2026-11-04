@@ -1,4 +1,4 @@
-use crate::state::{CastIncoming, CastStatus, DaemonStatus, DeviceInfo, RemoteDevicePayload};
+use crate::state::{CastIncoming, CastStatus, DaemonStatus, DeviceInfo, ExpandCastStatus, RemoteDevicePayload};
 use anyhow::{anyhow, Context, Result};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -346,6 +346,99 @@ impl DaemonClient {
             .await?;
         ensure_ok(&body)
     }
+    pub async fn expand_cast_start(&self, device_id: &str) -> Result<ExpandCastStatus> {
+        let body = self
+            .control_request(
+                "POST",
+                "/expand_cast/start",
+                Some(&serde_json::json!({"device_id": device_id}).to_string()),
+            )
+            .await?;
+        parse_expand_cast_status(&body)
+    }
+
+    pub async fn expand_cast_status(&self, device_id: &str) -> Result<ExpandCastStatus> {
+        let body = self
+            .control_request(
+                "POST",
+                "/expand_cast/status",
+                Some(&serde_json::json!({"device_id": device_id}).to_string()),
+            )
+            .await?;
+        parse_expand_cast_status(&body)
+    }
+
+    pub async fn expand_cast_stop(&self, device_id: &str) -> Result<()> {
+        let body = self
+            .control_request(
+                "POST",
+                "/expand_cast/stop",
+                Some(&serde_json::json!({"device_id": device_id}).to_string()),
+            )
+            .await?;
+        ensure_ok(&body)
+    }
+
+    pub async fn expand_cast_send(
+        &self,
+        device_id: &str,
+        connection_id: u64,
+        payload: &serde_json::Value,
+    ) -> Result<()> {
+        let body = self
+            .control_request(
+                "POST",
+                "/expand_cast/send",
+                Some(
+                    &serde_json::json!({
+                        "device_id": device_id,
+                        "connection_id": connection_id,
+                        "payload": payload,
+                    })
+                    .to_string(),
+                ),
+            )
+            .await?;
+        ensure_ok(&body)
+    }
+
+    pub async fn expand_cast_receive(
+        &self,
+        device_id: &str,
+        connection_id: u64,
+        max: usize,
+    ) -> Result<Vec<serde_json::Value>> {
+        let body = self
+            .control_request(
+                "POST",
+                "/expand_cast/receive",
+                Some(
+                    &serde_json::json!({
+                        "device_id": device_id,
+                        "connection_id": connection_id,
+                        "max": max,
+                    })
+                    .to_string(),
+                ),
+            )
+            .await?;
+        let response: serde_json::Value =
+            serde_json::from_str(&body).with_context(|| "invalid expand_cast receive response")?;
+        if response.get("code").and_then(|v| v.as_i64()) != Some(0) {
+            let message = response
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("daemon rejected expand_cast receive");
+            return Err(anyhow!("{message}"));
+        }
+        let messages = response
+            .get("data")
+            .and_then(|d| d.get("messages"))
+            .and_then(|m| m.as_array())
+            .cloned()
+            .unwrap_or_default();
+        Ok(messages)
+    }
     pub async fn kms_start(
         &self,
         device_id: &str,
@@ -509,6 +602,23 @@ fn parse_cast_status(body: &str) -> Result<CastStatus> {
     Ok(serde_json::from_value(
         response.get("data").cloned().unwrap_or_default(),
     )?)
+}
+fn parse_expand_cast_status(body: &str) -> Result<ExpandCastStatus> {
+    let response: serde_json::Value =
+        serde_json::from_str(body).with_context(|| "invalid expand_cast status response")?;
+    if response.get("code").and_then(|v| v.as_i64()) != Some(0) {
+        let message = response
+            .get("message")
+            .or_else(|| response.get("msg"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("daemon rejected expand_cast request");
+        return Err(anyhow!("{message}"));
+    }
+    let data = response
+        .get("data")
+        .cloned()
+        .ok_or_else(|| anyhow!("missing expand_cast status data"))?;
+    serde_json::from_value(data).with_context(|| "malformed expand_cast status payload")
 }
 
 /// IPC routes answer with `{"code":0,"msg":"success"}`; older ones used
