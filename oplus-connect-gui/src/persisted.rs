@@ -97,6 +97,69 @@ pub fn save_cast_settings(audio: bool, input: bool, h265: bool) {
     }
 }
 
+pub const FPS_MIN: u32 = 1;
+pub const FPS_MAX: u32 = 144;
+pub const BITRATE_MIN: u32 = 500;
+pub const BITRATE_MAX: u32 = 50_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ExpandCastSettings {
+    pub fps: u32,
+    pub bitrate_kbps: u32,
+    pub adaptive_bitrate: bool,
+}
+
+impl Default for ExpandCastSettings {
+    fn default() -> Self {
+        Self {
+            fps: 30,
+            bitrate_kbps: 6000,
+            adaptive_bitrate: true,
+        }
+    }
+}
+
+impl ExpandCastSettings {
+    pub fn is_valid(self) -> bool {
+        (FPS_MIN..=FPS_MAX).contains(&self.fps)
+            && (BITRATE_MIN..=BITRATE_MAX).contains(&self.bitrate_kbps)
+    }
+}
+
+fn expand_cast_settings_path() -> PathBuf {
+    oplus_connect_daemon::net_utils::config_dir()
+        .join("oppo-connect")
+        .join("expand-cast-settings.json")
+}
+
+fn load_expand_cast_settings_at(path: &Path) -> ExpandCastSettings {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<ExpandCastSettings>(&bytes).ok())
+        .filter(|settings| settings.is_valid())
+        .unwrap_or_default()
+}
+
+pub fn load_expand_cast_settings() -> ExpandCastSettings {
+    load_expand_cast_settings_at(&expand_cast_settings_path())
+}
+
+fn save_expand_cast_settings_at(path: &Path, settings: ExpandCastSettings) -> io::Result<()> {
+    if !settings.is_valid() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid tablet sharing settings",
+        ));
+    }
+    let bytes = serde_json::to_vec_pretty(&settings).map_err(io::Error::other)?;
+    save_bytes(path, &bytes)
+}
+
+pub fn save_expand_cast_settings(settings: ExpandCastSettings) -> io::Result<()> {
+    save_expand_cast_settings_at(&expand_cast_settings_path(), settings)
+}
+
 fn kms_settings_path() -> PathBuf {
     oplus_connect_daemon::net_utils::config_dir()
         .join("oppo-connect")
@@ -210,6 +273,63 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    #[test]
+    fn expand_cast_settings_round_trip_and_reject_invalid_values() {
+        let path = temp_path();
+        assert_eq!(
+            load_expand_cast_settings_at(&path),
+            ExpandCastSettings::default()
+        );
+        let settings = ExpandCastSettings {
+            fps: 120,
+            bitrate_kbps: 12_000,
+            adaptive_bitrate: false,
+        };
+        save_expand_cast_settings_at(&path, settings).unwrap();
+        assert_eq!(load_expand_cast_settings_at(&path), settings);
+        for invalid in [
+            ExpandCastSettings { fps: 0, ..settings },
+            ExpandCastSettings {
+                fps: FPS_MAX + 1,
+                ..settings
+            },
+            ExpandCastSettings {
+                bitrate_kbps: BITRATE_MIN - 1,
+                ..settings
+            },
+            ExpandCastSettings {
+                bitrate_kbps: BITRATE_MAX + 1,
+                ..settings
+            },
+        ] {
+            assert_eq!(
+                save_expand_cast_settings_at(&path, invalid)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+            fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+            assert_eq!(
+                load_expand_cast_settings_at(&path),
+                ExpandCastSettings::default()
+            );
+        }
+        fs::write(&path, b"not json").unwrap();
+        assert_eq!(
+            load_expand_cast_settings_at(&path),
+            ExpandCastSettings::default()
+        );
+        fs::write(&path, br#"{"fps":60}"#).unwrap();
+        assert_eq!(
+            load_expand_cast_settings_at(&path),
+            ExpandCastSettings {
+                fps: 60,
+                ..ExpandCastSettings::default()
+            }
+        );
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

@@ -2271,10 +2271,9 @@ async fn run_session<F, Fut>(
                         crate::expand_cast::control::BusCommand::Stop { reply } => {
                             if let Ok(close_msg) = controller.stop().await {
                                 bus_topics.expand_cast = false;
-                                for (route_head, json) in [
-                                    (0x52, close_msg),
-                                    (0x2a, bus_topics.sync_json()),
-                                ] {
+                                for (route_head, json) in
+                                    [(0x52, close_msg), (0x2a, bus_topics.sync_json())]
+                                {
                                     let frame = build_data_bus_with(
                                         local_session,
                                         our_id,
@@ -2298,28 +2297,26 @@ async fn run_session<F, Fut>(
                             width,
                             height,
                             reply,
-                        } => {
-                            match controller.on_tablet_device_info(width, height) {
-                                Ok(pc_auth_ready) => {
-                                    let frame = build_data_bus_with(
-                                        local_session,
-                                        our_id,
-                                        peer_id,
-                                        0x52,
-                                        &pc_auth_ready,
-                                    );
-                                    let _ = tokio::time::timeout(
-                                        crate::expand_cast::control::BUS_WRITE_TIMEOUT,
-                                        write_frame(&mut sock, &frame),
-                                    )
-                                    .await;
-                                    let _ = reply.send(Ok(pc_auth_ready));
-                                }
-                                Err(err) => {
-                                    let _ = reply.send(Err(err));
-                                }
+                        } => match controller.on_tablet_device_info(width, height) {
+                            Ok(pc_auth_ready) => {
+                                let frame = build_data_bus_with(
+                                    local_session,
+                                    our_id,
+                                    peer_id,
+                                    0x52,
+                                    &pc_auth_ready,
+                                );
+                                let _ = tokio::time::timeout(
+                                    crate::expand_cast::control::BUS_WRITE_TIMEOUT,
+                                    write_frame(&mut sock, &frame),
+                                )
+                                .await;
+                                let _ = reply.send(Ok(pc_auth_ready));
                             }
-                        }
+                            Err(err) => {
+                                let _ = reply.send(Err(err));
+                            }
+                        },
                         crate::expand_cast::control::BusCommand::SendSignal {
                             connection_id,
                             payload,
@@ -2354,13 +2351,18 @@ async fn run_session<F, Fut>(
                         crate::expand_cast::control::BusCommand::Stop { reply } => {
                             let _ = reply.send(Err(reason.clone()));
                         }
-                        crate::expand_cast::control::BusCommand::OnTabletDeviceInfo { reply, .. } => {
+                        crate::expand_cast::control::BusCommand::OnTabletDeviceInfo {
+                            reply,
+                            ..
+                        } => {
                             let _ = reply.send(Err(reason.clone()));
                         }
                         crate::expand_cast::control::BusCommand::SendSignal { reply, .. } => {
                             let _ = reply.send(Err(reason.clone()));
                         }
-                        crate::expand_cast::control::BusCommand::ReceiveSignal { reply, .. } => {
+                        crate::expand_cast::control::BusCommand::ReceiveSignal {
+                            reply, ..
+                        } => {
                             let _ = reply.send(Err(reason.clone()));
                         }
                     }
@@ -2633,14 +2635,17 @@ async fn run_session<F, Fut>(
                                         peer.ip(),
                                         local_addr.ip(),
                                     );
-                                    expand_cast_controller = state.expand_cast.register_bus(
-                                        &device_id,
-                                        peer.ip(),
-                                        local_addr.ip(),
-                                        &epi_name,
-                                        hostname,
-                                        &crate::net_utils::pdid(),
-                                    ).map(|(c, _)| c);
+                                    expand_cast_controller = state
+                                        .expand_cast
+                                        .register_bus(
+                                            &device_id,
+                                            peer.ip(),
+                                            local_addr.ip(),
+                                            &epi_name,
+                                            hostname,
+                                            &crate::net_utils::pdid(),
+                                        )
+                                        .map(|(c, _)| c);
                                 }
                                 *attached_device = Some((device_id, token));
                             }
@@ -3020,8 +3025,8 @@ async fn run_session<F, Fut>(
                                                     expand_cast_controller.as_mut(),
                                                     authenticated_device_id,
                                                 ) {
-                                                    if let Ok(pc_auth_ready) =
-                                                        controller.on_tablet_device_info(width, height)
+                                                    if let Ok(pc_auth_ready) = controller
+                                                        .on_tablet_device_info(width, height)
                                                     {
                                                         let frame = build_data_bus_with(
                                                             local_session,
@@ -3030,7 +3035,8 @@ async fn run_session<F, Fut>(
                                                             0x52,
                                                             &pc_auth_ready,
                                                         );
-                                                        let _ = write_frame(&mut sock, &frame).await;
+                                                        let _ =
+                                                            write_frame(&mut sock, &frame).await;
 
                                                         // Send track and audio mode required by ColorOS to dismiss the loading screen
                                                         let track = crate::expand_cast::control::expand_cast_dbs_json(
@@ -3049,7 +3055,9 @@ async fn run_session<F, Fut>(
                                                             0x52,
                                                             &track,
                                                         );
-                                                        let _ = write_frame(&mut sock, &frame_track).await;
+                                                        let _ =
+                                                            write_frame(&mut sock, &frame_track)
+                                                                .await;
 
                                                         let audio_mode = crate::expand_cast::control::expand_cast_dbs_json(
                                                             "pc_audio_mode",
@@ -3062,7 +3070,9 @@ async fn run_session<F, Fut>(
                                                             0x52,
                                                             &audio_mode,
                                                         );
-                                                        let _ = write_frame(&mut sock, &frame_audio).await;
+                                                        let _ =
+                                                            write_frame(&mut sock, &frame_audio)
+                                                                .await;
 
                                                         info!(
                                                             "panta[{}]: sent pc_auth_ready, pc_general_track, and pc_audio_mode for ExpandCast ({}x{})",
@@ -3305,7 +3315,9 @@ mod tests {
                     assert_eq!(names.contains(&"Oplus_ExpandCast"), topics.expand_cast);
                     assert_eq!(
                         names.len(),
-                        2 + usize::from(topics.kms) + usize::from(topics.cast) + usize::from(topics.expand_cast)
+                        2 + usize::from(topics.kms)
+                            + usize::from(topics.cast)
+                            + usize::from(topics.expand_cast)
                     );
                 }
                 match (step, stop_cast_first) {

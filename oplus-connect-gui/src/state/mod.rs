@@ -238,6 +238,8 @@ pub struct AppState {
     pub cast_audio: bool,
     pub cast_input: bool,
     pub cast_h265: bool,
+    pub expand_cast_settings: crate::persisted::ExpandCastSettings,
+    pub expand_cast_settings_feedback: Option<String>,
 }
 
 impl Default for AppState {
@@ -269,6 +271,8 @@ impl AppState {
             cast_audio: true,
             cast_input: true,
             cast_h265: true,
+            expand_cast_settings: crate::persisted::ExpandCastSettings::default(),
+            expand_cast_settings_feedback: None,
         }
     }
 

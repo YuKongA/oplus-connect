@@ -1,17 +1,19 @@
 //! GStreamer WebRTC desktop streaming sender for tablet secondary display.
+use crate::persisted::{ExpandCastSettings, BITRATE_MAX, BITRATE_MIN};
 use anyhow::{anyhow, Context, Result};
 use gstreamer as gst;
+use gstreamer_app as gst_app;
+use gstreamer_app::prelude::*;
 use gstreamer_sdp as gst_sdp;
 use gstreamer_webrtc as gst_webrtc;
-use gstreamer_video::prelude::*;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     Arc,
 };
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-/// How often the sender logs capture and encode frame rates.
 const REPORT_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,11 +40,12 @@ pub struct SenderConfig {
     pub render_height: u32,
     pub fps: u32,
     pub bitrate_kbps: u32,
+    pub adaptive_bitrate: bool,
     /// Size to request from a compositor-created virtual output, so the desktop
     /// itself has the tablet's aspect ratio instead of being letterboxed.
     pub capture_width: Option<u32>,
     pub capture_height: Option<u32>,
-    pub pipewire_fd: Option<i32>,
+    pub pipewire_fd: Option<Arc<OwnedFd>>,
     pub pipewire_node: Option<u32>,
 }
 
@@ -55,6 +58,7 @@ impl Default for SenderConfig {
             render_height: 1344,
             fps: 30,
             bitrate_kbps: 6000,
+            adaptive_bitrate: true,
             capture_width: None,
             capture_height: None,
             pipewire_fd: None,
@@ -63,70 +67,117 @@ impl Default for SenderConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BitrateMode {
+    initial: u32,
+    adaptive: bool,
+}
+
+fn bitrate_mode(config: &SenderConfig, override_value: Option<&str>) -> Result<BitrateMode> {
+    let fixed = override_value
+        .map(|value| {
+            value
+                .parse::<u32>()
+                .context("invalid OPLUS_EXPAND_CAST_BITRATE")
+        })
+        .transpose()?;
+    let initial = fixed.unwrap_or(config.bitrate_kbps);
+    if !(BITRATE_MIN..=BITRATE_MAX).contains(&initial) {
+        return Err(anyhow!(
+            "ExpandCast bitrate must be between {BITRATE_MIN} and {BITRATE_MAX} kbps"
+        ));
+    }
+    Ok(BitrateMode {
+        initial,
+        adaptive: fixed.is_none() && config.adaptive_bitrate,
+    })
+}
+
+fn adjusted_bitrate(current: u32, loss: f64, initial: u32) -> u32 {
+    let next = if loss > 0.03 {
+        (f64::from(current) * 0.8) as u32
+    } else if loss < 0.01 {
+        (f64::from(current) * 1.1) as u32
+    } else {
+        current
+    };
+    next.clamp(1_200.min(initial), 6_500.max(initial))
+}
+
 pub struct MediaSender {
     pub incoming: mpsc::Sender<SignalingMessage>,
     pub outgoing: mpsc::Receiver<SignalingMessage>,
+    pub finished: tokio::sync::oneshot::Receiver<Result<(), String>>,
     pub stop: Arc<AtomicBool>,
 }
 
 pub fn spawn_sender(config: SenderConfig) -> Result<MediaSender> {
+    let settings = ExpandCastSettings {
+        fps: config.fps,
+        bitrate_kbps: config.bitrate_kbps,
+        adaptive_bitrate: config.adaptive_bitrate,
+    };
+    if !settings.is_valid() {
+        return Err(anyhow!("invalid ExpandCast sender settings"));
+    }
+    let override_value = std::env::var("OPLUS_EXPAND_CAST_BITRATE").ok();
+    bitrate_mode(&config, override_value.as_deref())?;
     gst::init().context("initializing GStreamer for ExpandCast")?;
 
     let (incoming_tx, incoming_rx) = mpsc::channel(64);
     let (outgoing_tx, outgoing_rx) = mpsc::channel(64);
+    let (finished_tx, finished) = tokio::sync::oneshot::channel();
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
 
     std::thread::Builder::new()
         .name("oplus-expand-cast-sender".into())
         .spawn(move || {
-            let mut incoming_rx = incoming_rx;
-            let mut last_error = None;
-            // Pinning the capture format to the tablet's size needs compositor
-            // support that this stack does not have: KWin 6.7 returns
-            // "Element failed to change its state" and the portal's ScreenCast
-            // v5 exposes no SetSize. Keep it behind an opt-in env for the day
-            // that changes; the default path follows the compositor.
-            let pin_requested =
-                std::env::var("OPLUS_EXPAND_CAST_PIN_CAPTURE").as_deref() == Ok("1");
-            let attempts: &[bool] = if pin_requested { &[true, false] } else { &[false] };
-            for &pin_capture in attempts {
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run_pipeline(
-                        &mut incoming_rx,
-                        outgoing_tx.clone(),
-                        &stop_thread,
-                        &config,
-                        pin_capture,
-                    )
-                }));
-                match outcome {
-                    Ok(Ok(())) => return,
-                    Ok(Err(error)) => last_error = Some(error),
-                    Err(_) => {
-                        tracing::error!("ExpandCast sender thread panicked; screen sharing stopped");
-                        return;
+            let result = (|| -> Result<()> {
+                let mut incoming_rx = incoming_rx;
+                let mut last_error = None;
+                // Older compositors may reject the requested virtual output size.
+                let pin_supported =
+                    config.capture_width.is_some() && config.capture_height.is_some();
+                let pin_requested = pin_supported
+                    && std::env::var("OPLUS_EXPAND_CAST_PIN_CAPTURE").as_deref() != Ok("0");
+                let attempts: &[bool] = if pin_requested { &[true, false] } else { &[false] };
+                for &pin_capture in attempts {
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run_pipeline(
+                            &mut incoming_rx,
+                            outgoing_tx.clone(),
+                            &stop_thread,
+                            &config,
+                            pin_capture,
+                        )
+                    }));
+                    match outcome {
+                        Ok(Ok(())) => return Ok(()),
+                        Ok(Err(error)) => last_error = Some(error),
+                        Err(_) => anyhow::bail!("ExpandCast sender thread panicked"),
+                    }
+                    if stop_thread.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    if pin_capture {
+                        tracing::warn!(
+                            "compositor does not resize virtual outputs to the requested stream size ({:#}); \
+                             falling back to the compositor size and letterboxing",
+                            last_error.as_ref().expect("error recorded")
+                        );
                     }
                 }
-                if stop_thread.load(Ordering::Acquire) {
-                    return;
-                }
-                if pin_capture {
-                    tracing::warn!(
-                        "capture format pinning unavailable ({:#}); following the compositor instead",
-                        last_error.as_ref().expect("error recorded")
-                    );
-                }
-            }
-            if let Some(error) = last_error {
-                tracing::error!("ExpandCast sender pipeline error: {error:#}");
-            }
+                Err(last_error.unwrap_or_else(|| anyhow!("ExpandCast sender stopped")))
+            })();
+            let _ = finished_tx.send(result.map_err(|error| format!("{error:#}")));
         })
         .context("spawning ExpandCast sender thread")?;
 
     Ok(MediaSender {
         incoming: incoming_tx,
         outgoing: outgoing_rx,
+        finished,
         stop,
     })
 }
@@ -143,22 +194,29 @@ fn run_pipeline(
     // Video Source: the portal-granted PipeWire node when available. `pipewiresrc`
     // selects a remote node by numeric id through `path`; `target-object` matches
     // the node *name* and fails with "target not found" for portal node ids.
-    let (src, is_pipewire) = if let (Some(fd), Some(node)) = (config.pipewire_fd, config.pipewire_node) {
-        // pipewiresrc hands the descriptor to pipewire, which owns and closes it.
-        // Each attempt needs its own duplicate, or a retry would use a descriptor
-        // that the failed attempt already released.
-        let fd = duplicate_fd(fd)?;
-        let src = gst::ElementFactory::make("pipewiresrc")
-            .property("fd", fd)
-            .property("path", node.to_string())
-            .property("do-timestamp", true)
-            // Re-send the last frame while the desktop is idle so the cadence
-            // stays even instead of bursting only when damage occurs.
-            // The property is a gint, not a guint.
-            .property("keepalive-time", 33i32)
-            .build()
-            .context("creating pipewiresrc element")?;
-        (src, true)
+    let mut capture: Option<PortalCapture> = None;
+    let (src, is_pipewire) = if let (Some(fd), Some(node)) =
+        (config.pipewire_fd.as_ref(), config.pipewire_node)
+    {
+        // Copy frames before encoding so PipeWire buffers return to the compositor promptly.
+        let pin = if pin_capture {
+            config.capture_width.zip(config.capture_height)
+        } else {
+            None
+        };
+        let mut control = start_portal_capture(Arc::clone(fd), node, pin)?;
+        let appsrc = create_capture_source()?;
+        let pump_src = appsrc
+            .clone()
+            .downcast::<gst_app::AppSrc>()
+            .map_err(|_| anyhow!("appsrc is not an AppSrc"))?;
+        let rx = control.rx.take().context("capture channel")?;
+        std::thread::Builder::new()
+            .name("expand-cast-pump".into())
+            .spawn(move || pump_capture(pump_src, rx))
+            .context("spawning capture pump thread")?;
+        capture = Some(control);
+        (appsrc, true)
     } else if std::env::var("XDG_SESSION_TYPE").as_deref() == Ok("wayland") {
         // On Wayland the XWayland root window is an empty black canvas, so an
         // X11 capture would only ever show the pointer. Surface the real cause.
@@ -180,50 +238,30 @@ fn run_pipeline(
         (src, false)
     };
 
-    // Opt-in only: ask the capture node for the tablet's own size so a virtual
-    // output would be 3:2 instead of the primary monitor's aspect. Verified
-    // rejected on KWin 6.7 ("Element failed to change its state"), so the
-    // default path letterboxes instead.
-    let pinned_caps = if is_pipewire && pin_capture {
-        let mut builder = gst::Caps::builder("video/x-raw");
-        if let (Some(width), Some(height)) = (config.capture_width, config.capture_height) {
-            builder = builder
-                .field("width", (width & !1).max(2) as i32)
-                .field("height", (height & !1).max(2) as i32);
-        }
-        let caps = builder.build();
-        tracing::info!("ExpandCast: requesting capture caps {caps}");
-        Some(
-            gst::ElementFactory::make("capsfilter")
-                .property("caps", &caps)
-                .build()
-                .context("creating capture caps filter")?,
-        )
+    let pinned_size = if pin_capture && is_pipewire {
+        config
+            .capture_width
+            .zip(config.capture_height)
+            .map(|(w, h)| ((w & !1).max(2), (h & !1).max(2)))
     } else {
         None
     };
 
-    // A blocking sink anywhere downstream stalls `pipewiresrc` itself (measured:
-    // 0.5 fps captured with webrtcbin attached versus 22 fps without). This leaky
-    // queue absorbs that so the compositor keeps producing at its own rate.
+    // Drop stale frames rather than accumulating capture latency.
     let capture_queue = gst::ElementFactory::make("queue")
         .property_from_str("leaky", "downstream")
-        .property("max-size-buffers", 2u32)
+        .property("max-size-buffers", 1u32)
         .property("max-size-bytes", 0u32)
         .property("max-size-time", 0u64)
         .build()
         .context("creating capture queue")?;
 
-    // Scale and colour-convert on the GPU when VA-API post-processing exists:
-    // 4K BGRA -> tablet-sized NV12 through videoconvert/videoscale costs far more
-    // CPU than real-time (measured ~32 fps versus ~88 fps).
+    // Prefer GPU scaling and colour conversion when available.
     let scalers: Vec<gst::Element> = if gst::ElementFactory::find("vapostproc").is_some() {
         tracing::info!("ExpandCast: scaling with VA-API post-processing");
-        vec![
-            gst::ElementFactory::make("vapostproc")
-                .build()
-                .context("creating vapostproc")?,
-        ]
+        vec![gst::ElementFactory::make("vapostproc")
+            .build()
+            .context("creating vapostproc")?]
     } else {
         tracing::info!("ExpandCast: scaling on the CPU (videoconvert/videoscale)");
         vec![
@@ -236,11 +274,20 @@ fn run_pipeline(
         ]
     };
     // Keep a steady cadence even though the capture source reports 0/1.
-    let rate = gst::ElementFactory::make("videorate").build().context("creating videorate")?;
+    let rate = gst::ElementFactory::make("videorate")
+        .build()
+        .context("creating videorate")?;
+    let override_value = std::env::var("OPLUS_EXPAND_CAST_BITRATE").ok();
+    let mode = bitrate_mode(config, override_value.as_deref())?;
+    let bitrate_kbps = mode.initial;
+    if !mode.adaptive {
+        tracing::info!("ExpandCast: fixed bitrate {bitrate_kbps} kbps");
+    }
+    let target_bitrate = Arc::new(AtomicU32::new(bitrate_kbps));
     // Choose VA-API H.264 hardware encoder if available, otherwise x264enc
     let (enc, _is_va) = if gst::ElementFactory::find("vah264enc").is_some() {
         let enc = gst::ElementFactory::make("vah264enc")
-            .property("bitrate", config.bitrate_kbps)
+            .property("bitrate", bitrate_kbps)
             // One keyframe per second keeps recovery time short on Wi-Fi loss.
             .property("key-int-max", config.fps.max(1) as u32)
             // A single reference frame removes reorder delay and encode cost;
@@ -252,7 +299,7 @@ fn run_pipeline(
         (enc, true)
     } else {
         let enc = gst::ElementFactory::make("x264enc")
-            .property("bitrate", config.bitrate_kbps)
+            .property("bitrate", bitrate_kbps)
             .property_from_str("tune", "zerolatency")
             .property_from_str("speed-preset", "ultrafast")
             .property("key-int-max", config.fps)
@@ -279,15 +326,7 @@ fn run_pipeline(
         .context("creating webrtcbin")?;
 
     // When the compositor accepted our size request the captured desktop already
-    // matches the panel, so there is nothing to letterbox.
-    let pinned_size = if pin_capture {
-        config
-            .capture_width
-            .zip(config.capture_height)
-            .map(|(w, h)| ((w & !1).max(2), (h & !1).max(2)))
-    } else {
-        None
-    };
+    // matches the panel, so there is nothing to letterbox (see `pinned_size`).
     let render_width = pinned_size
         .map(|(w, _)| w)
         .unwrap_or(config.render_width & !1);
@@ -334,13 +373,26 @@ fn run_pipeline(
         None
     };
 
+    // Drop stale frames when downstream processing falls behind.
+    let make_leaky_queue = |name: &str| -> Result<gst::Element> {
+        gst::ElementFactory::make("queue")
+            .name(name)
+            .property_from_str("leaky", "downstream")
+            .property("max-size-buffers", 3u32)
+            .property("max-size-bytes", 0u32)
+            .property("max-size-time", 0u64)
+            .build()
+            .with_context(|| format!("creating {name}"))
+    };
+    let post_scaler_queue = make_leaky_queue("post-scaler-queue")?;
+    let post_rate_queue = make_leaky_queue("post-rate-queue")?;
+
     let mut elements: Vec<&gst::Element> = vec![&src];
-    if let Some(filter) = &pinned_caps {
-        elements.push(filter);
-    }
     elements.push(&capture_queue);
     elements.extend(scalers.iter());
+    elements.push(&post_scaler_queue);
     elements.push(&rate);
+    elements.push(&post_rate_queue);
     if let Some((boxx, converter)) = &padding {
         elements.push(boxx);
         elements.push(converter);
@@ -371,23 +423,26 @@ fn run_pipeline(
         .field("framerate", framerate)
         .build();
 
-    let mut tail: &gst::Element = &src;
-    if let Some(filter) = &pinned_caps {
-        tail.link(filter).context("linking source to capture format filter")?;
-        tail = filter;
-    }
-    tail.link(&capture_queue).context("linking capture queue")?;
-    tail = &capture_queue;
+    src.link(&capture_queue).context("linking capture queue")?;
+    let mut tail: &gst::Element = &capture_queue;
     for element in &scalers {
         tail.link(element)
             .with_context(|| format!("linking {} to {}", tail.name(), element.name()))?;
         tail = element;
     }
-    tail.link(&rate).context("linking scaler to rate")?;
+    tail.link(&post_scaler_queue)
+        .context("linking scaler to post-scaler queue")?;
+    tail = &post_scaler_queue;
+    tail.link(&rate)
+        .context("linking post-scaler queue to rate")?;
+    tail = &rate;
+    tail.link(&post_rate_queue)
+        .context("linking rate to post-rate queue")?;
     match &padding {
         Some((boxx, converter)) => {
-            rate.link_filtered(boxx, &boxed_caps)
-                .context("linking rate to videobox")?;
+            post_rate_queue
+                .link_filtered(boxx, &boxed_caps)
+                .context("linking post-rate queue to videobox")?;
             boxx.link_filtered(converter, &captured_caps)
                 .context("linking videobox to colour converter")?;
             converter
@@ -395,8 +450,9 @@ fn run_pipeline(
                 .context("linking colour converter to encoder")?;
         }
         None => {
-            rate.link_filtered(&enc, &encoder_caps)
-                .context("linking rate to encoder")?;
+            post_rate_queue
+                .link_filtered(&enc, &encoder_caps)
+                .context("linking post-rate queue to encoder")?;
         }
     }
     enc.link(&parse).context("linking encoder to parser")?;
@@ -412,29 +468,54 @@ fn run_pipeline(
         .field("profile-level-id", "42e01f")
         .build();
     let pay_src = pay.static_pad("src").context("getting payloader src pad")?;
-    let webrtc_sink = webrtc.request_pad_simple("sink_%u").context("requesting webrtc sink pad")?;
-    // Second stage of the same fix: webrtcbin still pushes back through the
-    // payloader (measured 4 fps captured instead of 26), so stale RTP buffers
-    // are dropped here rather than throttling the capture chain.
+    let webrtc_sink = webrtc
+        .request_pad_simple("sink_%u")
+        .context("requesting webrtc sink pad")?;
+    // RTP fragments must not be dropped independently; shed raw frames upstream.
     let send_queue = gst::ElementFactory::make("queue")
-        .property_from_str("leaky", "downstream")
-        .property("max-size-buffers", 3u32)
+        .property("max-size-buffers", 256u32)
         .property("max-size-bytes", 0u32)
         .property("max-size-time", 0u64)
         .build()
         .context("creating send queue")?;
     pipeline.add(&send_queue).context("adding send queue")?;
     pay_src
-        .link(&send_queue.static_pad("sink").context("send queue sink pad")?)
+        .link(
+            &send_queue
+                .static_pad("sink")
+                .context("send queue sink pad")?,
+        )
         .context("linking payloader to send queue")?;
-    send_queue
-        .static_pad("src")
-        .context("send queue src pad")?
-        .link(&webrtc_sink)
-        .context("linking send queue to webrtcbin")?;
+    // Diagnostic mode discards RTP locally to isolate the network leg.
+    let fake_sink = match std::env::var("OPLUS_EXPAND_CAST_FAKE_SINK").as_deref() {
+        Ok("1") => {
+            let sink = gst::ElementFactory::make("fakesink")
+                .property("sync", false)
+                .build()
+                .context("creating diagnostic fakesink")?;
+            pipeline.add(&sink).context("adding diagnostic fakesink")?;
+            tracing::warn!(
+                "OPLUS_EXPAND_CAST_FAKE_SINK=1: discarding RTP locally; the tablet gets no video"
+            );
+            Some(sink)
+        }
+        _ => None,
+    };
+    let send_queue_src = send_queue.static_pad("src").context("send queue src pad")?;
+    match &fake_sink {
+        Some(sink) => send_queue_src
+            .link(&sink.static_pad("sink").context("fakesink sink pad")?)
+            .context("linking send queue to diagnostic fakesink")?,
+        None => send_queue_src
+            .link(&webrtc_sink)
+            .context("linking send queue to webrtcbin")?,
+    };
     let _ = webrtc.emit_by_name::<Option<gst_webrtc::WebRTCRTPTransceiver>>(
         "add-transceiver",
-        &[&gst_webrtc::WebRTCRTPTransceiverDirection::Sendrecv, &Some(&rtp_caps)],
+        &[
+            &gst_webrtc::WebRTCRTPTransceiverDirection::Sendrecv,
+            &Some(&rtp_caps),
+        ],
     );
 
     // Listen for reverse touch input data channel from tablet
@@ -448,12 +529,14 @@ fn run_pipeline(
     // Monitor WebRTC connection states
     let webrtc_ice = webrtc.clone();
     webrtc.connect_notify(Some("ice-connection-state"), move |_, _| {
-        let state = webrtc_ice.property::<gst_webrtc::WebRTCICEConnectionState>("ice-connection-state");
+        let state =
+            webrtc_ice.property::<gst_webrtc::WebRTCICEConnectionState>("ice-connection-state");
         tracing::info!("WebRTC ICE connection state: {:?}", state);
     });
     let webrtc_conn = webrtc.clone();
     webrtc.connect_notify(Some("connection-state"), move |_, _| {
-        let state = webrtc_conn.property::<gst_webrtc::WebRTCPeerConnectionState>("connection-state");
+        let state =
+            webrtc_conn.property::<gst_webrtc::WebRTCPeerConnectionState>("connection-state");
         tracing::info!("WebRTC peer connection state: {:?}", state);
     });
 
@@ -463,7 +546,11 @@ fn run_pipeline(
         let mline_index = values[1].get::<u32>().unwrap_or_default();
         let candidate = values[2].get::<String>().unwrap_or_default();
         let wire_mline = if mline_index == 0 { 0 } else { 1 };
-        tracing::info!("Local WebRTC candidate: mline={}, cand={}", wire_mline, candidate);
+        tracing::info!(
+            "Local WebRTC candidate: mline={}, cand={}",
+            wire_mline,
+            candidate
+        );
         let _ = outgoing_ice.try_send(SignalingMessage::Ice {
             candidate,
             sdp_mline_index: wire_mline,
@@ -480,17 +567,34 @@ fn run_pipeline(
         "create-data-channel",
         &[&"OdmfDataChannel", &None::<gst::Structure>],
     );
-    tracing::info!("Created OdmfDataChannel for ExpandCast: {:?}", channel.is_some());
+    tracing::info!(
+        "Created OdmfDataChannel for ExpandCast: {:?}",
+        channel.is_some()
+    );
 
-    // Incoming signaling loop
+    // Allow latency negotiation to be overridden for diagnostics.
+    match std::env::var("OPLUS_EXPAND_CAST_PIPELINE_LATENCY").as_deref() {
+        Ok("auto") => {}
+        Ok(value) => match value.parse::<u64>() {
+            Ok(ms) => pipeline.set_latency(gst::ClockTime::from_mseconds(ms)),
+            Err(_) => {
+                tracing::warn!("ignoring invalid OPLUS_EXPAND_CAST_PIPELINE_LATENCY={value}")
+            }
+        },
+        Err(_) => pipeline.set_latency(gst::ClockTime::ZERO),
+    }
+    tracing::info!(
+        "ExpandCast pipeline latency: requested={:?} configured={:?}",
+        pipeline.latency(),
+        pipeline.configured_latency()
+    );
+
     let bus = pipeline.bus().context("getting pipeline bus")?;
     if let Err(error) = pipeline.set_state(gst::State::Playing) {
         let _ = pipeline.set_state(gst::State::Null);
         return Err(error).context("starting the desktop capture pipeline");
     }
 
-    // A compositor that refuses the negotiated capture format leaves the pipeline
-    // stuck in PAUSED, which reads as a peer that never gets a first frame.
     let deadline = Instant::now() + Duration::from_secs(4);
     while pipeline.current_state() != gst::State::Playing {
         if let Some(message) = bus.timed_pop(gst::ClockTime::from_mseconds(50)) {
@@ -510,21 +614,26 @@ fn run_pipeline(
     }
 
     // Wait for the video caps so the offer carries the m=video section.
-    let caps_deadline = Instant::now() + Duration::from_secs(3);
-    while webrtc_sink.current_caps().is_none() {
-        if let Some(message) = bus.timed_pop(gst::ClockTime::from_mseconds(50)) {
-            if let gst::MessageView::Error(err) = message.view() {
-                let _ = pipeline.set_state(gst::State::Null);
-                anyhow::bail!(
-                    "video negotiation error: {} ({})",
-                    err.error(),
-                    err.debug().unwrap_or_default()
-                );
-            }
+    let video_pad = if fake_sink.is_some() {
+        &pay_src
+    } else {
+        &webrtc_sink
+    };
+    match wait_for_video_caps(
+        video_pad,
+        &bus,
+        capture.as_ref(),
+        stop,
+        Duration::from_secs(3),
+    ) {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = pipeline.set_state(gst::State::Null);
+            return Ok(());
         }
-        if Instant::now() > caps_deadline {
-            tracing::warn!("no video caps after 3s; publishing the offer anyway");
-            break;
+        Err(error) => {
+            let _ = pipeline.set_state(gst::State::Null);
+            return Err(error);
         }
     }
     publish_offer(&webrtc, &outgoing_tx);
@@ -560,17 +669,48 @@ fn run_pipeline(
             gst::PadProbeReturn::Ok
         });
     }
+    // Stage counters: where the rate drops tells us whether the compositor, the
+    // capture queue or the WebRTC leg is the limiter.
+    let count_pad = |element: &gst::Element, pad_name: &str| -> Arc<AtomicU64> {
+        let counter = Arc::new(AtomicU64::new(0));
+        if let Some(pad) = element.static_pad(pad_name) {
+            let counter_inner = counter.clone();
+            pad.add_probe(
+                gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
+                move |_, info| {
+                    let count = info.buffer_list().map_or(1, |list| list.len() as u64);
+                    counter_inner.fetch_add(count, Ordering::Relaxed);
+                    gst::PadProbeReturn::Ok
+                },
+            );
+        }
+        counter
+    };
+    let queue_frames = count_pad(&capture_queue, "src");
+    let pay_frames = count_pad(&pay, "src");
+    let send_frames = count_pad(&send_queue, "src");
+
     let mut report_at = Instant::now() + REPORT_INTERVAL;
     let mut reported_frames = 0u64;
     let mut reported_source_frames = 0u64;
     let mut reported_raw_frames = 0u64;
+    let mut reported_queue_frames = 0u64;
+    let mut reported_pay_frames = 0u64;
+    let mut reported_send_frames = 0u64;
     let mut logged_capture_caps = false;
     while !stop.load(Ordering::Acquire) {
+        if let Some(error) = capture.as_ref().and_then(PortalCapture::error) {
+            let _ = pipeline.set_state(gst::State::Null);
+            anyhow::bail!("capture pipeline failed: {error}");
+        }
         // Poll for incoming signaling messages from daemon
         while let Ok(msg) = incoming_rx.try_recv() {
             match msg {
                 SignalingMessage::Sdp { type_, sdp } if type_ == "answer" => {
-                    tracing::info!("Received ExpandCast answer SDP from tablet ({} bytes)", sdp.len());
+                    tracing::info!(
+                        "Received ExpandCast answer SDP from tablet ({} bytes)",
+                        sdp.len()
+                    );
                     let local_sdp = parse_wire_answer(&sdp);
                     let sdp_msg = gst_sdp::SDPMessage::parse_buffer(local_sdp.as_bytes())
                         .map_err(|_| anyhow!("failed to parse answer SDP"))?;
@@ -578,17 +718,25 @@ fn run_pipeline(
                         gst_webrtc::WebRTCSDPType::Answer,
                         sdp_msg,
                     );
-                    let promise = gst::Promise::with_change_func(move |reply| {
-                        match reply {
-                            Ok(Some(s)) => tracing::info!("set-remote-description succeeded: {s}"),
-                            Ok(None) => tracing::info!("set-remote-description finished with empty response"),
-                            Err(e) => tracing::error!("set-remote-description failed: {e:?}"),
+                    let promise = gst::Promise::with_change_func(move |reply| match reply {
+                        Ok(Some(s)) => tracing::info!("set-remote-description succeeded: {s}"),
+                        Ok(None) => {
+                            tracing::info!("set-remote-description finished with empty response")
                         }
+                        Err(e) => tracing::error!("set-remote-description failed: {e:?}"),
                     });
                     webrtc.emit_by_name::<()>("set-remote-description", &[&answer, &promise]);
                 }
-                SignalingMessage::Ice { candidate, sdp_mline_index, .. } => {
-                    tracing::info!("Adding remote ICE candidate: mline={}, cand={}", sdp_mline_index, candidate);
+                SignalingMessage::Ice {
+                    candidate,
+                    sdp_mline_index,
+                    ..
+                } => {
+                    tracing::info!(
+                        "Adding remote ICE candidate: mline={}, cand={}",
+                        sdp_mline_index,
+                        candidate
+                    );
                     webrtc.emit_by_name::<()>("add-ice-candidate", &[&sdp_mline_index, &candidate]);
                 }
                 _ => {}
@@ -607,6 +755,10 @@ fn run_pipeline(
                     ));
                 }
                 gst::MessageView::Eos(_) => {
+                    if let Some(error) = capture.as_ref().and_then(PortalCapture::error) {
+                        let _ = pipeline.set_state(gst::State::Null);
+                        anyhow::bail!("capture pipeline failed: {error}");
+                    }
                     tracing::info!("GStreamer pipeline reached EOS");
                     break;
                 }
@@ -624,19 +776,58 @@ fn run_pipeline(
             let total = frames_out.load(Ordering::Relaxed);
             let source_total = source_frames.load(Ordering::Relaxed);
             let raw_total = raw_frames.load(Ordering::Relaxed);
+            let queue_total = queue_frames.load(Ordering::Relaxed);
+            let pay_total = pay_frames.load(Ordering::Relaxed);
+            let send_total = send_frames.load(Ordering::Relaxed);
             let elapsed = REPORT_INTERVAL.as_secs_f64();
             let fps = (total - reported_frames) as f64 / elapsed;
             let source_fps = (source_total - reported_source_frames) as f64 / elapsed;
             let raw_fps = (raw_total - reported_raw_frames) as f64 / elapsed;
+            let queue_fps = (queue_total - reported_queue_frames) as f64 / elapsed;
+            let pay_fps = (pay_total - reported_pay_frames) as f64 / elapsed;
+            let send_fps = (send_total - reported_send_frames) as f64 / elapsed;
             tracing::info!(
-                "ExpandCast stream: compositor {raw_fps:.1} fps -> scaled {source_fps:.1} fps -> encoded {fps:.1} fps ({}x{}, {} kbps)",
+                "ExpandCast stream: input {raw_fps:.1} -> queue {queue_fps:.1} -> scaled {source_fps:.1} -> encoded {fps:.1} fps; RTP pay {pay_fps:.1} -> send {send_fps:.1} buffers/s ({}x{}, {} kbps)",
                 out_width,
                 out_height,
-                config.bitrate_kbps
+                target_bitrate.load(Ordering::Relaxed)
             );
+            // WebRTC stats: packet/NACK/PLI counters and the remote estimate
+            // distinguish a congested link from a local pipeline problem.
+            let stats_webrtc = webrtc.clone();
+            let target = target_bitrate.clone();
+            let promise = gst::Promise::with_change_func(move |reply| {
+                let Ok(Some(stats)) = reply else {
+                    return;
+                };
+                if std::env::var("OPLUS_EXPAND_CAST_STATS").is_ok() {
+                    tracing::info!("ExpandCast webrtc stats: {stats}");
+                }
+                if !mode.adaptive {
+                    return;
+                }
+                let Some(loss) = parse_fraction_lost(stats) else {
+                    return;
+                };
+                let current = target.load(Ordering::Relaxed);
+                let next = adjusted_bitrate(current, loss, mode.initial);
+                if next != current {
+                    tracing::info!(
+                        "ExpandCast: peer loss {:.1}% -> bitrate {current} -> {next} kbps",
+                        loss * 100.0
+                    );
+                    target.store(next, Ordering::Relaxed);
+                }
+            });
+            stats_webrtc.emit_by_name::<()>("get-stats", &[&None::<&gst::Pad>, &promise]);
+            let wanted_bitrate = target_bitrate.load(Ordering::Relaxed);
+            enc.set_property("bitrate", wanted_bitrate);
             reported_frames = total;
             reported_source_frames = source_total;
             reported_raw_frames = raw_total;
+            reported_queue_frames = queue_total;
+            reported_pay_frames = pay_total;
+            reported_send_frames = send_total;
             report_at = Instant::now() + REPORT_INTERVAL;
         }
     }
@@ -644,17 +835,38 @@ fn run_pipeline(
     let _ = pipeline.set_state(gst::State::Null);
     Ok(())
 }
-/// Give each pipeline attempt its own descriptor for the portal's PipeWire node.
-/// The returned descriptor is intentionally leaked: pipewire takes ownership.
-fn duplicate_fd(fd: i32) -> Result<i32> {
-    use std::os::fd::{BorrowedFd, IntoRawFd};
-    // Safety: the caller keeps the portal guard (and thus `fd`) alive; we only
-    // borrow it long enough to duplicate.
-    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-    let owned = borrowed
-        .try_clone_to_owned()
-        .context("duplicating the PipeWire remote descriptor")?;
-    Ok(owned.into_raw_fd())
+
+fn wait_for_video_caps(
+    pad: &gst::Pad,
+    bus: &gst::Bus,
+    capture: Option<&PortalCapture>,
+    stop: &AtomicBool,
+    timeout: Duration,
+) -> Result<bool> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        if pad.current_caps().is_some() {
+            return Ok(true);
+        }
+        if let Some(message) = bus.timed_pop(gst::ClockTime::from_mseconds(50)) {
+            if let gst::MessageView::Error(err) = message.view() {
+                anyhow::bail!(
+                    "video negotiation error: {} ({})",
+                    err.error(),
+                    err.debug().unwrap_or_default()
+                );
+            }
+        }
+        if let Some(error) = capture.and_then(PortalCapture::error) {
+            anyhow::bail!("capture pipeline failed: {error}");
+        }
+        if Instant::now() > deadline {
+            anyhow::bail!("video caps not negotiated before timeout");
+        }
+    }
 }
 
 /// Ask webrtcbin for an offer and forward the wire-normalised SDP.
@@ -672,10 +884,7 @@ fn publish_offer(webrtc: &gst::Element, outgoing: &mpsc::Sender<SignalingMessage
         };
         let sdp = offer.sdp().as_text().unwrap_or_default();
         tracing::info!("Generated ExpandCast WebRTC offer ({} bytes)", sdp.len());
-        webrtc_local.emit_by_name::<()>(
-            "set-local-description",
-            &[&offer, &gst::Promise::new()],
-        );
+        webrtc_local.emit_by_name::<()>("set-local-description", &[&offer, &gst::Promise::new()]);
         let _ = outgoing.try_send(SignalingMessage::Sdp {
             type_: "offer".into(),
             sdp: format_wire_offer(&sdp),
@@ -700,7 +909,10 @@ fn format_wire_offer(sdp: &str) -> String {
         } else if line.starts_with("m=application 0") {
             lines.push("m=application 9 UDP/DTLS/SCTP webrtc-datachannel".to_string());
         } else if line.starts_with("a=fmtp:100 ") {
-            lines.push("a=fmtp:100 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f".to_string());
+            lines.push(
+                "a=fmtp:100 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
+                    .to_string(),
+            );
         } else {
             lines.push(line.to_string());
         }
@@ -708,6 +920,28 @@ fn format_wire_offer(sdp: &str) -> String {
     let mut text = lines.join("\r\n");
     text.push_str("\r\n");
     text
+}
+
+fn parse_fraction_lost(stats: &gst::StructureRef) -> Option<f64> {
+    stats.iter().find_map(|(_, value)| {
+        let report = value.get::<&gst::StructureRef>().ok()?;
+        if report.get::<gst_webrtc::WebRTCStatsType>("type").ok()?
+            != gst_webrtc::WebRTCStatsType::RemoteInboundRtp
+        {
+            return None;
+        }
+        if report
+            .get::<&str>("kind")
+            .ok()
+            .is_some_and(|kind| kind != "video")
+        {
+            return None;
+        }
+        report
+            .get::<f64>("fraction-lost")
+            .ok()
+            .filter(|value| (0.0..=1.0).contains(value))
+    })
 }
 
 fn parse_wire_answer(sdp: &str) -> String {
@@ -727,4 +961,412 @@ fn parse_wire_answer(sdp: &str) -> String {
     let mut text = lines.join("\r\n");
     text.push_str("\r\n");
     text
+}
+
+fn create_capture_source() -> Result<gst::Element> {
+    gst::ElementFactory::make("appsrc")
+        .property("is-live", true)
+        .property_from_str("format", "time")
+        .property("max-bytes", 0u64)
+        .property("max-buffers", 2u64)
+        .property_from_str("leaky-type", "downstream")
+        .property("block", false)
+        .property("do-timestamp", true)
+        .build()
+        .context("creating appsrc element")
+}
+
+fn pump_capture(src: gst_app::AppSrc, rx: std::sync::mpsc::Receiver<CaptureItem>) {
+    use std::sync::mpsc::RecvTimeoutError;
+
+    let mut current_caps = None;
+    let mut last_frame: Option<gst::Buffer> = None;
+    loop {
+        let buffer = match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(item) => {
+                if current_caps.as_ref() != Some(&item.caps) {
+                    src.set_caps(Some(&item.caps));
+                    current_caps = Some(item.caps);
+                }
+                last_frame = Some(item.buffer.clone());
+                item.buffer
+            }
+            Err(RecvTimeoutError::Timeout) => match &last_frame {
+                Some(buffer) => buffer.clone(),
+                None => continue,
+            },
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+        if src.push_buffer(buffer).is_err() {
+            break;
+        }
+    }
+    let _ = src.end_of_stream();
+}
+
+struct CaptureItem {
+    caps: gst::Caps,
+    buffer: gst::Buffer,
+}
+
+/// Stops the capture pipeline and joins its thread on drop.
+struct PortalCapture {
+    rx: Option<std::sync::mpsc::Receiver<CaptureItem>>,
+    stop: Arc<AtomicBool>,
+    error: Arc<std::sync::Mutex<Option<String>>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PortalCapture {
+    fn error(&self) -> Option<String> {
+        self.error.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+impl Drop for PortalCapture {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn start_portal_capture(
+    fd: Arc<OwnedFd>,
+    node: u32,
+    pin: Option<(u32, u32)>,
+) -> Result<PortalCapture> {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<CaptureItem>(2);
+    let stop = Arc::new(AtomicBool::new(false));
+    let error = Arc::new(std::sync::Mutex::new(None));
+    let thread_stop = stop.clone();
+    let thread_error = error.clone();
+    let thread = std::thread::Builder::new()
+        .name("expand-cast-capture".into())
+        .spawn(move || {
+            // Keep the channel open until the error is visible to the sender.
+            let keep_open = tx.clone();
+            if let Err(err) = run_capture_pipeline(fd, node, pin, tx, &thread_stop) {
+                *thread_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!("{err:#}"));
+            }
+            drop(keep_open);
+        })
+        .context("spawning capture thread")?;
+    Ok(PortalCapture {
+        rx: Some(rx),
+        stop,
+        error,
+        thread: Some(thread),
+    })
+}
+
+fn run_capture_pipeline(
+    fd: Arc<OwnedFd>,
+    node: u32,
+    pin: Option<(u32, u32)>,
+    tx: std::sync::mpsc::SyncSender<CaptureItem>,
+    stop: &AtomicBool,
+) -> Result<()> {
+    gst::init().ok();
+    // pipewiresrc borrows this descriptor and duplicates it for its PipeWire core.
+    let capture_fd = fd.try_clone().context("duplicating PipeWire remote fd")?;
+    let pipeline = gst::Pipeline::new();
+    let src = gst::ElementFactory::make("pipewiresrc")
+        .property("fd", capture_fd.as_raw_fd())
+        .property("path", node.to_string())
+        .property("do-timestamp", true)
+        .property("keepalive-time", 0i32)
+        .build()
+        .context("creating capture pipewiresrc")?;
+    let sink_element = gst::ElementFactory::make("appsink")
+        .property("max-buffers", 1u32)
+        .property("drop", true)
+        .property("sync", false)
+        .property("enable-last-sample", false)
+        .build()
+        .context("creating capture appsink")?;
+    let sink = sink_element
+        .clone()
+        .downcast::<gst_app::AppSink>()
+        .map_err(|_| anyhow!("appsink is not an AppSink"))?;
+    pipeline.add(&src).context("adding capture source")?;
+    pipeline
+        .add(&sink_element)
+        .context("adding capture appsink")?;
+    // WirePlumber needs a media type to link the capture stream to a video node.
+    let mut caps = gst::Caps::builder("video/x-raw");
+    if let Some((width, height)) = pin {
+        caps = caps
+            .field("width", (width & !1).max(2) as i32)
+            .field("height", (height & !1).max(2) as i32);
+    }
+    let caps = caps.build();
+    tracing::info!("ExpandCast: requesting capture caps {caps}");
+    let filter = gst::ElementFactory::make("capsfilter")
+        .property("caps", &caps)
+        .build()
+        .context("creating capture capsfilter")?;
+    pipeline.add(&filter).context("adding capture capsfilter")?;
+    src.link(&filter).context("linking capture source")?;
+    filter
+        .link(&sink_element)
+        .context("linking capture capsfilter to appsink")?;
+
+    let tx_callback = tx.clone();
+    sink.set_callbacks(
+        gst_app::AppSinkCallbacks::builder()
+            .new_sample(move |sink| {
+                if let Ok(sample) = sink.pull_sample() {
+                    if let (Some(caps), Some(buffer)) = (sample.caps(), sample.buffer()) {
+                        if let Ok(copy) = buffer.copy_deep() {
+                            let mut copy = copy;
+                            // Timestamps belong to the capture pipeline's clock;
+                            // let appsrc stamp them in the encode pipeline.
+                            let copy_ref = copy.make_mut();
+                            copy_ref.set_pts(gst::ClockTime::NONE);
+                            copy_ref.set_dts(gst::ClockTime::NONE);
+                            let _ = tx_callback.try_send(CaptureItem {
+                                caps: caps.to_owned(),
+                                buffer: copy,
+                            });
+                        }
+                    }
+                }
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build(),
+    );
+
+    let bus = pipeline.bus().context("capture pipeline bus")?;
+    if let Err(error) = pipeline.set_state(gst::State::Playing) {
+        let details = bus
+            .pop_filtered(&[gst::MessageType::Error])
+            .and_then(|message| {
+                if let gst::MessageView::Error(err) = message.view() {
+                    Some(format!(
+                        "{} ({})",
+                        err.error(),
+                        err.debug().unwrap_or_default()
+                    ))
+                } else {
+                    None
+                }
+            });
+        let _ = pipeline.set_state(gst::State::Null);
+        if let Some(details) = details {
+            anyhow::bail!("starting capture pipeline: {details}");
+        }
+        return Err(error).context("starting capture pipeline");
+    }
+    while !stop.load(Ordering::Acquire) {
+        if let Some(message) = bus.timed_pop(gst::ClockTime::from_mseconds(100)) {
+            match message.view() {
+                gst::MessageView::Error(err) => {
+                    let _ = pipeline.set_state(gst::State::Null);
+                    anyhow::bail!(
+                        "capture pipeline error: {} ({})",
+                        err.error(),
+                        err.debug().unwrap_or_default()
+                    );
+                }
+                gst::MessageView::Eos(_) => break,
+                _ => {}
+            }
+        }
+    }
+    let _ = pipeline.set_state(gst::State::Null);
+    Ok(())
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+
+    #[test]
+    fn bitrate_modes_respect_settings_and_override() {
+        let mut config = SenderConfig::default();
+        assert_eq!(
+            bitrate_mode(&config, None).unwrap(),
+            BitrateMode {
+                initial: 6000,
+                adaptive: true
+            }
+        );
+        config.bitrate_kbps = 12_000;
+        assert_eq!(
+            bitrate_mode(&config, None).unwrap(),
+            BitrateMode {
+                initial: 12_000,
+                adaptive: true
+            }
+        );
+        assert_eq!(adjusted_bitrate(12_000, 0.02, 12_000), 12_000);
+        assert_eq!(adjusted_bitrate(12_000, 0.1, 12_000), 9_600);
+        assert_eq!(adjusted_bitrate(6000, 0.0, 6000), 6500);
+        assert_eq!(adjusted_bitrate(1200, 0.1, 6000), 1200);
+        assert_eq!(adjusted_bitrate(500, 0.02, 500), 500);
+        config.adaptive_bitrate = false;
+        assert_eq!(
+            bitrate_mode(&config, None).unwrap(),
+            BitrateMode {
+                initial: 12_000,
+                adaptive: false
+            }
+        );
+        config.adaptive_bitrate = true;
+        assert_eq!(
+            bitrate_mode(&config, Some("7000")).unwrap(),
+            BitrateMode {
+                initial: 7000,
+                adaptive: false
+            }
+        );
+        assert!(bitrate_mode(&config, Some("50001")).is_err());
+        assert!(bitrate_mode(&config, Some("invalid")).is_err());
+    }
+
+    #[test]
+    fn missing_video_caps_fail_instead_of_proceeding() {
+        gst::init().unwrap();
+        let pad = gst::Pad::builder(gst::PadDirection::Sink).build();
+        let bus = gst::Bus::new();
+        let stop = AtomicBool::new(false);
+        let error =
+            wait_for_video_caps(&pad, &bus, None, &stop, Duration::from_millis(1)).unwrap_err();
+        assert!(error.to_string().contains("video caps not negotiated"));
+        stop.store(true, Ordering::Release);
+        assert!(!wait_for_video_caps(&pad, &bus, None, &stop, Duration::from_secs(1)).unwrap());
+    }
+
+    #[test]
+    fn receiver_loss_uses_typed_video_report() {
+        gst::init().unwrap();
+        let audio = gst::Structure::builder("remote-inbound-rtp")
+            .field("type", gst_webrtc::WebRTCStatsType::RemoteInboundRtp)
+            .field("kind", "audio")
+            .field("fraction-lost", 0.75f64)
+            .build();
+        let video = gst::Structure::builder("remote-inbound-rtp")
+            .field("type", gst_webrtc::WebRTCStatsType::RemoteInboundRtp)
+            .field("kind", "video")
+            .field("fraction-lost", 0.125f64)
+            .build();
+        let stats = gst::Structure::builder("application/x-webrtc-stats")
+            .field("audio", &audio)
+            .field("video", &video)
+            .build();
+        assert_eq!(parse_fraction_lost(&stats), Some(0.125));
+        let unrelated = gst::Structure::builder("application/x-webrtc-stats")
+            .field("audio", &audio)
+            .field("fraction-lost", 0.5f64)
+            .build();
+        assert_eq!(parse_fraction_lost(&unrelated), None);
+    }
+
+    #[test]
+    fn capture_source_bounds_pending_frames() {
+        gst::init().unwrap();
+        let src = create_capture_source()
+            .unwrap()
+            .downcast::<gst_app::AppSrc>()
+            .unwrap();
+        for _ in 0..100 {
+            src.push_buffer(gst::Buffer::with_size(1024).unwrap())
+                .unwrap();
+        }
+        assert_eq!(src.property::<u64>("current-level-buffers"), 2);
+    }
+
+    #[test]
+    fn capture_pump_repeats_idle_frame_with_new_timestamp() {
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        let src = create_capture_source().unwrap();
+        let sink = gst::ElementFactory::make("appsink")
+            .property("sync", false)
+            .build()
+            .unwrap();
+        pipeline.add_many([&src, &sink]).unwrap();
+        src.link(&sink).unwrap();
+        let src = src.downcast::<gst_app::AppSrc>().unwrap();
+        let sink = sink.downcast::<gst_app::AppSink>().unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        let thread = std::thread::spawn(move || pump_capture(src, rx));
+        let caps = gst::Caps::builder("video/x-raw")
+            .field("format", "GRAY8")
+            .field("width", 2i32)
+            .field("height", 2i32)
+            .field("framerate", gst::Fraction::new(30, 1))
+            .build();
+        tx.send(CaptureItem {
+            caps,
+            buffer: gst::Buffer::from_slice([1u8, 2, 3, 4]),
+        })
+        .unwrap();
+        let first = sink
+            .try_pull_sample(gst::ClockTime::from_seconds(5))
+            .unwrap();
+        let second = sink
+            .try_pull_sample(gst::ClockTime::from_seconds(5))
+            .unwrap();
+        let first = first.buffer().unwrap();
+        let second = second.buffer().unwrap();
+        assert_eq!(
+            first.map_readable().unwrap().as_slice(),
+            second.map_readable().unwrap().as_slice()
+        );
+        assert!(second.pts().unwrap() > first.pts().unwrap());
+        drop(tx);
+        thread.join().unwrap();
+        pipeline.set_state(gst::State::Null).unwrap();
+    }
+
+    #[test]
+    fn capture_pump_forwards_changed_caps_with_frames() {
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        let src = create_capture_source().unwrap();
+        let sink = gst::ElementFactory::make("appsink")
+            .property("sync", false)
+            .build()
+            .unwrap();
+        pipeline.add_many([&src, &sink]).unwrap();
+        src.link(&sink).unwrap();
+        let src = src.downcast::<gst_app::AppSrc>().unwrap();
+        let sink = sink.downcast::<gst_app::AppSink>().unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        let thread = std::thread::spawn(move || pump_capture(src, rx));
+        for width in [2, 4] {
+            let caps = gst::Caps::builder("video/x-raw")
+                .field("format", "GRAY8")
+                .field("width", width)
+                .field("height", 2i32)
+                .field("framerate", gst::Fraction::new(30, 1))
+                .build();
+            tx.send(CaptureItem {
+                caps,
+                buffer: gst::Buffer::with_size((width * 2) as usize).unwrap(),
+            })
+            .unwrap();
+            let sample = sink
+                .try_pull_sample(gst::ClockTime::from_seconds(3))
+                .expect("capture frame");
+            assert_eq!(
+                sample
+                    .caps()
+                    .unwrap()
+                    .structure(0)
+                    .unwrap()
+                    .get::<i32>("width")
+                    .unwrap(),
+                width
+            );
+        }
+        drop(tx);
+        thread.join().unwrap();
+        pipeline.set_state(gst::State::Null).unwrap();
+    }
 }

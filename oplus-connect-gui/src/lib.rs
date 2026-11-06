@@ -5,9 +5,9 @@ pub mod cast_input;
 pub mod cast_media;
 pub mod cast_session;
 pub mod cast_settings;
+pub mod client;
 pub mod expand_cast_media;
 pub mod expand_cast_session;
-pub mod client;
 pub mod icons;
 pub mod kms_capture;
 pub mod kms_input;
@@ -90,6 +90,9 @@ pub struct RootView {
         >,
     >,
     _kms_direction_events: Option<Subscription>,
+    expand_cast_fps_input: Option<Entity<gpui_kit::component::input::InputState>>,
+    expand_cast_bitrate_input: Option<Entity<gpui_kit::component::input::InputState>>,
+    _expand_cast_input_events: Vec<Subscription>,
 }
 
 // Poll faster until /status proves the daemon is serving.
@@ -99,6 +102,59 @@ const STEADY_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const STARTUP_MAX_ATTEMPTS: u8 = 25;
 
 impl RootView {
+    fn save_expand_cast_settings(
+        &mut self,
+        settings: persisted::ExpandCastSettings,
+        cx: &mut Context<Self>,
+    ) {
+        if settings == self.state.expand_cast_settings {
+            self.state.expand_cast_settings_feedback = None;
+        } else {
+            match persisted::save_expand_cast_settings(settings) {
+                Ok(()) => {
+                    self.state.expand_cast_settings = settings;
+                    self.state.expand_cast_settings_feedback = None;
+                }
+                Err(error) => {
+                    self.state.expand_cast_settings_feedback =
+                        Some(format!("保存失败，设置未应用：{error}"));
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn update_expand_cast_number(&mut self, value: &str, fps: bool, cx: &mut Context<Self>) {
+        let (min, max, label) = if fps {
+            (persisted::FPS_MIN, persisted::FPS_MAX, "帧率")
+        } else {
+            (persisted::BITRATE_MIN, persisted::BITRATE_MAX, "码率")
+        };
+        let Some(value) = value
+            .parse::<u32>()
+            .ok()
+            .filter(|value| (min..=max).contains(value))
+        else {
+            self.state.expand_cast_settings_feedback =
+                Some(format!("{label}必须为 {min}–{max} 的整数，未保存"));
+            cx.notify();
+            return;
+        };
+        let mut settings = self.state.expand_cast_settings;
+        if fps {
+            settings.fps = value;
+        } else {
+            settings.bitrate_kbps = value;
+        }
+        self.save_expand_cast_settings(settings, cx);
+    }
+
+    fn update_expand_cast_adaptive(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let mut settings = self.state.expand_cast_settings;
+        settings.adaptive_bitrate = enabled;
+        self.save_expand_cast_settings(settings, cx);
+    }
+
     pub fn new(cx: &mut Context<Self>) -> Self {
         let (tx, mut rx) = mpsc::channel::<AppEvent>(64);
 
@@ -126,6 +182,7 @@ impl RootView {
         state.cast_audio = cast_audio;
         state.cast_input = cast_input;
         state.cast_h265 = cast_h265;
+        state.expand_cast_settings = persisted::load_expand_cast_settings();
         cast_settings::set_audio(cast_audio);
         cast_settings::set_input(cast_input);
         cast_settings::set_h265(cast_h265);
@@ -146,6 +203,9 @@ impl RootView {
             _codec_events: None,
             kms_direction_select: None,
             _kms_direction_events: None,
+            expand_cast_fps_input: None,
+            expand_cast_bitrate_input: None,
+            _expand_cast_input_events: Vec::new(),
         };
         // The cast window carries the app's own close button, so closing it
         // must end the cast instead of leaving a session with no picture.
@@ -294,7 +354,11 @@ impl RootView {
             height: 1344,
         };
         let (tx, mut rx) = mpsc::channel(16);
-        self.expand_cast_session = Some(expand_cast_session::start(device_id, tx));
+        self.expand_cast_session = Some(expand_cast_session::start(
+            device_id,
+            tx,
+            self.state.expand_cast_settings,
+        ));
         cx.spawn(async move |this, app| {
             while let Some(event) = rx.recv().await {
                 if this
@@ -1026,12 +1090,42 @@ impl Render for RootView {
             ));
             self.kms_direction_select = Some(state);
         }
+        if self.expand_cast_fps_input.is_none() {
+            let value = self.state.expand_cast_settings.fps.to_string();
+            let input = cx.new(|cx| {
+                gpui_kit::component::input::InputState::new(window, cx).default_value(value)
+            });
+            self._expand_cast_input_events
+                .push(cx.subscribe(&input, |view, state, event, cx| {
+                    if matches!(event, gpui_kit::component::input::InputEvent::Change) {
+                        let value = state.read(cx).value().to_string();
+                        view.update_expand_cast_number(&value, true, cx);
+                    }
+                }));
+            self.expand_cast_fps_input = Some(input);
+        }
+        if self.expand_cast_bitrate_input.is_none() {
+            let value = self.state.expand_cast_settings.bitrate_kbps.to_string();
+            let input = cx.new(|cx| {
+                gpui_kit::component::input::InputState::new(window, cx).default_value(value)
+            });
+            self._expand_cast_input_events
+                .push(cx.subscribe(&input, |view, state, event, cx| {
+                    if matches!(event, gpui_kit::component::input::InputEvent::Change) {
+                        let value = state.read(cx).value().to_string();
+                        view.update_expand_cast_number(&value, false, cx);
+                    }
+                }));
+            self.expand_cast_bitrate_input = Some(input);
+        }
         views::MainContainer::render(
             &self.state,
             &self.kms,
             &self.expand_cast,
             self.codec_select.as_ref(),
             self.kms_direction_select.as_ref(),
+            self.expand_cast_fps_input.as_ref(),
+            self.expand_cast_bitrate_input.as_ref(),
             window,
             cx,
         )

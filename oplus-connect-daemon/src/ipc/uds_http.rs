@@ -695,7 +695,8 @@ async fn handle_client(
                     request
                 }
                 _ => {
-                    let response = ApiResponse::error(400, "Malformed expand_cast signaling request");
+                    let response =
+                        ApiResponse::error(400, "Malformed expand_cast signaling request");
                     return write_response(&mut stream, 400, &serde_json::to_string(&response)?)
                         .await;
                 }

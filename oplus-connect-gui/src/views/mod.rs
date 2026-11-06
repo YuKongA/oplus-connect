@@ -34,6 +34,8 @@ impl MainContainer {
                 >,
             >,
         >,
+        expand_cast_fps: Option<&Entity<gpui_kit::component::input::InputState>>,
+        expand_cast_bitrate: Option<&Entity<gpui_kit::component::input::InputState>>,
         window: &mut Window,
         cx: &mut Context<crate::RootView>,
     ) -> impl IntoElement {
@@ -48,10 +50,16 @@ impl MainContainer {
                 device_detail_view::DeviceDetailView::render(state, kms, expand_cast, window, cx)
                     .into_any_element()
             }
-            NavTab::Settings => {
-                settings_view::SettingsView::render(state, codec, kms_direction, window, cx)
-                    .into_any_element()
-            }
+            NavTab::Settings => settings_view::SettingsView::render(
+                state,
+                codec,
+                kms_direction,
+                expand_cast_fps,
+                expand_cast_bitrate,
+                window,
+                cx,
+            )
+            .into_any_element(),
         };
 
         div()

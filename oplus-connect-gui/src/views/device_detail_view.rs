@@ -69,7 +69,14 @@ impl DeviceDetailView {
     ) -> impl IntoElement {
         let mut list = div().flex().flex_col().gap(px(16.0));
         for (index, device) in state.known_devices.iter().enumerate() {
-            list = list.child(Self::render_device_card(device, state, kms, expand_cast, cx, index));
+            list = list.child(Self::render_device_card(
+                device,
+                state,
+                kms,
+                expand_cast,
+                cx,
+                index,
+            ));
         }
         list
     }
@@ -218,13 +225,17 @@ impl DeviceDetailView {
                         _ => "共享启动中",
                     }
                 } else {
-                    "开始键鼠共享"
+                    "键鼠共享"
                 };
                 let kms_id = device_id.clone();
                 actions = actions.child(
                     Button::new(("btn-kms", index))
                         .primary()
-                        .disabled((kms.active() && !sharing) || kms.phase == KmsPhase::Stopping || expand_cast.active())
+                        .disabled(
+                            (kms.active() && !sharing)
+                                || kms.phase == KmsPhase::Stopping
+                                || expand_cast.active(),
+                        )
                         .label(label)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if this.kms.active() {
@@ -239,17 +250,21 @@ impl DeviceDetailView {
                 let ext_label = if ext_active {
                     match expand_cast.phase {
                         ExpandCastPhase::Stopping => "停止中…",
-                        ExpandCastPhase::Streaming => "停止共享屏幕",
+                        ExpandCastPhase::Streaming => "停止屏幕共享",
                         _ => "共享启动中",
                     }
                 } else {
-                    "共享屏幕"
+                    "屏幕共享"
                 };
                 let ext_id = device_id.clone();
                 actions = actions.child(
                     Button::new(("btn-expand-cast", index))
                         .primary()
-                        .disabled((expand_cast.active() && !ext_active) || expand_cast.phase == ExpandCastPhase::Stopping || kms.active())
+                        .disabled(
+                            (expand_cast.active() && !ext_active)
+                                || expand_cast.phase == ExpandCastPhase::Stopping
+                                || kms.active(),
+                        )
                         .label(ext_label)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if this.expand_cast.active() {

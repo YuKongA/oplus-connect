@@ -1,6 +1,6 @@
 use crate::cast::control::CastRegistry;
-use crate::kms::control::KmsRegistry;
 use crate::expand_cast::control::ExpandCastRegistry;
+use crate::kms::control::KmsRegistry;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{

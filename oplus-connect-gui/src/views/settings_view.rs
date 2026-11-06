@@ -2,6 +2,7 @@ use crate::state::AppState;
 use crate::theme::Theme;
 use crate::RootView;
 use gpui_kit::component::group_box::{GroupBox, GroupBoxVariants};
+use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::select::Select;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::*;
@@ -25,6 +26,8 @@ impl SettingsView {
                 >,
             >,
         >,
+        expand_cast_fps: Option<&Entity<InputState>>,
+        expand_cast_bitrate: Option<&Entity<InputState>>,
         _window: &mut Window,
         cx: &mut Context<RootView>,
     ) -> impl IntoElement {
@@ -118,6 +121,41 @@ impl SettingsView {
             )
             .child(
                 GroupBox::new()
+                    .id("settings-expand-cast")
+                    .outline()
+                    .title("平板屏幕共享")
+                    .child(Self::control_row(
+                        "帧率（FPS）",
+                        "输入 1–144 的整数",
+                        div().w(px(160.0)).children(expand_cast_fps.map(Input::new)),
+                    ))
+                    .child(Self::control_row(
+                        "初始码率（kbps）",
+                        "输入 500–50000 的整数",
+                        div()
+                            .w(px(160.0))
+                            .children(expand_cast_bitrate.map(Input::new)),
+                    ))
+                    .child(Self::switch_row(
+                        "动态码率",
+                        "开启后码率会随共享状况变化",
+                        Switch::new("toggle-expand-cast-adaptive")
+                            .checked(state.expand_cast_settings.adaptive_bitrate)
+                            .accessibility_label("动态码率")
+                            .on_change(cx.listener(|this, next, _, cx| {
+                                this.update_expand_cast_adaptive(*next, cx);
+                            })),
+                    ))
+                    .children(state.expand_cast_settings_feedback.as_ref().map(|message| {
+                        div()
+                            .w_full()
+                            .text_xs()
+                            .text_color(Theme::text_secondary())
+                            .child(message.clone())
+                    })),
+            )
+            .child(
+                GroupBox::new()
                     .id("settings-kms")
                     .outline()
                     .title("平板键鼠共享")
@@ -162,12 +200,9 @@ impl SettingsView {
                                             .child(crate::APP_VERSION),
                                     ),
                             )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(Theme::text_secondary())
-                                    .child("ColorOS 设备互联客户端，支持剪贴板、通知、投屏与键鼠共享。"),
-                            )
+                            .child(div().text_xs().text_color(Theme::text_secondary()).child(
+                                "ColorOS 设备互联客户端，支持剪贴板、通知、投屏与键鼠共享。",
+                            ))
                             .child(
                                 div()
                                     .text_xs()

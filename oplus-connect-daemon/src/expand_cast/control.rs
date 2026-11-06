@@ -335,10 +335,7 @@ impl Controller {
         if let Some(mut server) = self.odmf_server.take() {
             server.shutdown().await;
         }
-        let close_msg = expand_cast_dbs_json(
-            "close_extend_window",
-            json!({}),
-        );
+        let close_msg = expand_cast_dbs_json("close_extend_window", json!({}));
         Ok(close_msg)
     }
 
@@ -384,14 +381,33 @@ impl Controller {
         }
     }
 
-    pub async fn send_signal(&self, connection_id: u64, payload: serde_json::Value) -> Result<(), String> {
-        let server = self.odmf_server.as_ref().ok_or_else(|| "ExpandCast server is not running".to_string())?;
-        server.send(connection_id, payload).await.map_err(|e| e.to_string())
+    pub async fn send_signal(
+        &self,
+        connection_id: u64,
+        payload: serde_json::Value,
+    ) -> Result<(), String> {
+        let server = self
+            .odmf_server
+            .as_ref()
+            .ok_or_else(|| "ExpandCast server is not running".to_string())?;
+        server
+            .send(connection_id, payload)
+            .await
+            .map_err(|e| e.to_string())
     }
 
-    pub fn receive_signal(&self, connection_id: u64, max: usize) -> Result<Vec<IncomingMessage>, String> {
-        let server = self.odmf_server.as_ref().ok_or_else(|| "ExpandCast server is not running".to_string())?;
-        server.receive_batch(connection_id, max).map_err(|e| e.to_string())
+    pub fn receive_signal(
+        &self,
+        connection_id: u64,
+        max: usize,
+    ) -> Result<Vec<IncomingMessage>, String> {
+        let server = self
+            .odmf_server
+            .as_ref()
+            .ok_or_else(|| "ExpandCast server is not running".to_string())?;
+        server
+            .receive_batch(connection_id, max)
+            .map_err(|e| e.to_string())
     }
 }
 pub fn expand_cast_dbs_json(msg_cmd: &str, body: serde_json::Value) -> String {
@@ -425,9 +441,7 @@ mod tests {
             .register_bus("TEST_PAD", ip, ip, "OPPO Pad", "Linux-PC", "ABCDEF")
             .unwrap();
 
-        let start_task = tokio::spawn(async move {
-            controller.start().await
-        });
+        let start_task = tokio::spawn(async move { controller.start().await });
 
         let pub_res = start_task.await.unwrap().unwrap();
         assert_eq!(pub_res.info.status, "waiting_for_tablet");

@@ -1,4 +1,6 @@
-use crate::state::{CastIncoming, CastStatus, DaemonStatus, DeviceInfo, ExpandCastStatus, RemoteDevicePayload};
+use crate::state::{
+    CastIncoming, CastStatus, DaemonStatus, DeviceInfo, ExpandCastStatus, RemoteDevicePayload,
+};
 use anyhow::{anyhow, Context, Result};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;

@@ -1,7 +1,9 @@
 //! Lifecycle management for tablet secondary display session.
 use crate::client::DaemonClient;
 use crate::expand_cast_media::{self, SenderConfig, SignalingMessage};
+use crate::persisted::ExpandCastSettings;
 use anyhow::{anyhow, Context, Result};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -68,6 +70,27 @@ impl Drop for ExpandCastSessionHandle {
 static ACTIVE_SESSION: Mutex<Option<(watch::Sender<bool>, watch::Receiver<bool>)>> =
     Mutex::new(None);
 
+fn clear_current_session(
+    active: &Mutex<Option<(watch::Sender<bool>, watch::Receiver<bool>)>>,
+    identity: &watch::Sender<bool>,
+) {
+    let mut guard = active.lock().unwrap_or_else(|e| e.into_inner());
+    if guard
+        .as_ref()
+        .is_some_and(|(cancel, _)| cancel.same_channel(identity))
+    {
+        *guard = None;
+    }
+}
+
+async fn wait_for_session(mut done: watch::Receiver<bool>) {
+    while !*done.borrow_and_update() {
+        if done.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
 pub async fn shutdown() {
     let handle = {
         let mut guard = ACTIVE_SESSION.lock().unwrap_or_else(|e| e.into_inner());
@@ -86,25 +109,37 @@ pub async fn shutdown() {
     }
 }
 
-pub fn start(device_id: String, events: mpsc::Sender<ExpandCastEvent>) -> ExpandCastSessionHandle {
+pub fn start(
+    device_id: String,
+    events: mpsc::Sender<ExpandCastEvent>,
+    settings: ExpandCastSettings,
+) -> ExpandCastSessionHandle {
     let (cancel_tx, cancel_rx) = watch::channel(false);
     let (done_tx, done_rx) = watch::channel(false);
     let stopped = Arc::new(AtomicBool::new(false));
 
-    {
-        let mut guard = ACTIVE_SESSION.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((prev_cancel, _)) = guard.take() {
-            let _ = prev_cancel.send(true);
-        }
-        *guard = Some((cancel_tx.clone(), done_rx.clone()));
+    let previous = ACTIVE_SESSION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .replace((cancel_tx.clone(), done_rx.clone()));
+    if let Some((cancel, _)) = &previous {
+        let _ = cancel.send(true);
     }
 
     let dev_id = device_id.clone();
     let events_clone = events.clone();
     let cancel_worker = cancel_rx.clone();
+    let worker_identity = cancel_tx.clone();
 
     crate::TOKIO_RT.spawn(async move {
-        let res = run_session(&dev_id, &events_clone, cancel_worker).await;
+        if let Some((_, done)) = previous {
+            wait_for_session(done).await;
+        }
+        let res = if *cancel_worker.borrow() {
+            Ok(())
+        } else {
+            run_session(&dev_id, &events_clone, cancel_worker, settings).await
+        };
         if let Err(err) = res {
             tracing::error!("ExpandCast session failed: {err:#}");
             let _ = events_clone.try_send(ExpandCastEvent::Error(format!("{err:#}")));
@@ -112,8 +147,7 @@ pub fn start(device_id: String, events: mpsc::Sender<ExpandCastEvent>) -> Expand
             let _ = events_clone.try_send(ExpandCastEvent::Closed);
         }
         let _ = done_tx.send(true);
-        let mut guard = ACTIVE_SESSION.lock().unwrap_or_else(|e| e.into_inner());
-        *guard = None;
+        clear_current_session(&ACTIVE_SESSION, &worker_identity);
     });
 
     ExpandCastSessionHandle {
@@ -127,11 +161,11 @@ async fn run_session(
     device_id: &str,
     events: &mpsc::Sender<ExpandCastEvent>,
     mut cancel: watch::Receiver<bool>,
+    settings: ExpandCastSettings,
 ) -> Result<()> {
     let client = DaemonClient::new();
     let _ = events.try_send(ExpandCastEvent::Phase(ExpandCastPhase::Preparing));
 
-    // 1. Tell daemon to initiate ExpandCast
     let _start_status = client
         .expand_cast_start(device_id)
         .await
@@ -139,7 +173,6 @@ async fn run_session(
 
     let _ = events.try_send(ExpandCastEvent::Phase(ExpandCastPhase::WaitingForTablet));
 
-    // 2. Poll status until tablet connects and reports dimensions
     let mut poll_interval = tokio::time::interval(Duration::from_millis(250));
     let mut connection_id = None;
     let mut tablet_width = 2016;
@@ -196,9 +229,8 @@ async fn run_session(
     let _ = events.try_send(ExpandCastEvent::Resolution(tablet_width, tablet_height));
     let _ = events.try_send(ExpandCastEvent::Phase(ExpandCastPhase::Streaming));
 
-    // 3. Acquire the portal screencast session (KDE prompts for approval).
-    let screencast = match tokio::time::timeout(Duration::from_secs(30), try_acquire_screencast()).await {
-        Ok(Ok(session)) => {
+    let mut screencast = match try_acquire_screencast(&mut cancel).await {
+        Ok(Some(session)) => {
             tracing::info!(
                 "Acquired portal screencast: node={} fd={}",
                 session.node(),
@@ -206,51 +238,50 @@ async fn run_session(
             );
             Some(session)
         }
-        Ok(Err(err)) => {
-            tracing::warn!("Could not acquire portal screencast: {err:#}");
-            None
+        Ok(None) => {
+            let _ = client.expand_cast_stop(device_id).await;
+            return Ok(());
         }
-        Err(_) => {
-            tracing::warn!("Portal screencast prompt timed out");
+        Err(err) => {
+            tracing::warn!("Could not acquire portal screencast: {err:#}");
             None
         }
     };
     // The guard keeps the compositor-side session (and thus the PipeWire node)
     // alive for as long as this function streams.
     let (pipewire_fd, pipewire_node) = match &screencast {
-        Some(session) => (Some(session.fd()), Some(session.node())),
+        Some(session) => (Some(Arc::clone(&session.fd)), Some(session.node())),
         None => (None, None),
     };
 
-    // Keep the stream at the capture's native pixel count: upscaling to the panel
-    // costs GPU time and adds encoder latency for no extra detail. The output
-    // takes the panel's aspect ratio, so the 16:9 desktop is letterboxed inside
-    // it - the compositor chooses the virtual output size, not us.
+    // Avoid upscaling when the compositor cannot resize the virtual output.
     let (render_width, render_height, out_width, out_height) =
         match screencast.as_ref().and_then(|s| s.size()) {
             Some((src_w, src_h)) if src_w > 0 && src_h > 0 => {
                 let render_w = src_w & !1;
                 let render_h = src_h & !1;
-                let out_h = ((render_w as u64 * tablet_height as u64 / tablet_width as u64) as u32) & !1;
+                let out_h =
+                    ((render_w as u64 * tablet_height as u64 / tablet_width as u64) as u32) & !1;
                 (render_w, render_h, render_w, out_h.max(2))
             }
             _ => (tablet_width, tablet_height, tablet_width, tablet_height),
         };
-    tracing::info!(
-        "ExpandCast: encoding {out_width}x{out_height} from {render_width}x{render_height} content"
-    );
 
-    // Only a compositor-created virtual output can be asked for a different size;
-    // a mirrored monitor is fixed to its own resolution. The request is opt-in
-    // (see `OPLUS_EXPAND_CAST_PIN_CAPTURE`) because current KWin rejects it.
+    // Only virtual outputs can be resized through stream negotiation.
     let (capture_width, capture_height) = match screencast.as_ref() {
         Some(session) if session.is_virtual() => (Some(tablet_width), Some(tablet_height)),
         _ => (None, None),
     };
+    match (capture_width, capture_height) {
+        (Some(w), Some(h)) => tracing::info!(
+            "ExpandCast: requesting a {w}x{h} virtual output (letterboxed fallback would be \
+             {out_width}x{out_height} from {render_width}x{render_height})"
+        ),
+        _ => tracing::info!(
+            "ExpandCast: encoding {out_width}x{out_height} from {render_width}x{render_height} content"
+        ),
+    }
 
-    // 4. Start GStreamer WebRTC sender. The tablet advertises a 30 fps cap and a
-    // 2500-6500 kbps video band, so encode inside that envelope instead of
-    // overshooting and letting Wi-Fi queue frames.
     let sender_config = SenderConfig {
         width: out_width,
         height: out_height,
@@ -258,14 +289,23 @@ async fn run_session(
         render_height,
         capture_width,
         capture_height,
-        fps: 30,
-        bitrate_kbps: 6000,
+        fps: settings.fps,
+        bitrate_kbps: settings.bitrate_kbps,
+        adaptive_bitrate: settings.adaptive_bitrate,
         pipewire_fd,
         pipewire_node,
     };
 
-    let mut media = expand_cast_media::spawn_sender(sender_config)
-        .context("启动屏幕共享推流管道失败")?;
+    let mut media = match expand_cast_media::spawn_sender(sender_config) {
+        Ok(media) => media,
+        Err(error) => {
+            let _ = client.expand_cast_stop(device_id).await;
+            if let Some(session) = &mut screencast {
+                session.session.close().await;
+            }
+            return Err(error).context("启动屏幕共享推流管道失败");
+        }
+    };
 
     // Send SUB_MODE and DISPLAY_RESOLUTION to tablet
     let sub_mode_cmd = serde_json::json!({
@@ -275,7 +315,9 @@ async fn run_session(
             "subMode": 1
         }
     });
-    let _ = client.expand_cast_send(device_id, conn_id, &sub_mode_cmd).await;
+    let _ = client
+        .expand_cast_send(device_id, conn_id, &sub_mode_cmd)
+        .await;
 
     let res_cmd = serde_json::json!({
         "cmd": "customBroadcast",
@@ -287,13 +329,23 @@ async fn run_session(
         }
     });
     let _ = client.expand_cast_send(device_id, conn_id, &res_cmd).await;
-    // 5. Signaling loop
     let mut poll_receive = tokio::time::interval(Duration::from_millis(100));
     let mut poll_status = tokio::time::interval(Duration::from_millis(1000));
+    let mut result = Ok(());
+    let mut sender_finished = false;
 
     while !*cancel.borrow() {
         tokio::select! {
             _ = cancel.changed() => break,
+            finished = &mut media.finished => {
+                sender_finished = true;
+                result = match finished {
+                    Ok(Ok(())) => Err(anyhow!("屏幕共享推流已停止")),
+                    Ok(Err(error)) => Err(anyhow!("屏幕共享推流失败: {error}")),
+                    Err(_) => Err(anyhow!("屏幕共享推流线程异常退出")),
+                };
+                break;
+            }
             Some(msg) = media.outgoing.recv() => {
                 match msg {
                     SignalingMessage::Sdp { sdp, .. } => {
@@ -342,7 +394,13 @@ async fn run_session(
                 }
             }
             _ = poll_status.tick() => {
-                let status = client.expand_cast_status(device_id).await?;
+                let status = match client.expand_cast_status(device_id).await {
+                    Ok(status) => status,
+                    Err(error) => {
+                        result = Err(error.into());
+                        break;
+                    }
+                };
                 if status.connection_id != Some(conn_id) || status.status != "connected" {
                     tracing::info!("ExpandCast connection disconnected by peer");
                     break;
@@ -351,27 +409,62 @@ async fn run_session(
         }
     }
 
-    // 6. Cleanup
     let _ = events.try_send(ExpandCastEvent::Phase(ExpandCastPhase::Stopping));
     media.stop.store(true, Ordering::Release);
     let _ = client.expand_cast_stop(device_id).await;
-    Ok(())
+    if !sender_finished {
+        if tokio::time::timeout(Duration::from_secs(5), &mut media.finished)
+            .await
+            .is_err()
+        {
+            tracing::warn!("ExpandCast sender did not stop within 5 seconds");
+        }
+    }
+    if let Some(session) = &mut screencast {
+        session.session.close().await;
+    }
+    result
 }
 
-/// Portal-granted desktop capture. Dropping the portal proxies ends the
-/// screencast session in the compositor, so the guard must outlive the pipeline.
+/// Portal-granted capture and its explicitly closed portal session.
 pub struct ScreencastSession {
-    fd: i32,
+    fd: Arc<OwnedFd>,
     node: u32,
     size: Option<(u32, u32)>,
     virtual_output: bool,
     _screencast: ashpd::desktop::screencast::Screencast,
-    _session: ashpd::desktop::Session<ashpd::desktop::screencast::Screencast>,
+    session: PortalSession,
+}
+
+struct PortalSession(Option<ashpd::desktop::Session<ashpd::desktop::screencast::Screencast>>);
+
+impl PortalSession {
+    async fn close(&mut self) {
+        if let Some(session) = self.0.as_ref() {
+            let result = session.close().await;
+            self.0.take();
+            if let Err(error) = result {
+                tracing::warn!("Failed to close screencast portal session: {error}");
+            }
+        }
+    }
+}
+
+impl Drop for PortalSession {
+    fn drop(&mut self) {
+        if let Some(session) = self.0.take() {
+            crate::TOKIO_RT.spawn(async move {
+                if let Err(error) = session.close().await {
+                    tracing::warn!("Failed to close screencast portal session: {error}");
+                }
+            });
+        }
+    }
 }
 
 impl ScreencastSession {
     fn fd(&self) -> i32 {
-        self.fd
+        self.fd.as_raw_fd()
     }
 
     fn node(&self) -> u32 {
@@ -383,83 +476,116 @@ impl ScreencastSession {
         self.size
     }
 
-    /// True when the user picked a compositor-created virtual output. Only such
-    /// a source can be asked to take the tablet's size, and current KWin rejects
-    /// that request, so treat it as a hint rather than a guarantee.
+    /// Whether the selected source is a virtual output.
     fn is_virtual(&self) -> bool {
         self.virtual_output
     }
 }
 
-async fn try_acquire_screencast() -> Result<ScreencastSession> {
+async fn try_acquire_screencast(
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<Option<ScreencastSession>> {
     use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};
     use ashpd::enumflags2::BitFlags;
-    use std::os::fd::AsRawFd;
 
-    let screencast = Screencast::new().await.context("connecting to screencast portal")?;
-    let session = screencast
-        .create_session(Default::default())
-        .await
-        .context("creating screencast session")?;
-
-    // The KDE dialog already offers both mirroring a monitor and creating a
-    // virtual output for this request; the app just accepts whichever is chosen.
-    screencast
-        .select_sources(
-            &session,
-            SelectSourcesOptions::default()
-                .set_cursor_mode(CursorMode::Embedded)
-                .set_sources(BitFlags::from_flag(SourceType::Monitor))
-                .set_multiple(false),
-        )
-        .await
-        .context("selecting screencast sources")?;
-
-    let response = screencast
-        .start(&session, None, Default::default())
-        .await
-        .context("starting screencast session")?
-        .response()
-        .context("getting screencast response")?;
-
-    let stream = response
-        .streams()
-        .first()
-        .context("no screencast streams in portal response")?;
-    let node_id = stream.pipe_wire_node_id();
-    let virtual_output = matches!(
-        stream.source_type(),
-        Some(ashpd::desktop::screencast::SourceType::Virtual)
-    );
-    let size = stream
-        .size()
-        .and_then(|(w, h)| u32::try_from(w).ok().zip(u32::try_from(h).ok()))
-        .filter(|(w, h)| *w > 0 && *h > 0);
-    tracing::info!(
-        "portal screencast stream: node={node_id} size={size:?} source_type={:?}",
-        stream.source_type()
-    );
-    let remote_fd = screencast
-        .open_pipe_wire_remote(&session, Default::default())
-        .await
-        .context("opening pipewire remote fd")?;
-
-    let raw_fd = remote_fd.as_raw_fd();
-    // `pipewiresrc` hands this fd to pipewire, which takes ownership of it and
-    // closes it on disconnect; leaking our handle avoids a double close.
-    std::mem::forget(remote_fd);
-    Ok(ScreencastSession {
-        fd: raw_fd,
-        node: node_id,
-        size,
-        virtual_output,
-        _screencast: screencast,
-        _session: session,
-    })
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let created = tokio::select! {
+        _ = cancel.changed() => return Ok(None),
+        result = tokio::time::timeout_at(deadline, async {
+            let screencast = Screencast::new().await.context("connecting to screencast portal")?;
+            tracing::info!("portal ScreenCast API version: {}", screencast.version());
+            let session = screencast
+                .create_session(Default::default())
+                .await
+                .context("creating screencast session")?;
+            Ok::<_, anyhow::Error>((screencast, session))
+        }) => result.context("portal screencast prompt timed out")??,
+    };
+    let (screencast, session) = created;
+    let mut session = PortalSession(Some(session));
+    let portal_session = session.0.as_ref().expect("portal session exists");
+    let selected = tokio::select! {
+        _ = cancel.changed() => Ok(None),
+        result = tokio::time::timeout_at(deadline, async {
+            screencast
+                .select_sources(
+                    portal_session,
+                    SelectSourcesOptions::default()
+                        .set_cursor_mode(CursorMode::Embedded)
+                        .set_sources(BitFlags::from_flag(SourceType::Monitor))
+                        .set_multiple(false),
+                )
+                .await
+                .context("selecting screencast sources")?;
+            let response = screencast
+                .start(portal_session, None, Default::default())
+                .await
+                .context("starting screencast session")?
+                .response()
+                .context("getting screencast response")?;
+            let stream = response
+                .streams()
+                .first()
+                .context("no screencast streams in portal response")?;
+            let node = stream.pipe_wire_node_id();
+            let virtual_output = matches!(stream.source_type(), Some(SourceType::Virtual));
+            let size = stream
+                .size()
+                .and_then(|(w, h)| u32::try_from(w).ok().zip(u32::try_from(h).ok()))
+                .filter(|(w, h)| *w > 0 && *h > 0);
+            tracing::info!(
+                "portal screencast stream: node={node} size={size:?} source_type={:?}",
+                stream.source_type()
+            );
+            let fd = screencast
+                .open_pipe_wire_remote(portal_session, Default::default())
+                .await
+                .context("opening pipewire remote fd")?;
+            Ok::<_, anyhow::Error>((fd, node, size, virtual_output))
+        }) => result.context("portal screencast prompt timed out").and_then(|result| result).map(Some),
+    };
+    match selected {
+        Ok(Some((fd, node, size, virtual_output))) => Ok(Some(ScreencastSession {
+            fd: Arc::new(fd),
+            node,
+            size,
+            virtual_output,
+            _screencast: screencast,
+            session,
+        })),
+        other => {
+            session.close().await;
+            other.map(|_| None)
+        }
+    }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn previous_completion_cannot_clear_replacement() {
+        let (old_cancel, _) = watch::channel(false);
+        let (new_cancel, _) = watch::channel(false);
+        let (done_tx, done_rx) = watch::channel(false);
+        let active = Mutex::new(Some((new_cancel.clone(), done_rx.clone())));
+
+        clear_current_session(&active, &old_cancel);
+        assert!(active
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .0
+            .same_channel(&new_cancel));
+
+        let waiter = tokio::spawn(wait_for_session(done_rx));
+        assert!(!waiter.is_finished());
+        done_tx.send(true).unwrap();
+        waiter.await.unwrap();
+        clear_current_session(&active, &new_cancel);
+        assert!(active.lock().unwrap().is_none());
+    }
 
     #[test]
     fn expand_cast_view_state_transitions_correctly() {
