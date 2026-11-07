@@ -17,7 +17,7 @@ jobs:
         shell: bash
     steps:
       - name: Install build tools
-        run: pacman -Syu --needed --noconfirm git sudo rust
+        run: pacman -Syu --needed --noconfirm git sudo rust zstd
 
       - name: Check out source
         uses: actions/checkout@v7
@@ -32,6 +32,57 @@ jobs:
           chmod 440 /etc/sudoers.d/builder
           chown -R builder:builder "$GITHUB_WORKSPACE"
 
+      - name: Compute dependency key
+        id: dependencies
+        env:
+          DEPENDENCY_HASH: ${{ hashFiles('PKGBUILD', 'oplus-connect-gui/Cargo.lock', 'oplus-connect-daemon/Cargo.lock') }}
+        run: echo "hash=$DEPENDENCY_HASH" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Cargo downloads
+        id: cargo-downloads
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            /home/builder/.cargo/registry
+            /home/builder/.cargo/git
+          key: ${{ runner.os }}-arch-cargo-v1-${{ steps.dependencies.outputs.hash }}
+          restore-keys: |
+            ${{ runner.os }}-arch-cargo-v1-
+
+      - name: Fix Cargo cache ownership
+        run: |
+          install -d -o builder -g builder /home/builder/.cargo
+          chown -R builder:builder /home/builder/.cargo
+
+      - name: Install package dependencies and fetch sources
+        run: |
+          commit=$(sudo -u builder git rev-parse HEAD)
+          sudo -u builder env HOME=/home/builder \
+            OPLUS_CONNECT_SOURCE_URL="file://${GITHUB_WORKSPACE}#commit=${commit}" \
+            makepkg --syncdeps --nobuild --noconfirm --nosign
+
+      - name: Fingerprint toolchain and system packages
+        id: system
+        run: |
+          fingerprint=$( { rustc --version --verbose; pacman -Q; } | sha256sum | cut -d ' ' -f1)
+          echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+
+      - name: Restore compiled artifacts
+        id: cargo-build
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            src/target
+            oplus-connect-daemon/target/release
+          key: ${{ runner.os }}-arch-target-v1-${{ steps.system.outputs.fingerprint }}-${{ steps.dependencies.outputs.hash }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-arch-target-v1-${{ steps.system.outputs.fingerprint }}-${{ steps.dependencies.outputs.hash }}-
+
+      - name: Fix build cache ownership
+        run: |
+          install -d -o builder -g builder src/target oplus-connect-daemon/target/release
+          chown -R builder:builder src/target oplus-connect-daemon/target
+
       - name: Check formatting
         run: |
           sudo -u builder env HOME=/home/builder cargo fmt --manifest-path oplus-connect-gui/Cargo.toml -- --check
@@ -40,12 +91,31 @@ jobs:
       - name: Build package and test GUI
         run: |
           commit=$(sudo -u builder git rev-parse HEAD)
-          sudo -u builder env HOME=/home/builder \
+          # A stable epoch avoids invalidating native build-script caches each run.
+          sudo -u builder env HOME=/home/builder CARGO_INCREMENTAL=0 SOURCE_DATE_EPOCH=1 \
             OPLUS_CONNECT_SOURCE_URL="file://${GITHUB_WORKSPACE}#commit=${commit}" \
-            makepkg --syncdeps --noconfirm --nosign
+            makepkg --syncdeps --noextract --noconfirm --nosign
 
       - name: Test daemon
-        run: sudo -u builder env HOME=/home/builder cargo test --locked --manifest-path oplus-connect-daemon/Cargo.toml
+        run: sudo -u builder env HOME=/home/builder CARGO_INCREMENTAL=0 cargo test --release --locked --manifest-path oplus-connect-daemon/Cargo.toml
+
+      - name: Save Cargo downloads
+        if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && steps.cargo-downloads.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            /home/builder/.cargo/registry
+            /home/builder/.cargo/git
+          key: ${{ steps.cargo-downloads.outputs.cache-primary-key }}
+
+      - name: Save compiled artifacts
+        if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && steps.cargo-build.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            src/target
+            oplus-connect-daemon/target/release
+          key: ${{ steps.cargo-build.outputs.cache-primary-key }}
 
       - name: Upload package
         uses: actions/upload-artifact@v7
