@@ -6,6 +6,14 @@ target/
 *.profdata
 /.cargo-isolated/
 
+# Arch package builds
+/src/
+/pkg/
+/oplus-connect/
+/oplus-connect-local/
+/*.pkg.tar.*
+/*.src.tar.*
+
 # Compiled libraries, debug symbols, and installer packages
 *.o
 *.obj

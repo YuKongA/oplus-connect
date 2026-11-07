@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  arch-linux:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install build tools
+        run: pacman -Syu --needed --noconfirm git sudo rust
+
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare unprivileged builder
+        run: |
+          useradd --create-home --shell /bin/bash builder
+          echo 'builder ALL=(ALL) NOPASSWD: /usr/bin/pacman' > /etc/sudoers.d/builder
+          chmod 440 /etc/sudoers.d/builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+
+      - name: Check formatting
+        run: |
+          sudo -u builder env HOME=/home/builder cargo fmt --manifest-path oplus-connect-gui/Cargo.toml -- --check
+          sudo -u builder env HOME=/home/builder cargo fmt --manifest-path oplus-connect-daemon/Cargo.toml -- --check
+
+      - name: Build package and test GUI
+        run: |
+          commit=$(sudo -u builder git rev-parse HEAD)
+          sudo -u builder env HOME=/home/builder \
+            OPLUS_CONNECT_SOURCE_URL="file://${GITHUB_WORKSPACE}#commit=${commit}" \
+            makepkg --syncdeps --noconfirm --nosign
+
+      - name: Test daemon
+        run: sudo -u builder env HOME=/home/builder cargo test --locked --manifest-path oplus-connect-daemon/Cargo.toml
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: oplus-connect-arch-x86_64
+          path: '*.pkg.tar.zst'
+          if-no-files-found: error

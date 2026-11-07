@@ -1,8 +1,8 @@
 [Desktop Entry]
 Type=Application
 Name=OPLUS 互联
-Comment=OPPO / 一加设备互联客户端
-Exec=@EXEC@
+Comment=OPPO/OnePlus/realme 设备互联客户端
+Exec=oplus-connect
 Icon=oplus-connect
 Terminal=false
 Categories=Network;

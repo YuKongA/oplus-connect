@@ -20,22 +20,18 @@ OPLUS 互联是面向 OPPO / OnePlus 设备的 Linux 原生客户端
 
 ## 构建与运行
 
-需要支持 Rust 2024 edition 的 Rust 工具链、GStreamer 1.24+，以及 WebRTC/libnice、VA 硬解与音频输出插件。Arch Linux：
+在 Arch Linux x86_64 上，从已有的 Git 检出目录构建并安装 pacman 软件包：
 
 ```bash
-sudo pacman -S --needed base-devel rust gstreamer gst-plugins-base gst-plugins-good \
-  gst-plugins-bad gst-plugin-va gst-plugin-pipewire libnice mesa
+sudo pacman -S --needed base-devel git
+OPLUS_CONNECT_SOURCE_URL="file://$PWD" makepkg -si
 ```
 
-无可用 VA-API H.264 编码器时，可安装软件编码插件：
+上述命令构建本地仓库当前分支已提交的代码，不包含未提交更改；不设置 `OPLUS_CONNECT_SOURCE_URL` 时使用远端最新提交。构建会运行 GUI 测试。安装后从应用菜单启动，或运行 `oplus-connect`。VA-API 需要适配显卡的驱动；无可用 H.264 硬件编码器时可安装 `gst-plugins-ugly` 使用软件编码。
 
-```bash
-sudo pacman -S --needed gst-plugins-ugly
-```
+项目目前未声明许可证，软件包将许可证标记为未知；分发前需由项目维护者明确授权。
 
-VA-API 还需要适配显卡的驱动；已通过 rustup 安装 Rust 时可省略 `rust` 包。
-
-GUI 会自动启动内嵌 daemon，正常使用只需运行 GUI：
+直接从源码运行需要支持 Rust 2024 edition 的工具链和 GStreamer 1.24+，GUI 会自动启动内嵌 daemon：
 
 ```bash
 cargo run --release --manifest-path oplus-connect-gui/Cargo.toml
@@ -65,10 +61,13 @@ cargo run --release --manifest-path oplus-connect-gui/Cargo.toml
 oplus-connect-daemon/   # 设备协议、连接状态、剪贴板与通知后端
 oplus-connect-gui/      # GPUI Kit 桌面客户端
 docs/                   # 协议与调试文档
-packaging/              # 桌面入口与本地图标安装脚本
+PKGBUILD                # Arch Linux 软件包构建配方
+oplus-connect.desktop   # 桌面入口
 ```
 
 ## 开发
+
+GitHub Actions 在 Arch Linux 容器中检查格式、运行后端与 GUI 测试，并构建 pacman 软件包作为工作流产物。
 
 ```bash
 # GUI 测试

@@ -9,42 +9,36 @@ pub struct LocalAssets {
     base_dirs: Vec<PathBuf>,
 }
 
-pub fn asset_path(rel_path: &str) -> PathBuf {
-    let clean = rel_path.trim_start_matches('/');
-    let candidates = [
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("assets")
-            .join(clean),
-        PathBuf::from("assets").join(clean),
-        PathBuf::from("oplus-connect-gui/assets").join(clean),
-    ];
-    for c in &candidates {
-        if c.exists() {
-            return c.clone();
+fn asset_directories() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            dirs.push(dir.join("../share/oplus-connect/assets"));
+            for parent in dir.ancestors().take(6) {
+                dirs.push(parent.join("assets"));
+                dirs.push(parent.join("oplus-connect-gui/assets"));
+            }
         }
     }
-    candidates[0].clone()
+    dirs.push(PathBuf::from("assets"));
+    dirs.push(PathBuf::from("oplus-connect-gui/assets"));
+    dirs
+}
+
+pub fn asset_path(rel_path: &str) -> PathBuf {
+    let clean = rel_path.trim_start_matches('/');
+    asset_directories()
+        .into_iter()
+        .map(|dir| dir.join(clean))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from("assets").join(clean))
 }
 
 impl LocalAssets {
     pub fn new() -> Self {
-        let mut dirs = Vec::new();
-
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                dirs.push(dir.join("assets"));
-                dirs.push(dir.join("../assets"));
-                dirs.push(dir.join("../../assets"));
-                dirs.push(dir.join("../../../oplus-connect-gui/assets"));
-            }
+        Self {
+            base_dirs: asset_directories(),
         }
-
-        dirs.push(PathBuf::from("assets"));
-        dirs.push(PathBuf::from("oplus-connect-gui/assets"));
-
-        dirs.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets"));
-
-        Self { base_dirs: dirs }
     }
 
     fn find_file(&self, path: &str) -> Option<PathBuf> {
@@ -160,14 +154,14 @@ mod tests {
     }
 
     #[test]
-    fn test_asset_load_system_svg() {
-        let assets = LocalAssets::new();
-        let close_svg = assets.load("/usr/share/icons/breeze/actions/16/window-close.svg");
-        println!(
-            "load result: {:?}",
-            close_svg.as_ref().map(|o| o.as_ref().map(|b| b.len()))
-        );
-        assert!(close_svg.unwrap().is_some());
+    fn absolute_asset_path_is_loaded() {
+        let dir = std::env::temp_dir().join(format!("oplus-assets-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("icon.svg");
+        fs::write(&path, b"<svg/>").unwrap();
+        let bytes = LocalAssets::new().load(path.to_str().unwrap()).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(bytes.unwrap().as_ref(), b"<svg/>");
     }
 
     #[test]
