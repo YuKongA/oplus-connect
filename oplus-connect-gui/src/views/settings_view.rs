@@ -1,6 +1,6 @@
+use crate::RootView;
 use crate::state::AppState;
 use crate::theme::Theme;
-use crate::RootView;
 use gpui_kit::component::group_box::{GroupBox, GroupBoxVariants};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::select::Select;

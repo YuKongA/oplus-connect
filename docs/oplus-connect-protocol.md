@@ -985,6 +985,7 @@ Rust `cast/` 提供显式启动、ODMF 认证与加密信令收发；GUI 的 `ca
   (`profile-level-id=42e01f;packetization-mode=1`) + RS-FEC(49)/RTX(101)，
   `m=application`、`sctp-port:5000`。反向触控为 30B 消息
   （6B 头 + 24B 事件体，type 0x10 TOUCH）走 DataChannel(sid=0)；
+  实机 SCTP 载荷在该 30B 帧之前另有 8B 外层数据；内容随消息变化。
   完整 offer/answer 在 `analysis/scp-log-recovery-20261102/expandcast-signaling/`。
 - KMS：`key = SHA-256(pwd)[:16]`，AES-128-GCM（无 AAD），24B 帧头 +
   12B nonce + 密文 + 16B tag；平板是 TCP 客户端，PC 监听动态 `socket_port`；
@@ -1274,7 +1275,8 @@ GUI 将该 connection 标识在输入、跨回读取或释放时被拒绝的情�
    - Linux 端通过 PipeWire / Screencast Portal 捕获画面，使用 VA-API 硬件编码器（`vah264enc`）向平板实时推流，目标码率 10 Mbps。
    - ScreenCast 版本低于 3 时不会返回 `source_type`；对于平板主动请求，GUI 按
      本次唯一请求的 Monitor 或 Virtual 类型识别采集源。
-   - 平板端的触控与手写笔操作通过 DataChannel 实时反传（采用与投屏反控相同的 24 字节帧格式）。
+   - 单指触控通过 DataChannel 反传，电脑以 RemoteDesktop portal 的指针和左键注入；
+     虚拟屏按 portal 的 mapping_id 跟踪 Wayland 输出逻辑尺寸，避免分辨率或缩放变化后使用旧尺寸。
 
 ---
 

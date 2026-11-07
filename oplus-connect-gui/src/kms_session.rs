@@ -4,7 +4,7 @@ use crate::{
     kms_capture::{self, CaptureEvent},
     kms_input::InputMapper,
 };
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::{future::Future, time::Duration};
 use tokio::sync::{mpsc, watch};
 

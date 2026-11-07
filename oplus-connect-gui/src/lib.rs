@@ -14,6 +14,7 @@ pub mod kms_input;
 pub mod kms_session;
 pub mod kms_settings;
 pub mod models;
+mod output_geometry;
 mod persisted;
 pub mod state;
 pub mod theme;
@@ -68,7 +69,6 @@ pub struct RootView {
     kms_session: Option<kms_session::KmsSessionHandle>,
     pub expand_cast: expand_cast_session::ExpandCastViewState,
     expand_cast_session: Option<expand_cast_session::ExpandCastSessionHandle>,
-    expand_cast_mode: Option<u8>,
     tablet_share_started_at: Option<Instant>,
     poll_guard: PollGuard,
     cast_session: Option<cast_session::CastSessionHandle>,
@@ -240,7 +240,6 @@ impl RootView {
             kms_session: None,
             expand_cast: expand_cast_session::ExpandCastViewState::default(),
             expand_cast_session: None,
-            expand_cast_mode: None,
             tablet_share_started_at: None,
             poll_guard: PollGuard::default(),
             cast_session: None,
@@ -386,8 +385,8 @@ impl RootView {
             cx.notify();
         }
     }
-    pub fn start_expand_cast(&mut self, device_id: String, cx: &mut Context<Self>) {
-        self.start_expand_cast_with_mode(device_id, None, cx);
+    pub fn start_expand_cast(&mut self, device_id: String, mode: u8, cx: &mut Context<Self>) {
+        self.start_expand_cast_with_mode(device_id, Some(mode), cx);
     }
 
     fn start_expand_cast_with_mode(
@@ -408,15 +407,15 @@ impl RootView {
             return;
         }
         self.tablet_share_started_at = Some(Instant::now());
-        self.expand_cast_mode = mode;
         let generation = self.expand_cast.generation.wrapping_add(1);
         self.expand_cast = expand_cast_session::ExpandCastViewState {
             device_id: device_id.clone(),
+            mode,
             generation,
             phase: expand_cast_session::ExpandCastPhase::Preparing,
             detail: match mode {
-                Some(1) => "平板请求扩展屏：等待系统授权并选择虚拟扩展屏…",
-                Some(2) => "平板请求镜像：等待系统授权并选择显示器…",
+                Some(1) => "正在准备屏幕扩展，请在系统弹窗中授权…",
+                Some(2) => "正在准备屏幕镜像，请在系统弹窗中授权…",
                 _ => "正在准备屏幕共享…",
             }
             .into(),
@@ -446,16 +445,27 @@ impl RootView {
                         match event {
                             ExpandCastEvent::Phase(phase) => {
                                 view.expand_cast.phase = phase;
-                                view.expand_cast.detail = match (phase, view.expand_cast_mode) {
-                                    (ExpandCastPhase::WaitingForTablet, Some(1)) => "平板请求扩展屏：等待平板连接，请在系统弹窗选择虚拟扩展屏…",
-                                    (ExpandCastPhase::WaitingForTablet, Some(2)) => "平板请求镜像：等待平板连接，请在系统弹窗选择要镜像的显示器…",
-                                    (ExpandCastPhase::WaitingForTablet, _) => "等待平板连接，请在系统弹窗选择要共享的显示器…",
-                                    (ExpandCastPhase::Streaming, Some(1)) => "扩展屏源已授权，正在启动推流（实际显示效果取决于系统）",
-                                    (ExpandCastPhase::Streaming, Some(2)) => "显示器源已授权，正在启动镜像推流",
+                                view.expand_cast.detail = match (phase, view.expand_cast.mode) {
+                                    (ExpandCastPhase::WaitingForTablet, Some(1)) => {
+                                        "屏幕扩展：等待平板连接，并在系统弹窗中授权…"
+                                    }
+                                    (ExpandCastPhase::WaitingForTablet, Some(2)) => {
+                                        "屏幕镜像：等待平板连接，并在系统弹窗中授权…"
+                                    }
+                                    (ExpandCastPhase::WaitingForTablet, _) => {
+                                        "等待平板连接，请在系统弹窗选择要共享的显示器…"
+                                    }
+                                    (ExpandCastPhase::Streaming, Some(1)) => {
+                                        "扩展屏源已授权，正在启动推流（实际显示效果取决于系统）"
+                                    }
+                                    (ExpandCastPhase::Streaming, Some(2)) => {
+                                        "显示器源已授权，正在启动镜像推流"
+                                    }
                                     (ExpandCastPhase::Streaming, _) => "屏幕共享推流已启动",
                                     (ExpandCastPhase::Stopping, _) => "正在停止共享屏幕…",
                                     _ => "正在准备屏幕共享…",
-                                }.into();
+                                }
+                                .into();
                             }
                             ExpandCastEvent::Resolution(w, h) => {
                                 view.expand_cast.width = w;
@@ -962,7 +972,7 @@ impl RootView {
                 } else {
                     self.expand_cast.active()
                         && self.expand_cast.device_id == device_id
-                        && self.expand_cast_mode == Some(mode)
+                        && self.expand_cast.mode == Some(mode)
                 };
                 if duplicate {
                     return false;
@@ -978,9 +988,9 @@ impl RootView {
                     self.start_kms(device_id, cx);
                 } else {
                     self.state.set_toast(if mode == 1 {
-                        "平板请求扩展屏，请在系统弹窗中授权并选择虚拟扩展屏"
+                        "平板请求屏幕扩展，请在系统弹窗中授权"
                     } else {
-                        "平板请求镜像，请在系统弹窗中授权并选择显示器"
+                        "平板请求屏幕镜像，请在系统弹窗中授权"
                     });
                     self.start_expand_cast_with_mode(device_id, Some(mode), cx);
                 }
@@ -1344,7 +1354,7 @@ impl Render for RootView {
 #[cfg(test)]
 mod polling_tests {
     use super::{
-        current_device_snapshot, tablet_missing, PollGuard, DAEMON_MAX_CONSECUTIVE_FAILURES,
+        DAEMON_MAX_CONSECUTIVE_FAILURES, PollGuard, current_device_snapshot, tablet_missing,
     };
     use crate::models::DeviceInfo;
     use crate::state::AppState;

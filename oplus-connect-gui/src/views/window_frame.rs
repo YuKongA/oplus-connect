@@ -2,13 +2,13 @@ use crate::models::*;
 use crate::state::AppState;
 use crate::theme::Theme;
 use gpui_kit::assets::IconName;
-use gpui_kit::component::sidebar::{
-    Sidebar as KitSidebar, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem,
-};
 use gpui_kit::component::Icon;
 use gpui_kit::component::Selectable;
 use gpui_kit::component::Theme as KitTheme;
 use gpui_kit::component::TitleBar as KitTitleBar;
+use gpui_kit::component::sidebar::{
+    Sidebar as KitSidebar, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem,
+};
 use gpui_kit::*;
 
 pub struct WindowFrame;

@@ -1,13 +1,13 @@
 //! Lifecycle management for tablet secondary display session.
 use crate::client::DaemonClient;
-use crate::expand_cast_media::{self, SenderConfig, SignalingMessage};
+use crate::expand_cast_media::{self, SenderConfig, SignalingMessage, TouchAction, TouchEvent};
 use crate::persisted::ExpandCastSettings;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::{
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
@@ -27,6 +27,7 @@ pub enum ExpandCastPhase {
 #[derive(Clone, Debug, Default)]
 pub struct ExpandCastViewState {
     pub device_id: String,
+    pub mode: Option<u8>,
     pub generation: u64,
     pub phase: ExpandCastPhase,
     pub detail: String,
@@ -227,6 +228,10 @@ async fn run_session(
             return Ok(());
         }
     };
+    if tablet_width == 0 || tablet_height == 0 {
+        let _ = client.expand_cast_stop(device_id).await;
+        return Err(anyhow!("平板屏幕尺寸无效"));
+    }
 
     let _ = events.try_send(ExpandCastEvent::Resolution(tablet_width, tablet_height));
 
@@ -335,9 +340,11 @@ async fn run_session(
     let mut poll_status = tokio::time::interval(Duration::from_millis(1000));
     let mut result = Ok(());
     let mut sender_finished = false;
+    let mut pressed = false;
 
     while !*cancel.borrow() {
         tokio::select! {
+            biased;
             _ = cancel.changed() => break,
             finished = &mut media.finished => {
                 sender_finished = true;
@@ -347,6 +354,37 @@ async fn run_session(
                     Err(_) => Err(anyhow!("屏幕共享推流线程异常退出")),
                 };
                 break;
+            }
+            touch = media.touch.recv() => {
+                match touch {
+                    Some(touch) => {
+                        let geometry = *media.geometry.borrow();
+                        tokio::select! {
+                            biased;
+                            _ = cancel.changed() => break,
+                            finished = &mut media.finished => {
+                                sender_finished = true;
+                                result = match finished {
+                                    Ok(Ok(())) => Err(anyhow!("屏幕共享推流已停止")),
+                                    Ok(Err(error)) => Err(anyhow!("屏幕共享推流失败: {error}")),
+                                    Err(_) => Err(anyhow!("屏幕共享推流线程异常退出")),
+                                };
+                                break;
+                            }
+                            injected = screencast.as_ref().expect("portal session exists")
+                                .inject_touch(touch, &mut pressed, tablet_width, tablet_height, geometry) => {
+                                if let Err(error) = injected {
+                                    result = Err(error.context("注入远程触控失败"));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        result = Err(anyhow!("平板触控通道已关闭"));
+                        break;
+                    }
+                }
             }
             Some(msg) = media.outgoing.recv() => {
                 match msg {
@@ -412,6 +450,16 @@ async fn run_session(
     }
 
     let _ = events.try_send(ExpandCastEvent::Phase(ExpandCastPhase::Stopping));
+    if pressed {
+        if let Some(session) = &screencast {
+            if let Err(error) = session.release_touch().await {
+                tracing::warn!("释放远程触控失败: {error:#}");
+                if result.is_ok() {
+                    result = Err(error.context("释放远程触控失败"));
+                }
+            }
+        }
+    }
     media.stop.store(true, Ordering::Release);
     let _ = client.expand_cast_stop(device_id).await;
     if !sender_finished {
@@ -433,12 +481,15 @@ pub struct ScreencastSession {
     fd: Arc<OwnedFd>,
     node: u32,
     size: Option<(u32, u32)>,
+    logical_size: Option<watch::Receiver<Option<(u32, u32)>>>,
     virtual_output: bool,
-    _screencast: ashpd::desktop::screencast::Screencast,
+    remote: ashpd::desktop::remote_desktop::RemoteDesktop,
     session: PortalSession,
 }
 
-struct PortalSession(Option<ashpd::desktop::Session<ashpd::desktop::screencast::Screencast>>);
+struct PortalSession(
+    Option<ashpd::desktop::Session<ashpd::desktop::remote_desktop::RemoteDesktop>>,
+);
 
 impl PortalSession {
     async fn close(&mut self) {
@@ -482,6 +533,129 @@ impl ScreencastSession {
     fn is_virtual(&self) -> bool {
         self.virtual_output
     }
+
+    async fn release_touch(&self) -> Result<()> {
+        use ashpd::desktop::remote_desktop::KeyState;
+        let session = self.session.0.as_ref().expect("portal session exists");
+        self.remote
+            .notify_pointer_button(session, 0x110, KeyState::Released, Default::default())
+            .await?;
+        Ok(())
+    }
+
+    async fn inject_touch(
+        &self,
+        touch: TouchEvent,
+        pressed: &mut bool,
+        tablet_width: u32,
+        tablet_height: u32,
+        geometry: Option<expand_cast_media::MediaGeometry>,
+    ) -> Result<()> {
+        use ashpd::desktop::remote_desktop::KeyState;
+        if touch.action == TouchAction::Up {
+            if *pressed {
+                self.release_touch().await?;
+                *pressed = false;
+            }
+            return Ok(());
+        }
+        if !accept_contact_event(*pressed, touch.action) {
+            return Ok(());
+        }
+        let Some(geometry) = geometry else {
+            return Ok(());
+        };
+        let logical_size = if self.virtual_output {
+            let tracker = self
+                .logical_size
+                .as_ref()
+                .context("系统未提供虚拟屏映射标识")?;
+            if tracker.has_changed().is_err() {
+                return Err(anyhow!("无法跟踪虚拟屏逻辑尺寸"));
+            }
+            *tracker.borrow()
+        } else {
+            self.size
+        };
+        let Some((logical_width, logical_height)) = logical_size else {
+            return Ok(());
+        };
+        let Some((x, y)) = map_touch(
+            touch.x,
+            touch.y,
+            tablet_width,
+            tablet_height,
+            geometry.out_width,
+            geometry.out_height,
+            geometry.render_width,
+            geometry.render_height,
+            logical_width,
+            logical_height,
+        ) else {
+            return Ok(());
+        };
+        let session = self.session.0.as_ref().expect("portal session exists");
+        self.remote
+            .notify_pointer_motion_absolute(session, self.node, x, y, Default::default())
+            .await?;
+        if matches!(touch.action, TouchAction::Down) {
+            *pressed = true;
+            self.remote
+                .notify_pointer_button(session, 0x110, KeyState::Pressed, Default::default())
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+// Tablet coordinates address the displayed frame; portal coordinates are
+// relative to the selected stream in compositor logical units.
+fn map_touch(
+    x: u32,
+    y: u32,
+    tablet_width: u32,
+    tablet_height: u32,
+    output_width: u32,
+    output_height: u32,
+    render_width: u32,
+    render_height: u32,
+    logical_width: u32,
+    logical_height: u32,
+) -> Option<(f64, f64)> {
+    if tablet_width == 0
+        || tablet_height == 0
+        || output_width == 0
+        || output_height == 0
+        || render_width == 0
+        || render_height == 0
+        || logical_width == 0
+        || logical_height == 0
+        || render_width > output_width
+        || render_height > output_height
+        || x >= tablet_width
+        || y >= tablet_height
+    {
+        return None;
+    }
+    let px = x as f64 * output_width as f64 / tablet_width as f64;
+    let py = y as f64 * output_height as f64 / tablet_height as f64;
+    let left = ((output_width - render_width) / 2) as f64;
+    let top = ((output_height - render_height) / 2) as f64;
+    if px < left || px >= left + render_width as f64 || py < top || py >= top + render_height as f64
+    {
+        return None;
+    }
+    Some((
+        (px - left) * logical_width as f64 / render_width as f64,
+        (py - top) * logical_height as f64 / render_height as f64,
+    ))
+}
+
+fn accept_contact_event(pressed: bool, action: TouchAction) -> bool {
+    match action {
+        TouchAction::Down => !pressed,
+        TouchAction::Move | TouchAction::Up => pressed,
+    }
 }
 
 fn virtual_source_for_request(
@@ -491,15 +665,15 @@ fn virtual_source_for_request(
 ) -> Result<bool> {
     use ashpd::desktop::screencast::SourceType;
     match (mode, source) {
-        (Some(1), Some(SourceType::Virtual)) => Ok(true),
-        (Some(2), Some(SourceType::Monitor)) => Ok(false),
+        (Some(1), Some(SourceType::VIRTUAL)) => Ok(true),
+        (Some(2), Some(SourceType::MONITOR)) => Ok(false),
         // Before v3 the portal cannot report source_type. SelectSources above
         // requests exactly one type, so that request identifies the source.
         (Some(1), None) if portal_version < 3 => Ok(true),
         (Some(2), None) if portal_version < 3 => Ok(false),
-        (None, source) => Ok(source == Some(SourceType::Virtual)),
-        (Some(1), _) => Err(anyhow!("系统未确认选择虚拟扩展屏，无法满足平板扩展请求")),
-        (Some(2), _) => Err(anyhow!("系统未确认选择显示器，无法满足平板镜像请求")),
+        (None, source) => Ok(source == Some(SourceType::VIRTUAL)),
+        (Some(1), _) => Err(anyhow!("系统未确认选择扩展屏，无法满足平板屏幕扩展请求")),
+        (Some(2), _) => Err(anyhow!("系统未确认选择显示器，无法满足平板屏幕镜像请求")),
         _ => Err(anyhow!("不支持的屏幕共享模式")),
     }
 }
@@ -508,47 +682,58 @@ async fn try_acquire_screencast(
     cancel: &mut watch::Receiver<bool>,
     mode: Option<u8>,
 ) -> Result<Option<ScreencastSession>> {
+    use ashpd::desktop::remote_desktop::{DeviceType, RemoteDesktop, SelectDevicesOptions};
     use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};
-    use ashpd::enumflags2::BitFlags;
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let created = tokio::select! {
         _ = cancel.changed() => return Ok(None),
         result = tokio::time::timeout_at(deadline, async {
             let screencast = Screencast::new().await.context("connecting to screencast portal")?;
-            tracing::info!("portal ScreenCast API version: {}", screencast.version());
-            let session = screencast
+            let remote = RemoteDesktop::new().await.context("连接远程桌面授权服务失败")?;
+            let session = remote
                 .create_session(Default::default())
                 .await
-                .context("creating screencast session")?;
-            Ok::<_, anyhow::Error>((screencast, session))
+                .context("创建远程桌面会话失败")?;
+            Ok::<_, anyhow::Error>((screencast, remote, session))
         }) => result.context("portal screencast prompt timed out")??,
     };
-    let (screencast, session) = created;
+    let (screencast, remote, session) = created;
     let mut session = PortalSession(Some(session));
     let portal_session = session.0.as_ref().expect("portal session exists");
     let selected = tokio::select! {
         _ = cancel.changed() => Ok(None),
         result = tokio::time::timeout_at(deadline, async {
+            // A single tablet contact maps to a pointer and left button.
+            // Some portals ignore the stream when injecting touch events.
+            remote.select_devices(
+                portal_session,
+                SelectDevicesOptions::default().set_devices(DeviceType::POINTER),
+            ).await.context("申请远程输入设备失败")?.response().context("远程输入设备申请被拒绝")?;
+            // Request exactly one source type: KDE's RemoteDesktop backend
+            // creates a virtual output only for a Virtual-only request.
             screencast
                 .select_sources(
                     portal_session,
                     SelectSourcesOptions::default()
-                        .set_cursor_mode(CursorMode::Embedded)
-                        .set_sources(BitFlags::from_flag(match mode {
-                            Some(1) => SourceType::Virtual,
-                            _ => SourceType::Monitor,
-                        }))
+                        .set_cursor_mode(CursorMode::EMBEDDED)
+                        .set_sources(match mode {
+                            Some(1) => SourceType::VIRTUAL,
+                            _ => SourceType::MONITOR,
+                        })
                         .set_multiple(false),
                 )
                 .await
-                .context("selecting screencast sources")?;
-            let response = screencast
+                .context("选择屏幕源失败")?.response().context("屏幕源选择被拒绝")?;
+            let response = remote
                 .start(portal_session, None, Default::default())
                 .await
-                .context("starting screencast session")?
+                .context("启动远程桌面授权失败")?
                 .response()
-                .context("getting screencast response")?;
+                .context("远程桌面授权被拒绝或失败")?;
+            if !response.devices().contains(DeviceType::POINTER) {
+                return Err(anyhow!("未获准使用指针输入设备"));
+            }
             let stream = response
                 .streams()
                 .first()
@@ -567,16 +752,21 @@ async fn try_acquire_screencast(
                 .open_pipe_wire_remote(portal_session, Default::default())
                 .await
                 .context("opening pipewire remote fd")?;
-            Ok::<_, anyhow::Error>((fd, node, size, virtual_output))
+            Ok::<_, anyhow::Error>((fd, node, size, virtual_output, stream.mapping_id().map(str::to_owned)))
         }) => result.context("portal screencast prompt timed out").and_then(|result| result).map(Some),
     };
     match selected {
-        Ok(Some((fd, node, size, virtual_output))) => Ok(Some(ScreencastSession {
+        Ok(Some((fd, node, size, virtual_output, mapping_id))) => Ok(Some(ScreencastSession {
             fd: Arc::new(fd),
             node,
             size,
+            logical_size: if virtual_output {
+                mapping_id.map(crate::output_geometry::track)
+            } else {
+                None
+            },
             virtual_output,
-            _screencast: screencast,
+            remote,
             session,
         })),
         other => {
@@ -590,12 +780,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn maps_content_and_rejects_black_bars() {
+        // A 1920x1080 image centered in a 1920x1280 frame, displayed on
+        // a 1200x800 tablet, maps to a HiDPI 960x540 logical stream.
+        assert_eq!(
+            map_touch(600, 400, 1200, 800, 1920, 1280, 1920, 1080, 960, 540),
+            Some((480.0, 270.0))
+        );
+        assert_eq!(
+            map_touch(0, 0, 1200, 800, 1920, 1280, 1920, 1080, 960, 540),
+            None
+        );
+        assert_eq!(
+            map_touch(600, 799, 1200, 800, 1920, 1280, 1920, 1080, 960, 540),
+            None
+        );
+        assert_eq!(
+            map_touch(1200, 400, 1200, 800, 1920, 1280, 1920, 1080, 960, 540),
+            None
+        );
+        assert_eq!(
+            map_touch(0, 0, 0, 800, 1920, 1280, 1920, 1080, 960, 540),
+            None
+        );
+        assert_eq!(
+            map_touch(600, 400, 1200, 800, 1200, 800, 1200, 800, 1200, 800),
+            Some((600.0, 400.0))
+        );
+    }
+
+    #[test]
     fn legacy_portal_uses_the_single_requested_source_type() {
         use ashpd::desktop::screencast::SourceType;
         assert_eq!(virtual_source_for_request(Some(1), None, 2).unwrap(), true);
         assert_eq!(virtual_source_for_request(Some(2), None, 2).unwrap(), false);
-        assert!(virtual_source_for_request(Some(1), Some(SourceType::Monitor), 2).is_err());
-        assert!(virtual_source_for_request(Some(2), Some(SourceType::Virtual), 2).is_err());
+        assert!(virtual_source_for_request(Some(1), Some(SourceType::MONITOR), 2).is_err());
+        assert!(virtual_source_for_request(Some(2), Some(SourceType::VIRTUAL), 2).is_err());
         assert!(virtual_source_for_request(Some(2), None, 3).is_err());
     }
 
@@ -607,13 +827,15 @@ mod tests {
         let active = Mutex::new(Some((new_cancel.clone(), done_rx.clone())));
 
         clear_current_session(&active, &old_cancel);
-        assert!(active
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .0
-            .same_channel(&new_cancel));
+        assert!(
+            active
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .0
+                .same_channel(&new_cancel)
+        );
 
         let waiter = tokio::spawn(wait_for_session(done_rx));
         assert!(!waiter.is_finished());

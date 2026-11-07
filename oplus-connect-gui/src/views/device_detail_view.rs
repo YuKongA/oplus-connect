@@ -5,9 +5,9 @@ use crate::models::*;
 use crate::state::AppState;
 use crate::theme::Theme;
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::Disableable;
 use gpui_kit::component::Icon;
+use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::*;
 
 pub struct DeviceDetailView;
@@ -130,6 +130,8 @@ impl DeviceDetailView {
             .border_1()
             .border_color(Theme::border_card())
             .flex()
+            .flex_wrap()
+            .gap(px(12.0))
             .items_center()
             .justify_between()
             .child(
@@ -186,7 +188,7 @@ impl DeviceDetailView {
 
         if is_connected {
             let device_id = device.device_id.clone();
-            let mut actions = div().flex().items_center().gap(px(8.0));
+            let mut actions = div().flex().flex_wrap().items_center().gap(px(8.0));
             if device.device_type == "phone" {
                 let casting = state.cast.device_id == device.device_id && state.cast.active();
                 let cast_label = if casting {
@@ -250,34 +252,49 @@ impl DeviceDetailView {
                 );
 
                 let ext_active = expand_cast.device_id == device.device_id && expand_cast.active();
-                let ext_label = if ext_active {
-                    match expand_cast.phase {
+                if ext_active {
+                    let ext_label = match expand_cast.phase {
                         ExpandCastPhase::Stopping => "停止中…",
-                        ExpandCastPhase::Streaming => "停止屏幕共享",
+                        ExpandCastPhase::Streaming => match expand_cast.mode {
+                            Some(1) => "停止屏幕扩展",
+                            Some(2) => "停止屏幕镜像",
+                            _ => "停止屏幕共享",
+                        },
                         _ => "共享启动中",
-                    }
-                } else {
-                    "屏幕共享"
-                };
-                let ext_id = device_id.clone();
-                actions = actions.child(
-                    Button::new(("btn-expand-cast", index))
-                        .primary()
-                        .disabled(
-                            (expand_cast.active() && !ext_active)
-                                || expand_cast.phase == ExpandCastPhase::Stopping
-                                || state.cast.active()
-                                || kms.active(),
-                        )
-                        .label(ext_label)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if this.expand_cast.active() {
+                    };
+                    actions = actions.child(
+                        Button::new(("btn-expand-cast-stop", index))
+                            .primary()
+                            .disabled(expand_cast.phase == ExpandCastPhase::Stopping)
+                            .label(ext_label)
+                            .on_click(cx.listener(move |this, _, _, cx| {
                                 this.stop_expand_cast(cx);
-                            } else {
-                                this.start_expand_cast(ext_id.clone(), cx);
-                            }
-                        })),
-                );
+                            })),
+                    );
+                } else {
+                    let disabled = expand_cast.active() || state.cast.active() || kms.active();
+                    let ext_id = device_id.clone();
+                    let mirror_id = device_id.clone();
+                    actions = actions
+                        .child(
+                            Button::new(("btn-expand-cast-virtual", index))
+                                .primary()
+                                .disabled(disabled)
+                                .label("屏幕扩展")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.start_expand_cast(ext_id.clone(), 1, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new(("btn-expand-cast-mirror", index))
+                                .primary()
+                                .disabled(disabled)
+                                .label("屏幕镜像")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.start_expand_cast(mirror_id.clone(), 2, cx);
+                                })),
+                        );
+                }
             }
             actions = actions.child(
                 Button::new(("btn-disconnect", index))

@@ -1,6 +1,6 @@
 use gpui_kit::*;
-use oplus_connect_gui::assets::LocalAssets;
 use oplus_connect_gui::RootView;
+use oplus_connect_gui::assets::LocalAssets;
 use tracing::info;
 
 fn main() {

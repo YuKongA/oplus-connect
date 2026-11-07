@@ -1,6 +1,6 @@
 //! GStreamer WebRTC desktop streaming sender for tablet secondary display.
-use crate::persisted::{ExpandCastSettings, BITRATE_MAX, BITRATE_MIN};
-use anyhow::{anyhow, Context, Result};
+use crate::persisted::{BITRATE_MAX, BITRATE_MIN, ExpandCastSettings};
+use anyhow::{Context, Result, anyhow};
 use gstreamer as gst;
 use gstreamer_app as gst_app;
 use gstreamer_app::prelude::*;
@@ -8,13 +8,143 @@ use gstreamer_sdp as gst_sdp;
 use gstreamer_webrtc as gst_webrtc;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::{
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
-    Arc,
 };
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 const REPORT_INTERVAL: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TouchAction {
+    Down,
+    Move,
+    Up,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TouchEvent {
+    pub action: TouchAction,
+    pub x: u32,
+    pub y: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MediaGeometry {
+    pub out_width: u32,
+    pub out_height: u32,
+    pub render_width: u32,
+    pub render_height: u32,
+    pub pad_x: u32,
+    pub pad_y: u32,
+}
+
+fn parse_touch_frame(frame: &[u8]) -> Option<TouchEvent> {
+    // The SCTP decoder prepends an 8-byte per-message header to the 30-byte
+    // ODMF event; header contents are not part of the touch payload.
+    let frame = if frame.len() == 38 {
+        &frame[8..]
+    } else {
+        frame
+    };
+    if frame.len() != 30
+        || frame[..10] != [0x81, 0x03, 0x01, 0x1f, 0x00, 0x18, 0x10, 0, 0, 0]
+        || frame[11] != 1
+        || frame[12..16] != [0, 0, 0, 0]
+        || frame[28..30] != [1, 0]
+    {
+        return None;
+    }
+    let action = match frame[10] {
+        0 => TouchAction::Down,
+        1 => TouchAction::Up,
+        2 => TouchAction::Move,
+        _ => return None,
+    };
+    Some(TouchEvent {
+        action,
+        x: u32::from_be_bytes(frame[20..24].try_into().ok()?),
+        y: u32::from_be_bytes(frame[24..28].try_into().ok()?),
+    })
+}
+
+struct TouchDispatch {
+    tx: mpsc::Sender<TouchEvent>,
+    error: Mutex<Option<String>>,
+    stop: Arc<AtomicBool>,
+    used: AtomicBool,
+}
+
+impl TouchDispatch {
+    fn fail(&self, reason: String) {
+        let mut error = self.error.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.stop.load(Ordering::Acquire) {
+            *error = Some(reason);
+            self.stop.store(true, Ordering::Release);
+        }
+    }
+
+    fn channel_closed(&self, used: bool) {
+        if used {
+            self.fail("ExpandCast touch DataChannel closed".into());
+        }
+    }
+
+    fn send(&self, event: TouchEvent) {
+        let mut error = self.error.lock().unwrap_or_else(|e| e.into_inner());
+        if self.stop.load(Ordering::Acquire) {
+            return;
+        }
+        if let Err(cause) = self.tx.try_send(event) {
+            *error = Some(format!("ExpandCast touch delivery failed: {cause}"));
+            self.stop.store(true, Ordering::Release);
+        }
+    }
+}
+
+// Some tablet messages arrive with the SCTP string PPID but are not valid UTF-8.
+// GStreamer's string signal also loses embedded NULs, so inspect the raw buffer.
+fn attach_touch_probe(pad: &gst::Pad, dispatch: Arc<TouchDispatch>) {
+    if pad.name() != "src_0" {
+        return;
+    }
+    tracing::debug!(pad = %pad.name(), "Observing tablet SCTP stream");
+    let accepted = AtomicU32::new(0);
+    let rejected = AtomicU32::new(0);
+    pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+        if let Some(buffer) = info.buffer() {
+            if let Ok(mapped) = buffer.map_readable() {
+                let frame = mapped.as_slice();
+                if let Some(event) = parse_touch_frame(frame) {
+                    if accepted.fetch_add(1, Ordering::Relaxed) < 8 {
+                        tracing::debug!(action = ?event.action, "Received ExpandCast touch frame");
+                    }
+                    dispatch.used.store(true, Ordering::Release);
+                    dispatch.send(event);
+                } else if rejected.fetch_add(1, Ordering::Relaxed) < 8 {
+                    tracing::debug!(len = frame.len(), "Ignoring non-touch SCTP message");
+                }
+            }
+        }
+        gst::PadProbeReturn::Ok
+    });
+}
+
+fn attach_touch_channel(channel: &gst_webrtc::WebRTCDataChannel, dispatch: Arc<TouchDispatch>) {
+    channel.connect_on_open(|channel| {
+        tracing::debug!(channel_id = channel.id(), "ExpandCast DataChannel opened");
+    });
+    let closed = dispatch.clone();
+    channel.connect_on_close(move |channel| {
+        closed.channel_closed(channel.id() == 0 && closed.used.load(Ordering::Acquire));
+    });
+    channel.connect_on_error(move |channel, error| {
+        if channel.id() == 0 && dispatch.used.load(Ordering::Acquire) {
+            dispatch.fail(format!("ExpandCast touch DataChannel error: {error}"));
+        }
+    });
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignalingMessage {
@@ -107,6 +237,8 @@ fn adjusted_bitrate(current: u32, loss: f64, initial: u32) -> u32 {
 pub struct MediaSender {
     pub incoming: mpsc::Sender<SignalingMessage>,
     pub outgoing: mpsc::Receiver<SignalingMessage>,
+    pub touch: mpsc::Receiver<TouchEvent>,
+    pub geometry: watch::Receiver<Option<MediaGeometry>>,
     pub finished: tokio::sync::oneshot::Receiver<Result<(), String>>,
     pub stop: Arc<AtomicBool>,
 }
@@ -129,6 +261,14 @@ pub fn spawn_sender(config: SenderConfig) -> Result<MediaSender> {
     let (finished_tx, finished) = tokio::sync::oneshot::channel();
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
+    let (touch_tx, touch_rx) = mpsc::channel(256);
+    let (geometry_tx, geometry_rx) = watch::channel(None);
+    let touch_dispatch = Arc::new(TouchDispatch {
+        tx: touch_tx,
+        error: Mutex::new(None),
+        stop: stop.clone(),
+        used: AtomicBool::new(false),
+    });
 
     std::thread::Builder::new()
         .name("oplus-expand-cast-sender".into())
@@ -147,11 +287,16 @@ pub fn spawn_sender(config: SenderConfig) -> Result<MediaSender> {
                         run_pipeline(
                             &mut incoming_rx,
                             outgoing_tx.clone(),
+                            touch_dispatch.clone(),
+                            &geometry_tx,
                             &stop_thread,
                             &config,
                             pin_capture,
                         )
                     }));
+                    if let Some(error) = touch_dispatch.error.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                        return Err(anyhow!(error));
+                    }
                     match outcome {
                         Ok(Ok(())) => return Ok(()),
                         Ok(Err(error)) => last_error = Some(error),
@@ -177,19 +322,32 @@ pub fn spawn_sender(config: SenderConfig) -> Result<MediaSender> {
     Ok(MediaSender {
         incoming: incoming_tx,
         outgoing: outgoing_rx,
+        touch: touch_rx,
+        geometry: geometry_rx,
         finished,
         stop,
     })
 }
 
+struct PipelineCleanup<'a>(&'a gst::Pipeline);
+
+impl<'a> Drop for PipelineCleanup<'a> {
+    fn drop(&mut self) {
+        let _ = self.0.set_state(gst::State::Null);
+    }
+}
+
 fn run_pipeline(
     incoming_rx: &mut mpsc::Receiver<SignalingMessage>,
     outgoing_tx: mpsc::Sender<SignalingMessage>,
+    touch_dispatch: Arc<TouchDispatch>,
+    geometry_tx: &watch::Sender<Option<MediaGeometry>>,
     stop: &AtomicBool,
     config: &SenderConfig,
     pin_capture: bool,
 ) -> Result<()> {
     let pipeline = gst::Pipeline::new();
+    let _pipeline_cleanup = PipelineCleanup(&pipeline);
 
     // The portal node id is passed through `path`, not `target-object`.
     let (Some(fd), Some(node)) = (config.pipewire_fd.as_ref(), config.pipewire_node) else {
@@ -234,9 +392,11 @@ fn run_pipeline(
     // Prefer GPU scaling and colour conversion when available.
     let scalers: Vec<gst::Element> = if gst::ElementFactory::find("vapostproc").is_some() {
         tracing::info!("ExpandCast: scaling with VA-API post-processing");
-        vec![gst::ElementFactory::make("vapostproc")
-            .build()
-            .context("creating vapostproc")?]
+        vec![
+            gst::ElementFactory::make("vapostproc")
+                .build()
+                .context("creating vapostproc")?,
+        ]
     } else {
         tracing::info!("ExpandCast: scaling on the CPU (videoconvert/videoscale)");
         vec![
@@ -493,10 +653,26 @@ fn run_pipeline(
         ],
     );
 
-    // Listen for reverse touch input data channel from tablet
+    let sctp_touch = touch_dispatch.clone();
+    webrtc
+        .clone()
+        .downcast::<gst::Bin>()
+        .map_err(|_| anyhow!("webrtcbin is not a GstBin"))?
+        .connect_deep_element_added(move |_, _, element| {
+            if element
+                .factory()
+                .is_some_and(|factory| factory.name() == "sctpdec")
+            {
+                let dispatch = sctp_touch.clone();
+                element.connect_pad_added(move |_, pad| attach_touch_probe(pad, dispatch.clone()));
+            }
+        });
+
+    let remote_touch = touch_dispatch.clone();
     webrtc.connect("on-data-channel", false, move |values| {
         if let Ok(channel) = values[1].get::<gst_webrtc::WebRTCDataChannel>() {
             tracing::info!("Tablet opened WebRTC DataChannel: {:?}", channel.label());
+            attach_touch_channel(&channel, remote_touch.clone());
         }
         None
     });
@@ -509,10 +685,20 @@ fn run_pipeline(
         tracing::info!("WebRTC ICE connection state: {:?}", state);
     });
     let webrtc_conn = webrtc.clone();
+    let connection_touch = touch_dispatch.clone();
     webrtc.connect_notify(Some("connection-state"), move |_, _| {
         let state =
             webrtc_conn.property::<gst_webrtc::WebRTCPeerConnectionState>("connection-state");
         tracing::info!("WebRTC peer connection state: {:?}", state);
+        if matches!(
+            state,
+            gst_webrtc::WebRTCPeerConnectionState::Disconnected
+                | gst_webrtc::WebRTCPeerConnectionState::Failed
+                | gst_webrtc::WebRTCPeerConnectionState::Closed
+        ) && connection_touch.used.load(Ordering::Acquire)
+        {
+            connection_touch.fail(format!("ExpandCast WebRTC connection {state:?}"));
+        }
     });
 
     // Handle ICE candidates generated by local webrtcbin
@@ -542,6 +728,9 @@ fn run_pipeline(
         "create-data-channel",
         &[&"OdmfDataChannel", &None::<gst::Structure>],
     );
+    if let Some(channel) = &channel {
+        attach_touch_channel(channel, touch_dispatch);
+    }
     tracing::info!(
         "Created OdmfDataChannel for ExpandCast: {:?}",
         channel.is_some()
@@ -611,6 +800,14 @@ fn run_pipeline(
             return Err(error);
         }
     }
+    geometry_tx.send_replace(Some(MediaGeometry {
+        out_width,
+        out_height,
+        render_width,
+        render_height,
+        pad_x,
+        pad_y,
+    }));
     publish_offer(&webrtc, &outgoing_tx);
 
     let frames_out = Arc::new(AtomicU64::new(0));
@@ -1157,6 +1354,155 @@ fn run_capture_pipeline(
 #[cfg(test)]
 mod capture_tests {
     use super::*;
+
+    const TOUCH_FRAME: [u8; 30] = [
+        0x81, 0x03, 0x01, 0x1f, 0, 0x18, 0x10, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0x09, 0xd8, 0x06, 0x90,
+        0, 0, 0x09, 0x90, 0, 0, 0x06, 0x39, 1, 0,
+    ];
+
+    #[test]
+    fn sctp_probe_receives_binary_frame_with_nuls_and_invalid_utf8() {
+        gst::init().unwrap();
+        let src = gst::Pad::builder(gst::PadDirection::Src)
+            .name("src_0")
+            .build();
+        let sink = gst::Pad::builder(gst::PadDirection::Sink)
+            .chain_function(|_, _, _| Ok(gst::FlowSuccess::Ok))
+            .build();
+        let (tx, mut rx) = mpsc::channel(4);
+        let dispatch = Arc::new(TouchDispatch {
+            tx,
+            error: Mutex::new(None),
+            stop: Arc::new(AtomicBool::new(false)),
+            used: AtomicBool::new(false),
+        });
+        attach_touch_probe(&src, dispatch.clone());
+        src.link(&sink).unwrap();
+        sink.set_active(true).unwrap();
+        src.set_active(true).unwrap();
+        assert!(src.push_event(gst::event::StreamStart::new("touch")));
+        let segment = gst::FormattedSegment::<gst::ClockTime>::new();
+        assert!(src.push_event(gst::event::Segment::new(segment.as_ref())));
+        let mut packet = vec![180, 183, 42, 229, 0, 0, 0, 0];
+        packet.extend_from_slice(&TOUCH_FRAME);
+        src.push(gst::Buffer::from_mut_slice(packet)).unwrap();
+        assert!(dispatch.used.load(Ordering::Acquire));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            TouchEvent {
+                action: TouchAction::Down,
+                x: 2448,
+                y: 1593
+            }
+        );
+    }
+
+    #[test]
+    fn parses_captured_touch_actions_and_big_endian_coordinates() {
+        for (code, action) in [
+            (0, TouchAction::Down),
+            (1, TouchAction::Up),
+            (2, TouchAction::Move),
+        ] {
+            let mut frame = TOUCH_FRAME;
+            frame[10] = code;
+            assert_eq!(
+                parse_touch_frame(&frame),
+                Some(TouchEvent {
+                    action,
+                    x: 2448,
+                    y: 1593
+                })
+            );
+        }
+        let mut frame = TOUCH_FRAME;
+        frame[20..28].copy_from_slice(&[0xff, 0xff, 0xff, 0xff, 0x80, 0, 0, 0]);
+        let event = parse_touch_frame(&frame).unwrap();
+        assert_eq!((event.x, event.y), (u32::MAX, 0x8000_0000));
+    }
+
+    #[test]
+    fn rejects_malformed_or_unsupported_touch_frames() {
+        assert_eq!(parse_touch_frame(&TOUCH_FRAME[..29]), None);
+        let mut longer = TOUCH_FRAME.to_vec();
+        longer.push(0);
+        assert_eq!(parse_touch_frame(&longer), None);
+        for index in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 28, 29] {
+            let mut frame = TOUCH_FRAME;
+            frame[index] ^= 0xff;
+            assert_eq!(
+                parse_touch_frame(&frame),
+                None,
+                "accepted invalid byte {index}"
+            );
+        }
+        let mut frame = TOUCH_FRAME;
+        frame[10] = 3;
+        assert_eq!(parse_touch_frame(&frame), None);
+    }
+
+    #[test]
+    fn full_touch_queue_stops_session_instead_of_losing_release() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let stop = Arc::new(AtomicBool::new(false));
+        let dispatch = TouchDispatch {
+            tx,
+            error: Mutex::new(None),
+            stop: stop.clone(),
+            used: AtomicBool::new(false),
+        };
+        let down = TouchEvent {
+            action: TouchAction::Down,
+            x: 1,
+            y: 2,
+        };
+        dispatch.send(down);
+        dispatch.send(TouchEvent {
+            action: TouchAction::Up,
+            ..down
+        });
+        assert!(stop.load(Ordering::Acquire));
+        assert!(dispatch.error.lock().unwrap().is_some());
+        assert_eq!(rx.try_recv().unwrap(), down);
+        dispatch.send(down);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn closed_touch_consumer_stops_session() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let stop = Arc::new(AtomicBool::new(false));
+        let dispatch = TouchDispatch {
+            tx,
+            error: Mutex::new(None),
+            stop: stop.clone(),
+            used: AtomicBool::new(false),
+        };
+        dispatch.send(TouchEvent {
+            action: TouchAction::Down,
+            x: 0,
+            y: 0,
+        });
+        assert!(stop.load(Ordering::Acquire));
+        assert!(dispatch.error.lock().unwrap().is_some());
+    }
+    #[test]
+    fn only_used_channel_closure_stops_session() {
+        let (tx, _rx) = mpsc::channel(1);
+        let stop = Arc::new(AtomicBool::new(false));
+        let dispatch = TouchDispatch {
+            tx,
+            error: Mutex::new(None),
+            stop: stop.clone(),
+            used: AtomicBool::new(false),
+        };
+        dispatch.channel_closed(false);
+        assert!(!stop.load(Ordering::Acquire));
+        dispatch.channel_closed(true);
+        assert!(stop.load(Ordering::Acquire));
+        assert!(dispatch.error.lock().unwrap().is_some());
+    }
 
     #[test]
     fn bitrate_modes_respect_settings_and_override() {

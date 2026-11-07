@@ -2,8 +2,8 @@ use crate::models::*;
 use crate::state::AppState;
 use crate::theme::Theme;
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::Icon;
+use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::*;
 
 pub struct NotificationView;

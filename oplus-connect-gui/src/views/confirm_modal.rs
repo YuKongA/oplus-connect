@@ -1,7 +1,7 @@
+use crate::RootView;
 use crate::client::DaemonClient;
 use crate::models::ConnectionRequest;
 use crate::theme::Theme;
-use crate::RootView;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::{Disableable, WindowExt};
 use gpui_kit::*;

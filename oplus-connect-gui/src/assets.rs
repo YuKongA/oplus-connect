@@ -3,7 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use gpui_kit::{assets::AllAssets as KitAssets, AssetSource, SharedString};
+use gpui_kit::{AssetSource, SharedString, assets::AllAssets as KitAssets};
 
 pub struct LocalAssets {
     base_dirs: Vec<PathBuf>,
@@ -127,11 +127,13 @@ mod tests {
         let assets = LocalAssets::new();
         let path = "icons/search.svg";
         assert_eq!(assets.load(path).unwrap(), KitAssets.load(path).unwrap());
-        assert!(assets
-            .list("icons/")
-            .unwrap()
-            .iter()
-            .any(|name| name.as_ref() == path));
+        assert!(
+            assets
+                .list("icons/")
+                .unwrap()
+                .iter()
+                .any(|name| name.as_ref() == path)
+        );
         assert!(assets.load("missing/optional.svg").unwrap().is_none());
     }
 
@@ -149,9 +151,11 @@ mod tests {
 
         assert_eq!(loaded.as_ref(), b"local icon");
         assert!(listed.iter().any(|name| name.as_ref() == "search.svg"));
-        assert!(!listed
-            .iter()
-            .any(|name| name.as_ref() == "icons/search.svg"));
+        assert!(
+            !listed
+                .iter()
+                .any(|name| name.as_ref() == "icons/search.svg")
+        );
         assert!(listed.iter().any(|name| name.as_ref() == "icons/check.svg"));
     }
 

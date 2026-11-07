@@ -2,9 +2,9 @@ use crate::models::*;
 use crate::state::AppState;
 use crate::theme::Theme;
 use gpui_kit::assets::IconName;
+use gpui_kit::component::Icon;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_kit::component::tab::{Tab, TabBar};
-use gpui_kit::component::Icon;
 use gpui_kit::component::{Disableable, Selectable, WindowExt};
 use gpui_kit::*;
 

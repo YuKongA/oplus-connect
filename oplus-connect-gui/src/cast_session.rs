@@ -2,14 +2,14 @@
 //! handed to the GPUI cast window, which sizes itself from the phone's own
 //! resolution.
 use crate::cast_media::{
-    probe_config, spawn_receiver, MediaEvent, MediaReceiver, ReceiverConfig, SignalingMessage,
-    VideoFrame,
+    MediaEvent, MediaReceiver, ReceiverConfig, SignalingMessage, VideoFrame, probe_config,
+    spawn_receiver,
 };
 use crate::client::CastRequestRejected;
 use crate::client::DaemonClient;
 use crate::state::{CastEvent, CastIncoming, CastPhase};
-use anyhow::{anyhow, Context, Result};
-use serde_json::{json, Value};
+use anyhow::{Context, Result, anyhow};
+use serde_json::{Value, json};
 use std::{collections::HashMap, time::Duration};
 use tokio::sync::{mpsc, watch};
 
@@ -557,7 +557,7 @@ fn is_remote_disconnect(payload: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{signaling_to_json, SignalingMessage};
+    use super::{SignalingMessage, signaling_to_json};
     use serde_json::json;
 
     #[test]

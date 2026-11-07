@@ -1,5 +1,5 @@
 use gpui_kit::component::{Theme as KitTheme, ThemeMode};
-use gpui_kit::{rgb, rgba, App, Hsla};
+use gpui_kit::{App, Hsla, rgb, rgba};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Neutral palette aligned with GPUI Kit's default theme. Kit owns component

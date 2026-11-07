@@ -9,8 +9,8 @@ pub mod window_frame;
 use crate::models::NavTab;
 use crate::state::AppState;
 use crate::theme::Theme;
-use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::component::WindowExt;
+use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::*;
 
 pub struct MainContainer;

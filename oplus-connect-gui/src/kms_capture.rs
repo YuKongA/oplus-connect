@@ -6,13 +6,13 @@
 
 use std::{collections::HashSet, os::unix::net::UnixStream, time::Duration};
 
-use anyhow::{anyhow, bail, ensure, Context, Result};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use ashpd::desktop::{
+    Session,
     input_capture::{
         ActivatedBarrier, Barrier, BarrierID, Capabilities, InputCapture, ReleaseOptions,
         StartOptions, Zones,
     },
-    Session,
 };
 use futures_util::StreamExt;
 use reis::{
@@ -21,7 +21,7 @@ use reis::{
 };
 use tokio::{
     sync::{mpsc, watch},
-    time::{timeout, Instant},
+    time::{Instant, timeout},
 };
 
 use crate::kms_settings::ExitDirection;
@@ -136,7 +136,7 @@ async fn register_host_app(connection: &zbus::Connection) -> Result<()> {
     )
     .await
     .context("Connecting to host application registry")?;
-    let options = std::collections::HashMap::<&str, zbus::zvariant::Value<'_>>::new();
+    let options = std::collections::HashMap::<&str, zbus::Variant<'_>>::new();
     registry
         .call_method("Register", &("oplus-connect", options))
         .await
@@ -465,7 +465,7 @@ async fn capture_events(
 ) -> Result<()> {
     let mut activated = portal.receive_activated().await?;
     let mut deactivated = portal.receive_deactivated().await?;
-    let capabilities = Capabilities::Keyboard | Capabilities::Pointer;
+    let capabilities = Capabilities::KEYBOARD | Capabilities::POINTER;
     let response = portal
         .start(
             session,
@@ -800,12 +800,14 @@ mod tests {
             pct_y: 0.5,
         };
         assert!(order.return_activation(request).is_none());
-        assert!(order
-            .return_activation(ReturnRequest {
-                activation: 11,
-                ..request
-            })
-            .is_some());
+        assert!(
+            order
+                .return_activation(ReturnRequest {
+                    activation: 11,
+                    ..request
+                })
+                .is_some()
+        );
     }
 
     #[test]

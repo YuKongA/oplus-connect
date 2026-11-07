@@ -1,7 +1,7 @@
 //! Linux evdev inputs translated to the captured Windows KMS wire vocabulary.
 use crate::kms_capture::CaptureEvent;
 use oplus_connect_daemon::kms::input::InputEvent;
-use smallvec::{smallvec, SmallVec};
+use smallvec::{SmallVec, smallvec};
 
 #[derive(Default)]
 pub struct InputMapper {
@@ -204,9 +204,11 @@ mod tests {
     #[test]
     fn preserves_fractional_motion_and_resets_on_new_capture() {
         let mut mapper = InputMapper::default();
-        assert!(mapper
-            .translate(&CaptureEvent::Motion { dx: 0.6, dy: -0.4 })
-            .is_empty());
+        assert!(
+            mapper
+                .translate(&CaptureEvent::Motion { dx: 0.6, dy: -0.4 })
+                .is_empty()
+        );
         assert_eq!(
             mapper
                 .translate(&CaptureEvent::Motion { dx: 0.6, dy: -0.8 })
@@ -217,9 +219,11 @@ mod tests {
             }]
         );
         mapper.reset();
-        assert!(mapper
-            .translate(&CaptureEvent::Motion { dx: 0.9, dy: -0.9 })
-            .is_empty());
+        assert!(
+            mapper
+                .translate(&CaptureEvent::Motion { dx: 0.9, dy: -0.9 })
+                .is_empty()
+        );
     }
 
     #[test]
@@ -329,11 +333,13 @@ mod tests {
                 pressed: true
             }]
         );
-        assert!(mapper
-            .translate(&CaptureEvent::Button {
-                code: 0x117,
-                pressed: true
-            })
-            .is_empty());
+        assert!(
+            mapper
+                .translate(&CaptureEvent::Button {
+                    code: 0x117,
+                    pressed: true
+                })
+                .is_empty()
+        );
     }
 }

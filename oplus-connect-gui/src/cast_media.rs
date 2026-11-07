@@ -4,7 +4,7 @@
 //! Video is decoded with VA-API (H.264 or H.265), scaled in GPU memory and then
 //! copied once into BGRA buffers that the GPUI cast window paints; audio is
 //! Opus decoded straight into the desktop audio sink.
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use gstreamer as gst;
 use gstreamer_sdp as gst_sdp;
 use gstreamer_video::{self as gst_video, prelude::*};
@@ -12,8 +12,8 @@ use gstreamer_webrtc as gst_webrtc;
 use std::{
     collections::VecDeque,
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -236,7 +236,10 @@ pub fn probe_config(config: &ReceiverConfig) -> Result<()> {
         .filter(|name| gst::ElementFactory::find(name).is_none())
         .collect();
     if !missing.is_empty() {
-        bail!("required GStreamer factories unavailable: {}; install WebRTC/libnice, DTLS/SRTP/SCTP, VA video and selected audio plugins; software decoding is not supported", missing.join(", "));
+        bail!(
+            "required GStreamer factories unavailable: {}; install WebRTC/libnice, DTLS/SRTP/SCTP, VA video and selected audio plugins; software decoding is not supported",
+            missing.join(", ")
+        );
     }
     Ok(())
 }
@@ -1173,8 +1176,8 @@ fn run_pipeline(
 #[cfg(test)]
 mod tests {
     use super::{
-        audio_only_without_data, display_size, flush_pending_ice, normalize_offer, offer_mids,
-        packed_bgra, SignalingMessage,
+        SignalingMessage, audio_only_without_data, display_size, flush_pending_ice,
+        normalize_offer, offer_mids, packed_bgra,
     };
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
@@ -1211,7 +1214,9 @@ mod tests {
             "a=mid:audio0\r\na=rtpmap:111 opus/48000/2\r\n",
             "a=rtpmap:111 opus/48000/2\r\na=mid:audio0\r\n",
         ] {
-            let input = format!("v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n{attributes}a=fmtp:111 old=1\r\na=extmap:1 old\r\nm=video 9 UDP/TLS/RTP/SAVPF 100\r\na=mid:video1\r\n");
+            let input = format!(
+                "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n{attributes}a=fmtp:111 old=1\r\na=extmap:1 old\r\nm=video 9 UDP/TLS/RTP/SAVPF 100\r\na=mid:video1\r\n"
+            );
             let output = normalize_offer(&input);
             let (audio, video) = output.split_once("m=video").unwrap();
             assert_eq!(audio.matches("a=fmtp:111 ").count(), 1);
