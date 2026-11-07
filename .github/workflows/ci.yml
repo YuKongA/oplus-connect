@@ -20,7 +20,7 @@ jobs:
         run: pacman -Syu --needed --noconfirm git sudo rust
 
       - name: Check out source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -48,8 +48,8 @@ jobs:
         run: sudo -u builder env HOME=/home/builder cargo test --locked --manifest-path oplus-connect-daemon/Cargo.toml
 
       - name: Upload package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: oplus-connect-arch-x86_64
-          path: '*.pkg.tar.zst'
+          path: "*.pkg.tar.zst"
           if-no-files-found: error
