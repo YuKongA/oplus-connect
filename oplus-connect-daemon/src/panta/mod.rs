@@ -1043,18 +1043,15 @@ mod utc_timestamp_tests {
     }
 }
 
-/// Finds the JSON payload after the binary data-bus header. Searching for the
-/// first `{` alone can hit that byte inside a sequence/id field and parse the
-/// wrong span; prefer the object that owns `dbs_msg_payload`.
+/// Finds the complete JSON object after the binary data-bus header. Header
+/// bytes may contain braces, and braces inside the object may belong to nested
+/// objects or quoted strings, so validate each candidate against the full tail.
 fn payload_json_start(body: &[u8]) -> Option<usize> {
-    const MARKER: &[u8] = b"\"dbs_msg_payload\"";
-    if let Some(position) = body
-        .windows(MARKER.len())
-        .position(|window| window == MARKER)
-    {
-        return body[..position].iter().rposition(|byte| *byte == b'{');
-    }
-    body.iter().position(|byte| *byte == b'{')
+    body.iter().enumerate().find_map(|(position, byte)| {
+        (*byte == b'{'
+            && serde_json::from_slice::<serde::de::IgnoredAny>(&body[position..]).is_ok())
+        .then_some(position)
+    })
 }
 
 /// Pulls the text out of a received `clipboard_data` value.
@@ -1140,7 +1137,7 @@ pub fn expand_cast_tablet_resolution(body: &[u8]) -> Option<(u32, u32)> {
 pub fn notification_fields(
     body: &[u8],
 ) -> Option<(String, String, String, String, Option<String>)> {
-    let start = body.iter().position(|b| *b == b'{')?;
+    let start = payload_json_start(body)?;
     let outer: serde_json::Value = serde_json::from_slice(&body[start..]).ok()?;
     let payload = outer["dbs_msg_payload"].as_str()?;
     let kv: serde_json::Value = serde_json::from_str(payload).ok()?;
@@ -1593,7 +1590,7 @@ pub fn show_desktop_notification(
 
 /// Extracts `(topic, key)` from a decrypted `msg_normal_topic_data` frame.
 pub fn kv_message(body: &[u8]) -> Option<(String, String)> {
-    let start = body.iter().position(|b| *b == b'{')?;
+    let start = payload_json_start(body)?;
     let value: serde_json::Value = serde_json::from_slice(&body[start..]).ok()?;
     if value["dbs_msg_type"] != "msg_normal_topic_data" {
         return None;
@@ -1605,6 +1602,47 @@ pub fn kv_message(body: &[u8]) -> Option<(String, String)> {
     let inner: serde_json::Value = serde_json::from_str(payload).ok()?;
     let key = inner["key"].as_str()?.to_string();
     Some((topic, key))
+}
+fn tablet_share_request(body: &[u8], device_id: Option<[u8; 6]>, category: u8) -> Option<String> {
+    let device_id = device_id.filter(|_| category == 10)?;
+    let start = payload_json_start(body)?;
+    let envelope: serde_json::Value = serde_json::from_slice(&body[start..]).ok()?;
+    if envelope["dbs_msg_type"] != "msg_normal_topic_data"
+        || envelope["dbs_msg_topic"]["dbs_topic_name"] != "Oplus_MacConnect"
+    {
+        return None;
+    }
+    let payload: serde_json::Value =
+        serde_json::from_str(envelope["dbs_msg_payload"].as_str()?).ok()?;
+    if payload["key"] != "screen_synergy" {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(payload["value"].as_str()?).ok()?;
+    let mode = value["screenShareMode"]
+        .as_u64()
+        .filter(|mode| *mode <= 2)?;
+    Some(serde_json::json!({"event":"tablet_share_request", "device_id":hex(&device_id), "mode":mode}).to_string())
+}
+
+fn phone_cast_request(body: &[u8], device_id: Option<[u8; 6]>, category: u8) -> Option<String> {
+    let device_id = device_id.filter(|_| category == 8)?;
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&body[payload_json_start(body)?..]).ok()?;
+    if envelope["dbs_msg_type"] != "msg_normal_topic_data"
+        || envelope["dbs_msg_topic"]["dbs_topic_name"] != "Oplus_MacConnect"
+    {
+        return None;
+    }
+    let payload: serde_json::Value =
+        serde_json::from_str(envelope["dbs_msg_payload"].as_str()?).ok()?;
+    if payload["key"] != "phone_start_mirror" {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(payload["value"].as_str()?).ok()?;
+    if value["phoneStartMirror"] != true || value["phoneCastMode"] != "0" {
+        return None;
+    }
+    Some(serde_json::json!({"event":"phone_cast_request", "device_id":hex(&device_id)}).to_string())
 }
 
 /// `msg_normal_topic_data` envelope the official PC uses for KV messages on a
@@ -1833,6 +1871,7 @@ async fn run_session<F, Fut>(
     let mut ksc: Option<Vec<u8>> = None;
     let mut peer_device_id: Option<[u8; 6]> = None;
     let mut authenticated_device_id: Option<[u8; 6]> = None;
+    let mut authenticated_category = 0;
     let mut pending_auth_device_id: Option<[u8; 6]> = None;
     let mut link_info_sent = false;
     let mut agent_answered = false;
@@ -2230,11 +2269,11 @@ async fn run_session<F, Fut>(
                         break;
                     };
                     match command {
-                        crate::expand_cast::control::BusCommand::Start { reply } => {
+                        crate::expand_cast::control::BusCommand::Start { mode, reply } => {
                             if reply.is_closed() {
                                 continue;
                             }
-                            match controller.start().await {
+                            match controller.start(mode).await {
                                 Ok(publication) => {
                                     bus_topics.expand_cast = true;
                                     for (route_head, json) in [
@@ -2345,7 +2384,7 @@ async fn run_session<F, Fut>(
                         crate::expand_cast::control::BusCommand::Status { reply } => {
                             let _ = reply.send(controller.status());
                         }
-                        crate::expand_cast::control::BusCommand::Start { reply } => {
+                        crate::expand_cast::control::BusCommand::Start { reply, .. } => {
                             let _ = reply.send(Err(reason.clone()));
                         }
                         crate::expand_cast::control::BusCommand::Stop { reply } => {
@@ -2373,6 +2412,19 @@ async fn run_session<F, Fut>(
             if state.take_disconnect_request(*token).await {
                 info!("panta[{}]: closing session on user request", peer);
                 return;
+            }
+        }
+        if let Some(peer_id) = peer_device_id {
+            if local_session_confirmed
+                && last_heartbeat.elapsed() >= std::time::Duration::from_secs(5)
+            {
+                last_heartbeat = std::time::Instant::now();
+                let frame =
+                    build_data_bus_with(local_session, our_id, peer_id, 0x51, HEARTBEAT_JSON);
+                if let Err(error) = write_frame(&mut sock, &frame).await {
+                    warn!("panta[{}]: cannot send heartbeat: {}", peer, error);
+                    return;
+                }
             }
         }
         // Idle for 700 ms = a chance to mirror local clipboard changes; a
@@ -2459,22 +2511,6 @@ async fn run_session<F, Fut>(
                             );
                         }
                     }
-                    if local_session_confirmed
-                        && last_heartbeat.elapsed() >= std::time::Duration::from_secs(5)
-                    {
-                        last_heartbeat = std::time::Instant::now();
-                        let frame = build_data_bus_with(
-                            local_session,
-                            our_id,
-                            peer_id,
-                            0x51,
-                            HEARTBEAT_JSON,
-                        );
-                        if let Err(error) = write_frame(&mut sock, &frame).await {
-                            warn!("panta[{}]: cannot send heartbeat: {}", peer, error);
-                            return;
-                        }
-                    }
                 }
                 if clipboard_enabled && local_session_confirmed {
                     if let (Some(peer_id), Some(text)) =
@@ -2527,8 +2563,20 @@ async fn run_session<F, Fut>(
         buf.extend_from_slice(&chunk[..read]);
 
         while let Some(body) = take_frame(&mut buf) {
+            let is_business_frame = body.len() > 11
+                && body[2] & 0x04 != 0
+                && decode_transport_header([body[0], body[1]]).is_some_and(|(session, _)| {
+                    accepts_business_session(
+                        session,
+                        &peer_sessions,
+                        local_session,
+                        local_session_confirmed,
+                        oshare_session,
+                        oshare_session_confirmed,
+                    )
+                });
             match body.first().copied() {
-                Some(MSG_EPI_ANSWER) => match parse_answer(&body) {
+                Some(MSG_EPI_ANSWER) if !is_business_frame => match parse_answer(&body) {
                     Some(answer) => {
                         epi_name = answer.friendly_name.clone();
                         epi_type = answer.device_category;
@@ -2614,6 +2662,7 @@ async fn run_session<F, Fut>(
                                 (lifecycle, pending_auth_device_id)
                             {
                                 authenticated_device_id = Some(device_id);
+                                authenticated_category = epi_type;
                                 let device_id = hex(&device_id);
                                 let token = state.attach_data_session(&device_id).await;
                                 if let Ok(local_addr) = sock.local_addr() {
@@ -2793,24 +2842,7 @@ async fn run_session<F, Fut>(
                         );
                     }
                 }
-                Some(_)
-                    if body.get(2).is_some_and(|flags| flags & 0x04 != 0)
-                        && body.len() > 11
-                        && decode_transport_header([body[0], body[1]]).is_some_and(
-                            |(session, _)| {
-                                // Both endpoints' confirmed sessions are valid
-                                // receive keys; direction does not own the id.
-                                accepts_business_session(
-                                    session,
-                                    &peer_sessions,
-                                    local_session,
-                                    local_session_confirmed,
-                                    oshare_session,
-                                    oshare_session_confirmed,
-                                )
-                            },
-                        ) =>
-                {
+                Some(_) if is_business_frame => {
                     // AES-128-GCM; key/iv/aad derived from the KSC plus the
                     // per-frame 8-byte sequence (protocol doc §7.3). Reserved
                     // sessions 1/2/4 are the plaintext OAF control frames.
@@ -2850,6 +2882,34 @@ async fn run_session<F, Fut>(
                                         }
                                     }
                                     if let Some((topic, key)) = kv_message(&plain) {
+                                        if topic == "Oplus_MacConnect"
+                                            && key == "screen_synergy"
+                                            && peer_device_id == authenticated_device_id
+                                        {
+                                            if let Some(event) = tablet_share_request(
+                                                &plain,
+                                                authenticated_device_id,
+                                                authenticated_category,
+                                            ) {
+                                                if let Some(broadcaster) = &event_broadcaster {
+                                                    broadcaster(&event);
+                                                }
+                                            }
+                                        }
+                                        if topic == "Oplus_MacConnect"
+                                            && key == "phone_start_mirror"
+                                            && peer_device_id == authenticated_device_id
+                                        {
+                                            if let Some(event) = phone_cast_request(
+                                                &plain,
+                                                authenticated_device_id,
+                                                authenticated_category,
+                                            ) {
+                                                if let Some(broadcaster) = &event_broadcaster {
+                                                    broadcaster(&event);
+                                                }
+                                            }
+                                        }
                                         info!("panta[{}]: kv {}.{}", peer, topic, key);
                                         if topic
                                             == "Oplus_HeySynergy_PcConnect_SyncNotification_Publisher"
@@ -3044,7 +3104,7 @@ async fn run_session<F, Fut>(
                                                             serde_json::json!({
                                                                 "CaptureChannelInitFail": 0,
                                                                 "DualGpuMismatch": 0,
-                                                                "extMode": 1,
+                                                                "extMode": controller.mode(),
                                                                 "version": "17.20.3"
                                                             }),
                                                         );
@@ -3291,6 +3351,202 @@ async fn run_session<F, Fut>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Preserve the received field order instead of relying on map ordering.
+    fn framed_topic_message(key: &str, value: serde_json::Value) -> Vec<u8> {
+        let payload = serde_json::json!({"key": key, "value": value.to_string()}).to_string();
+        let envelope = format!(
+            r#"{{"dbs_msg_type":"msg_normal_topic_data","dbs_msg_topic":{{"dbs_topic_name":"Oplus_MacConnect","extra":{}}},"dbs_msg_payload":{}}}"#,
+            serde_json::to_string("a \"{}\" and \\ slash").unwrap(),
+            serde_json::to_string(&payload).unwrap()
+        );
+        let mut body = b"\0{header \"dbs_msg_payload\" \\\" {noise".to_vec();
+        body.extend_from_slice(envelope.as_bytes());
+        body
+    }
+
+    #[test]
+    fn nested_topic_frames_reach_kv_and_request_consumers() {
+        let id = Some([1, 2, 3, 4, 5, 6]);
+        let phone = framed_topic_message(
+            "phone_start_mirror",
+            serde_json::json!({"phoneStartMirror": true, "phoneCastMode": "0", "note": "quote \" and slash \\ { }"}),
+        );
+        assert_eq!(
+            kv_message(&phone),
+            Some(("Oplus_MacConnect".into(), "phone_start_mirror".into()))
+        );
+        let event: serde_json::Value =
+            serde_json::from_str(&phone_cast_request(&phone, id, 8).unwrap()).unwrap();
+        assert_eq!(
+            event,
+            serde_json::json!({"event": "phone_cast_request", "device_id": "010203040506"})
+        );
+
+        let tablet =
+            framed_topic_message("screen_synergy", serde_json::json!({"screenShareMode": 2}));
+        assert_eq!(
+            kv_message(&tablet),
+            Some(("Oplus_MacConnect".into(), "screen_synergy".into()))
+        );
+        let event: serde_json::Value =
+            serde_json::from_str(&tablet_share_request(&tablet, id, 10).unwrap()).unwrap();
+        assert_eq!(
+            event,
+            serde_json::json!({"event": "tablet_share_request", "device_id": "010203040506", "mode": 2})
+        );
+    }
+
+    #[test]
+    fn nested_topic_frames_reach_notification_and_clipboard_consumers() {
+        let notification = framed_topic_message(
+            "HeySynergy_Notification_Add",
+            serde_json::json!({
+                "key": "notice", "label": "App", "contractedTitle": "A \"quoted\" {title}",
+                "contractedContent": "path \\ end"
+            }),
+        );
+        assert_eq!(
+            kv_message(&notification),
+            Some((
+                "Oplus_MacConnect".into(),
+                "HeySynergy_Notification_Add".into()
+            ))
+        );
+        assert_eq!(
+            notification_fields(&notification),
+            Some((
+                "notice".into(),
+                "App".into(),
+                "A \"quoted\" {title}".into(),
+                "path \\ end".into(),
+                None
+            ))
+        );
+
+        let clipboard = framed_topic_message(
+            "clipboard_data",
+            serde_json::json!({
+                "data": {"text": {"content": "a {brace}, \"quote\" and \\ slash"}}
+            }),
+        );
+        assert_eq!(
+            clipboard_text_from(std::str::from_utf8(&clipboard).unwrap()).as_deref(),
+            Some("a {brace}, \"quote\" and \\ slash")
+        );
+        let enabled =
+            framed_topic_message("clipboard_state_active", serde_json::json!({"state": 1}));
+        assert_eq!(clipboard_enabled_from(&enabled), Some(true));
+    }
+
+    #[test]
+    fn payload_boundary_rejects_truncated_or_trailing_json() {
+        assert_eq!(
+            payload_json_start(b"{header {\"dbs_msg_payload\":\"broken\""),
+            None
+        );
+        assert_eq!(
+            payload_json_start(b"{header {\"dbs_msg_payload\":\"ok\"} trailing"),
+            None
+        );
+        assert_eq!(
+            payload_json_start(b"{noise {\"value\":\"escaped \\\"{\\\"\"}  "),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn phone_mirror_request_requires_authenticated_phone_and_observed_mode() {
+        let id = Some([0xc7, 0x7c, 0x70, 0x2e, 0xc0, 0x21]);
+        let message = |topic: &str, key: &str, value: serde_json::Value| {
+            topic_data_json(
+                topic,
+                &serde_json::json!({"key": key, "value": value.to_string()}).to_string(),
+            )
+        };
+        let request = message(
+            "Oplus_MacConnect",
+            "phone_start_mirror",
+            serde_json::json!({"phoneStartMirror":true,"phoneCastMode":"0"}),
+        );
+        let event: serde_json::Value =
+            serde_json::from_str(&phone_cast_request(request.as_bytes(), id, 8).unwrap()).unwrap();
+        assert_eq!(
+            event,
+            serde_json::json!({"event":"phone_cast_request", "device_id":"c77c702ec021"})
+        );
+        assert!(phone_cast_request(request.as_bytes(), None, 8).is_none());
+        assert!(phone_cast_request(request.as_bytes(), id, 10).is_none());
+        for value in [
+            serde_json::json!({"phoneStartMirror":false,"phoneCastMode":"0"}),
+            serde_json::json!({"phoneStartMirror":true,"phoneCastMode":"1"}),
+            serde_json::json!({"phoneStartMirror":true,"phoneCastMode":0}),
+            serde_json::json!({"phoneStartMirror":true}),
+        ] {
+            let request = message("Oplus_MacConnect", "phone_start_mirror", value);
+            assert!(phone_cast_request(request.as_bytes(), id, 8).is_none());
+        }
+        let wrong_topic = message(
+            "Oplus_Cast",
+            "phone_start_mirror",
+            serde_json::json!({"phoneStartMirror":true,"phoneCastMode":"0"}),
+        );
+        assert!(phone_cast_request(wrong_topic.as_bytes(), id, 8).is_none());
+    }
+
+    #[test]
+    fn tablet_share_requests_require_authenticated_tablet_and_exact_envelope() {
+        let id = Some([1, 2, 3, 4, 5, 6]);
+        let make = |topic: &str, key: &str, value: serde_json::Value| {
+            topic_data_json(
+                topic,
+                &serde_json::json!({"key": key, "value": value.to_string()}).to_string(),
+            )
+        };
+        for mode in 0..=2 {
+            let message = make(
+                "Oplus_MacConnect",
+                "screen_synergy",
+                serde_json::json!({"screenShareMode": mode, "private": "ignored"}),
+            );
+            let event: serde_json::Value =
+                serde_json::from_str(&tablet_share_request(message.as_bytes(), id, 10).unwrap())
+                    .unwrap();
+            assert_eq!(
+                event,
+                serde_json::json!({"event":"tablet_share_request", "device_id":"010203040506", "mode":mode})
+            );
+            assert!(tablet_share_request(message.as_bytes(), None, 10).is_none());
+            assert!(tablet_share_request(message.as_bytes(), id, 8).is_none());
+        }
+        for mode in [
+            serde_json::json!(-1),
+            serde_json::json!(3),
+            serde_json::json!(1.0),
+            serde_json::json!("1"),
+            serde_json::Value::Null,
+        ] {
+            let message = make(
+                "Oplus_MacConnect",
+                "screen_synergy",
+                serde_json::json!({"screenShareMode":mode}),
+            );
+            assert!(tablet_share_request(message.as_bytes(), id, 10).is_none());
+        }
+        for (topic, key) in [
+            ("Oplus_MacConnect_other", "screen_synergy"),
+            ("Oplus_MacConnect", "Screen_synergy"),
+        ] {
+            let message = make(topic, key, serde_json::json!({"screenShareMode":1}));
+            assert!(tablet_share_request(message.as_bytes(), id, 10).is_none());
+        }
+        assert!(tablet_share_request(b"not json", id, 10).is_none());
+        let malformed = topic_data_json(
+            "Oplus_MacConnect",
+            r#"{"key":"screen_synergy","value":"{"}"#,
+        );
+        assert!(tablet_share_request(malformed.as_bytes(), id, 10).is_none());
+    }
 
     #[test]
     fn cast_and_kms_topic_ownership_compose_in_both_stop_orders() {

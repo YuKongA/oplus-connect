@@ -198,9 +198,17 @@ pub enum AppEvent {
     DaemonPolled {
         status: Result<DaemonStatus, String>,
         devices: Result<Vec<DeviceInfo>, String>,
+        devices_requested_at: std::time::Instant,
         remote: Result<Option<RemoteDevicePayload>, String>,
     },
     IpcMessage(serde_json::Value),
+    TabletShareRequest {
+        device: DeviceInfo,
+        mode: u8,
+    },
+    PhoneCastRequest {
+        device: DeviceInfo,
+    },
     Toast(String),
     DaemonStartup(Result<(), String>),
     ConnectionRequestResolved,

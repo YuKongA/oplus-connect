@@ -28,7 +28,7 @@ use gpui_kit::*;
 use models::*;
 use state::{AppState, CastEvent, CastPhase, CastViewState};
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::runtime::Runtime;
@@ -68,6 +68,9 @@ pub struct RootView {
     kms_session: Option<kms_session::KmsSessionHandle>,
     pub expand_cast: expand_cast_session::ExpandCastViewState,
     expand_cast_session: Option<expand_cast_session::ExpandCastSessionHandle>,
+    expand_cast_mode: Option<u8>,
+    tablet_share_started_at: Option<Instant>,
+    poll_guard: PollGuard,
     cast_session: Option<cast_session::CastSessionHandle>,
     cast_window: Option<WindowHandle<views::cast_window::CastWindow>>,
     cast_frame_size: (u32, u32),
@@ -100,6 +103,49 @@ const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(400);
 const STEADY_POLL_INTERVAL: Duration = Duration::from_secs(2);
 // 25 × 400 ms ≈ 10 s without a single successful /status reply.
 const STARTUP_MAX_ATTEMPTS: u8 = 25;
+// A transient IPC failure is not evidence that an established daemon stopped.
+const DAEMON_MAX_CONSECUTIVE_FAILURES: u8 = 3;
+
+#[derive(Default)]
+struct PollGuard {
+    consecutive_status_failures: u8,
+}
+
+impl PollGuard {
+    // None means that this observation is inconclusive.
+    fn observe_status(&mut self, running: Option<bool>) -> Option<bool> {
+        match running {
+            Some(running) => {
+                self.consecutive_status_failures = 0;
+                Some(running)
+            }
+            None => {
+                self.consecutive_status_failures =
+                    self.consecutive_status_failures.saturating_add(1);
+                (self.consecutive_status_failures >= DAEMON_MAX_CONSECUTIVE_FAILURES)
+                    .then_some(false)
+            }
+        }
+    }
+}
+
+// A request begun before a share started can contain an older device list, even
+// if its response arrives after the tablet's share request was handled.
+fn current_device_snapshot(
+    devices: Result<Vec<DeviceInfo>, String>,
+    requested_at: Instant,
+    share_started_at: Option<Instant>,
+) -> Option<Vec<DeviceInfo>> {
+    devices
+        .ok()
+        .filter(|_| share_started_at.is_none_or(|started_at| requested_at > started_at))
+}
+
+fn tablet_missing(devices: &[DeviceInfo], device_id: &str) -> bool {
+    !devices
+        .iter()
+        .any(|device| device.device_id == device_id && device.is_connected)
+}
 
 impl RootView {
     fn save_expand_cast_settings(
@@ -194,6 +240,9 @@ impl RootView {
             kms_session: None,
             expand_cast: expand_cast_session::ExpandCastViewState::default(),
             expand_cast_session: None,
+            expand_cast_mode: None,
+            tablet_share_started_at: None,
+            poll_guard: PollGuard::default(),
             cast_session: None,
             cast_window: None,
             cast_frame_size: (0, 0),
@@ -257,6 +306,8 @@ impl RootView {
 
     pub fn start_kms(&mut self, device_id: String, cx: &mut Context<Self>) {
         if self.kms.active()
+            || self.expand_cast.active()
+            || self.state.cast.active()
             || !self.state.known_devices.iter().any(|device| {
                 device.device_id == device_id
                     && device.is_connected
@@ -265,6 +316,7 @@ impl RootView {
         {
             return;
         }
+        self.tablet_share_started_at = Some(Instant::now());
         let generation = self.kms.generation.wrapping_add(1);
         self.kms = kms_session::KmsViewState {
             device_id: device_id.clone(),
@@ -335,7 +387,18 @@ impl RootView {
         }
     }
     pub fn start_expand_cast(&mut self, device_id: String, cx: &mut Context<Self>) {
+        self.start_expand_cast_with_mode(device_id, None, cx);
+    }
+
+    fn start_expand_cast_with_mode(
+        &mut self,
+        device_id: String,
+        mode: Option<u8>,
+        cx: &mut Context<Self>,
+    ) {
         if self.expand_cast.active()
+            || self.kms.active()
+            || self.state.cast.active()
             || !self.state.known_devices.iter().any(|device| {
                 device.device_id == device_id
                     && device.is_connected
@@ -344,12 +407,19 @@ impl RootView {
         {
             return;
         }
+        self.tablet_share_started_at = Some(Instant::now());
+        self.expand_cast_mode = mode;
         let generation = self.expand_cast.generation.wrapping_add(1);
         self.expand_cast = expand_cast_session::ExpandCastViewState {
             device_id: device_id.clone(),
             generation,
             phase: expand_cast_session::ExpandCastPhase::Preparing,
-            detail: "正在准备屏幕共享…".into(),
+            detail: match mode {
+                Some(1) => "平板请求扩展屏：等待系统授权并选择虚拟扩展屏…",
+                Some(2) => "平板请求镜像：等待系统授权并选择显示器…",
+                _ => "正在准备屏幕共享…",
+            }
+            .into(),
             width: 2016,
             height: 1344,
         };
@@ -358,6 +428,7 @@ impl RootView {
             device_id,
             tx,
             self.state.expand_cast_settings,
+            mode,
         ));
         cx.spawn(async move |this, app| {
             while let Some(event) = rx.recv().await {
@@ -375,13 +446,16 @@ impl RootView {
                         match event {
                             ExpandCastEvent::Phase(phase) => {
                                 view.expand_cast.phase = phase;
-                                view.expand_cast.detail = match phase {
-                                    ExpandCastPhase::WaitingForTablet => "等待平板连接 / 在系统弹窗中选择「镜像屏幕」或「虚拟扩展屏」…",
-                                    ExpandCastPhase::Streaming => "正在向平板共享屏幕",
-                                    ExpandCastPhase::Stopping => "正在停止共享屏幕…",
+                                view.expand_cast.detail = match (phase, view.expand_cast_mode) {
+                                    (ExpandCastPhase::WaitingForTablet, Some(1)) => "平板请求扩展屏：等待平板连接，请在系统弹窗选择虚拟扩展屏…",
+                                    (ExpandCastPhase::WaitingForTablet, Some(2)) => "平板请求镜像：等待平板连接，请在系统弹窗选择要镜像的显示器…",
+                                    (ExpandCastPhase::WaitingForTablet, _) => "等待平板连接，请在系统弹窗选择要共享的显示器…",
+                                    (ExpandCastPhase::Streaming, Some(1)) => "扩展屏源已授权，正在启动推流（实际显示效果取决于系统）",
+                                    (ExpandCastPhase::Streaming, Some(2)) => "显示器源已授权，正在启动镜像推流",
+                                    (ExpandCastPhase::Streaming, _) => "屏幕共享推流已启动",
+                                    (ExpandCastPhase::Stopping, _) => "正在停止共享屏幕…",
                                     _ => "正在准备屏幕共享…",
-                                }
-                                .into();
+                                }.into();
                             }
                             ExpandCastEvent::Resolution(w, h) => {
                                 view.expand_cast.width = w;
@@ -422,6 +496,8 @@ impl RootView {
 
     pub fn start_cast(&mut self, device_id: String, cx: &mut Context<Self>) {
         if self.state.cast.active()
+            || self.kms.active()
+            || self.expand_cast.active()
             || !self.state.known_devices.iter().any(|device| {
                 device.device_id == device_id
                     && device.is_connected
@@ -610,6 +686,7 @@ impl RootView {
 
         TOKIO_RT.spawn(async move {
             loop {
+                let devices_requested_at = Instant::now();
                 let status = client.get_status().await.map_err(|e| e.to_string());
                 let reachable = status.is_ok();
                 let devices = client.get_devices().await.map_err(|e| e.to_string());
@@ -619,6 +696,7 @@ impl RootView {
                     .send(AppEvent::DaemonPolled {
                         status,
                         devices,
+                        devices_requested_at,
                         remote,
                     })
                     .await
@@ -657,7 +735,62 @@ impl RootView {
                             }
 
                             if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                                if tx.send(AppEvent::IpcMessage(val)).await.is_err() {
+                                let event = if val.get("event").and_then(|event| event.as_str())
+                                    == Some("tablet_share_request")
+                                {
+                                    let Some(id) = val
+                                        .get("device_id")
+                                        .and_then(|id| id.as_str())
+                                        .filter(|id| !id.is_empty())
+                                    else {
+                                        continue;
+                                    };
+                                    let Some(mode @ 0..=2) =
+                                        val.get("mode").and_then(|mode| mode.as_u64())
+                                    else {
+                                        continue;
+                                    };
+                                    let Ok(devices) = DaemonClient::new().get_devices().await
+                                    else {
+                                        continue;
+                                    };
+                                    let Some(device) = devices.into_iter().find(|device| {
+                                        device.device_id.eq_ignore_ascii_case(id)
+                                            && device.is_connected
+                                            && device.device_type == "tablet"
+                                    }) else {
+                                        continue;
+                                    };
+                                    AppEvent::TabletShareRequest {
+                                        device,
+                                        mode: mode as u8,
+                                    }
+                                } else if val.get("event").and_then(|event| event.as_str())
+                                    == Some("phone_cast_request")
+                                {
+                                    let Some(id) = val
+                                        .get("device_id")
+                                        .and_then(|id| id.as_str())
+                                        .filter(|id| !id.is_empty())
+                                    else {
+                                        continue;
+                                    };
+                                    let Ok(devices) = DaemonClient::new().get_devices().await
+                                    else {
+                                        continue;
+                                    };
+                                    let Some(device) = devices.into_iter().find(|device| {
+                                        device.device_id.eq_ignore_ascii_case(id)
+                                            && device.is_connected
+                                            && device.device_type == "phone"
+                                    }) else {
+                                        continue;
+                                    };
+                                    AppEvent::PhoneCastRequest { device }
+                                } else {
+                                    AppEvent::IpcMessage(val)
+                                };
+                                if tx.send(event).await.is_err() {
                                     return;
                                 }
                             }
@@ -677,18 +810,31 @@ impl RootView {
             AppEvent::DaemonPolled {
                 status,
                 devices,
+                devices_requested_at,
                 remote,
             } => {
                 let mut changed = false;
-                if let Ok(st) = status {
+                let share_started_at = if self.kms.active() || self.expand_cast.active() {
+                    self.tablet_share_started_at
+                } else {
+                    None
+                };
+                let current_poll =
+                    share_started_at.is_none_or(|started_at| devices_requested_at > started_at);
+                let running = if current_poll {
+                    let observation =
+                        status.as_ref().ok().map(|st| st.running).or_else(|| {
+                            (self.state.daemon_running && devices.is_ok()).then_some(true)
+                        });
+                    self.poll_guard.observe_status(observation)
+                } else {
+                    None
+                };
+                if status.is_ok() {
                     // /status is the only proof that startup finished.
                     self.state.daemon_startup_failures = 0;
                     if self.state.daemon_starting {
                         self.state.daemon_starting = false;
-                        changed = true;
-                    }
-                    if self.state.daemon_running != st.running {
-                        self.state.daemon_running = st.running;
                         changed = true;
                     }
                 } else {
@@ -701,22 +847,32 @@ impl RootView {
                             changed = true;
                         }
                     }
-                    if self.state.daemon_running {
-                        self.state.daemon_running = false;
+                }
+                if let Some(running) = running {
+                    if self.state.daemon_running != running {
+                        self.state.daemon_running = running;
                         changed = true;
                     }
                 }
-                if !self.state.daemon_running && self.kms.active() {
+                if running == Some(false) && self.kms.active() {
                     self.stop_kms(cx);
                     changed = true;
                 }
+                if running == Some(false) && self.expand_cast.active() {
+                    self.stop_expand_cast(cx);
+                    changed = true;
+                }
 
-                if let Ok(dev_list) = devices {
-                    if self.kms.active()
-                        && !dev_list.iter().any(|device| {
-                            device.device_id == self.kms.device_id && device.is_connected
-                        })
+                if let Some(dev_list) =
+                    current_device_snapshot(devices, devices_requested_at, share_started_at)
+                {
+                    if self.expand_cast.active()
+                        && tablet_missing(&dev_list, &self.expand_cast.device_id)
                     {
+                        self.stop_expand_cast(cx);
+                        changed = true;
+                    }
+                    if self.kms.active() && tablet_missing(&dev_list, &self.kms.device_id) {
                         self.stop_kms(cx);
                         changed = true;
                     }
@@ -782,6 +938,53 @@ impl RootView {
                     }
                 }
                 changed
+            }
+            AppEvent::PhoneCastRequest { device } => {
+                let device_id = device.device_id.clone();
+                self.state.remember_connected_device(&device);
+                if self.state.cast.active() && self.state.cast.device_id == device_id {
+                    return false;
+                }
+                if self.state.cast.active() || self.kms.active() || self.expand_cast.active() {
+                    self.state
+                        .set_toast("手机请求投屏，但已有会话正在进行或停止中，请先结束该会话");
+                    return true;
+                }
+                self.state.set_toast("手机请求投屏，正在启动…");
+                self.start_cast(device_id, cx);
+                true
+            }
+            AppEvent::TabletShareRequest { device, mode } => {
+                let device_id = device.device_id.clone();
+                self.state.remember_connected_device(&device);
+                let duplicate = if mode == 0 {
+                    self.kms.active() && self.kms.device_id == device_id
+                } else {
+                    self.expand_cast.active()
+                        && self.expand_cast.device_id == device_id
+                        && self.expand_cast_mode == Some(mode)
+                };
+                if duplicate {
+                    return false;
+                }
+                if self.kms.active() || self.expand_cast.active() || self.state.cast.active() {
+                    self.state
+                        .set_toast("平板请求共享，但已有会话正在进行或停止中，请先结束该会话");
+                    return true;
+                }
+                if mode == 0 {
+                    self.state
+                        .set_toast("平板请求键鼠共享，请在系统弹窗中授权捕获键鼠");
+                    self.start_kms(device_id, cx);
+                } else {
+                    self.state.set_toast(if mode == 1 {
+                        "平板请求扩展屏，请在系统弹窗中授权并选择虚拟扩展屏"
+                    } else {
+                        "平板请求镜像，请在系统弹窗中授权并选择显示器"
+                    });
+                    self.start_expand_cast_with_mode(device_id, Some(mode), cx);
+                }
+                true
             }
             AppEvent::IpcMessage(val) => {
                 let req_data = if val
@@ -931,6 +1134,12 @@ impl RootView {
                             .map_or(true, |id| id == self.kms.device_id)
                         {
                             self.stop_kms(cx);
+                        }
+                        if disconnected_id
+                            .as_deref()
+                            .map_or(true, |id| id == self.expand_cast.device_id)
+                        {
+                            self.stop_expand_cast(cx);
                         }
                         self.state
                             .mark_device_disconnected(disconnected_id.as_deref());
@@ -1129,5 +1338,79 @@ impl Render for RootView {
             window,
             cx,
         )
+    }
+}
+
+#[cfg(test)]
+mod polling_tests {
+    use super::{
+        current_device_snapshot, tablet_missing, PollGuard, DAEMON_MAX_CONSECUTIVE_FAILURES,
+    };
+    use crate::models::DeviceInfo;
+    use crate::state::AppState;
+    use std::time::{Duration, Instant};
+
+    fn tablet(id: &str, connected: bool) -> DeviceInfo {
+        DeviceInfo {
+            device_id: id.into(),
+            device_type: "tablet".into(),
+            is_connected: connected,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn status_failure_is_transient_but_repeated_failure_stops_sharing() {
+        let mut guard = PollGuard::default();
+        assert_eq!(guard.observe_status(Some(true)), Some(true));
+        assert_eq!(guard.observe_status(None), None);
+        assert_eq!(guard.observe_status(Some(true)), Some(true));
+        for _ in 1..DAEMON_MAX_CONSECUTIVE_FAILURES {
+            assert_eq!(guard.observe_status(None), None);
+        }
+        assert_eq!(guard.observe_status(None), Some(false));
+        assert_eq!(guard.observe_status(Some(true)), Some(true));
+        assert_eq!(guard.observe_status(None), None);
+        assert_eq!(guard.observe_status(Some(false)), Some(false));
+        assert_eq!(guard.observe_status(None), None);
+    }
+
+    #[test]
+    fn stale_snapshot_cannot_stop_new_share_or_mark_tablet_offline() {
+        let start = Instant::now();
+        let before = start - Duration::from_millis(1);
+        let after = start + Duration::from_millis(1);
+        let mut state = AppState::new();
+        state.remember_connected_device(&tablet("tablet-1", true));
+
+        // The request began before the share but its empty response arrived later.
+        let stale = current_device_snapshot(Ok(vec![]), before, Some(start));
+        assert!(stale.is_none());
+        assert!(state.known_devices[0].is_connected);
+        assert!(current_device_snapshot(Ok(vec![]), start, Some(start)).is_none());
+        assert!(current_device_snapshot(Err("unavailable".into()), after, Some(start)).is_none());
+
+        let connected =
+            current_device_snapshot(Ok(vec![tablet("tablet-1", true)]), after, Some(start))
+                .unwrap();
+        assert!(!tablet_missing(&connected, "tablet-1"));
+        state.sync_known_devices(&connected);
+        assert!(state.known_devices[0].is_connected);
+
+        // A fresh snapshot is authoritative, including an explicitly offline
+        // entry or an empty list; genuine disconnects must stop the share.
+        let offline =
+            current_device_snapshot(Ok(vec![tablet("tablet-1", false)]), after, Some(start))
+                .unwrap();
+        assert!(tablet_missing(&offline, "tablet-1"));
+        let missing = current_device_snapshot(Ok(vec![]), after, Some(start)).unwrap();
+        assert!(tablet_missing(&missing, "tablet-1"));
+        state.sync_known_devices(&missing);
+        assert!(!state.known_devices[0].is_connected);
+
+        // A later share must not accept a snapshot from the preceding one.
+        let restarted = after + Duration::from_millis(1);
+        assert!(current_device_snapshot(Ok(missing), after, Some(restarted)).is_none());
+        assert!(current_device_snapshot(Ok(vec![]), before, None).is_some());
     }
 }

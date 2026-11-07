@@ -204,6 +204,8 @@ impl DeviceDetailView {
                         .primary()
                         .disabled(
                             (state.cast.active() && !casting)
+                                || kms.active()
+                                || expand_cast.active()
                                 || state.cast.phase == CastPhase::Stopping,
                         )
                         .label(cast_label)
@@ -234,6 +236,7 @@ impl DeviceDetailView {
                         .disabled(
                             (kms.active() && !sharing)
                                 || kms.phase == KmsPhase::Stopping
+                                || state.cast.active()
                                 || expand_cast.active(),
                         )
                         .label(label)
@@ -263,6 +266,7 @@ impl DeviceDetailView {
                         .disabled(
                             (expand_cast.active() && !ext_active)
                                 || expand_cast.phase == ExpandCastPhase::Stopping
+                                || state.cast.active()
                                 || kms.active(),
                         )
                         .label(ext_label)

@@ -1,6 +1,6 @@
 //! Independent tablet keyboard/mouse sharing lifecycle; no video session is involved.
 use crate::{
-    client::DaemonClient,
+    client::{CastRequestRejected, DaemonClient},
     kms_capture::{self, CaptureEvent},
     kms_input::InputMapper,
 };
@@ -125,6 +125,21 @@ async fn cancelled(cancel: &mut watch::Receiver<bool>) {
     }
 }
 
+// Only the daemon's exact rejection for a generation-bound operation means
+// the peer disconnected. Context and unrelated errors must remain visible.
+fn connection_result<T>(result: Result<T>) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error)
+            if error
+                .downcast_ref::<CastRequestRejected>()
+                .is_some_and(|rejection| rejection.0 == "KMS connection ID is stale") =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
 async fn request<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
     tokio::time::timeout(REQUEST_TIMEOUT, future)
         .await
@@ -271,7 +286,8 @@ async fn run_session(
                 // matching deactivation arrives.
                 _ = return_poll.tick(), if sharing && activation.is_some() && return_sent.is_none() => {
                     let receive_res = tokio::time::timeout(Duration::from_millis(400), client.kms_receive(device_id, id)).await;
-                    let Some((pct_x, pct_y)) = receive_res.unwrap_or(Ok(None))? else { continue; };
+                    let Some(received) = connection_result(receive_res.unwrap_or(Ok(None)))? else { return Ok(()); };
+                    let Some((pct_x, pct_y)) = received else { continue; };
                     let Some(current) = activation else { continue; };
                     if !sharing || activation != Some(current) || return_sent.is_some() { continue; }
                     tracing::debug!(device_id, activation = current, pct_x, pct_y, "kms cross-back return");
@@ -282,13 +298,13 @@ async fn run_session(
                     return_sent = Some(current);
                 },
                 _ = motion_flush.tick(), if sharing && (pending_dx != 0 || pending_dy != 0) => {
-                    flush_motion(&client, device_id, id, &mut pending_dx, &mut pending_dy).await?;
+                    if connection_result(flush_motion(&client, device_id, id, &mut pending_dx, &mut pending_dy).await)?.is_none() { return Ok(()); }
                 },
                 _ = status_poll.tick() => {
                     let status_res = tokio::time::timeout(Duration::from_millis(600), client.kms_status(device_id)).await;
                     if let Ok(Ok(status)) = status_res {
                         if status.connection_id != Some(id) || status.status.as_deref() != Some("connected") {
-                            return Err(anyhow!("平板键鼠连接已改变或断开，请重新启动共享"));
+                            return Ok(());
                         }
                     }
                 },
@@ -318,7 +334,9 @@ async fn run_session(
                             pending_dy = 0;
                             return_tx.send(None).context("系统输入返回通道已退出")?;
                             tracing::debug!(device_id, activation = ?retired, "kms activation returned");
-                            request(client.kms_release(device_id, id)).await.context("释放平板按键失败")?;
+                            if connection_result(request(client.kms_release(device_id, id)).await.context("释放平板按键失败"))?.is_none() {
+                                return Ok(());
+                            }
                             mapper.reset();
                             sharing = false;
                             tracing::debug!(device_id, phase = ?KmsPhase::Armed, "kms phase");
@@ -339,9 +357,9 @@ async fn run_session(
                                 pending_dy = pending_dy.saturating_add(delta_y);
                             }
                             discrete => {
-                                flush_motion(&client, device_id, id, &mut pending_dx, &mut pending_dy).await?;
+                                if connection_result(flush_motion(&client, device_id, id, &mut pending_dx, &mut pending_dy).await)?.is_none() { return Ok(()); }
                                 tracing::debug!(?discrete, "sending discrete event to tablet");
-                                fast_input(&client, device_id, id, &discrete).await?;
+                                if connection_result(fast_input(&client, device_id, id, &discrete).await)?.is_none() { return Ok(()); }
                             }
                         }
                     }
@@ -358,13 +376,15 @@ async fn run_session(
     drop(capture_rx);
     let cleanup = async {
         let release = if let Some(id) = connection_id {
-            tokio::time::timeout(
+            match tokio::time::timeout(
                 Duration::from_millis(1500),
                 client.kms_release(device_id, id),
             )
             .await
-            .map_err(|_| anyhow!("释放平板按键超时"))
-            .and_then(|r| r.context("释放平板按键失败"))
+            {
+                Ok(result) => connection_result(result.context("释放平板按键失败")).map(|_| ()),
+                Err(_) => Err(anyhow!("释放平板按键超时")),
+            }
         } else {
             Ok(())
         };
@@ -390,5 +410,25 @@ fn combine(first: Result<()>, second: Result<()>) -> Result<()> {
         (Err(first), Err(second)) => Err(anyhow!("{first:#}；{second:#}")),
         (Err(error), _) | (_, Err(error)) => Err(error),
         (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_exact_daemon_stale_rejection_is_a_disconnect() {
+        for message in [
+            "KMS connection ID is stale but write failed",
+            "device is not connected",
+            "KMS input queue is full or closed",
+        ] {
+            let error =
+                anyhow::Error::new(CastRequestRejected(message.to_owned())).context("input");
+            assert!(connection_result::<()>(Err(error)).is_err());
+        }
+        assert!(connection_result::<()>(Err(anyhow!("KMS connection ID is stale"))).is_err());
+        assert!(connection_result::<()>(Err(anyhow!("request timed out"))).is_err());
     }
 }

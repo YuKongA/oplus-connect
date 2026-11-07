@@ -191,54 +191,29 @@ fn run_pipeline(
 ) -> Result<()> {
     let pipeline = gst::Pipeline::new();
 
-    // Video Source: the portal-granted PipeWire node when available. `pipewiresrc`
-    // selects a remote node by numeric id through `path`; `target-object` matches
-    // the node *name* and fails with "target not found" for portal node ids.
-    let mut capture: Option<PortalCapture> = None;
-    let (src, is_pipewire) = if let (Some(fd), Some(node)) =
-        (config.pipewire_fd.as_ref(), config.pipewire_node)
-    {
-        // Copy frames before encoding so PipeWire buffers return to the compositor promptly.
-        let pin = if pin_capture {
-            config.capture_width.zip(config.capture_height)
-        } else {
-            None
-        };
-        let mut control = start_portal_capture(Arc::clone(fd), node, pin)?;
-        let appsrc = create_capture_source()?;
-        let pump_src = appsrc
-            .clone()
-            .downcast::<gst_app::AppSrc>()
-            .map_err(|_| anyhow!("appsrc is not an AppSrc"))?;
-        let rx = control.rx.take().context("capture channel")?;
-        std::thread::Builder::new()
-            .name("expand-cast-pump".into())
-            .spawn(move || pump_capture(pump_src, rx))
-            .context("spawning capture pump thread")?;
-        capture = Some(control);
-        (appsrc, true)
-    } else if std::env::var("XDG_SESSION_TYPE").as_deref() == Ok("wayland") {
-        // On Wayland the XWayland root window is an empty black canvas, so an
-        // X11 capture would only ever show the pointer. Surface the real cause.
-        anyhow::bail!("未获得系统屏幕共享授权，无法采集 Wayland 桌面画面");
-    } else if gst::ElementFactory::find("ximagesrc").is_some() && std::env::var("DISPLAY").is_ok() {
-        tracing::info!("Using ximagesrc for direct desktop capture");
-        let src = gst::ElementFactory::make("ximagesrc")
-            .property("use-damage", false)
-            .build()
-            .context("creating ximagesrc element")?;
-        (src, false)
-    } else {
-        tracing::info!("Using videotestsrc pattern for video stream");
-        let src = gst::ElementFactory::make("videotestsrc")
-            .property_from_str("pattern", "ball")
-            .property("is-live", true)
-            .build()
-            .context("creating videotestsrc element")?;
-        (src, false)
+    // The portal node id is passed through `path`, not `target-object`.
+    let (Some(fd), Some(node)) = (config.pipewire_fd.as_ref(), config.pipewire_node) else {
+        anyhow::bail!("未获得系统屏幕共享授权，无法采集屏幕画面");
     };
+    // Copy frames before encoding so PipeWire buffers return to the compositor promptly.
+    let pin = if pin_capture {
+        config.capture_width.zip(config.capture_height)
+    } else {
+        None
+    };
+    let mut capture = start_portal_capture(Arc::clone(fd), node, pin)?;
+    let src = create_capture_source()?;
+    let pump_src = src
+        .clone()
+        .downcast::<gst_app::AppSrc>()
+        .map_err(|_| anyhow!("appsrc is not an AppSrc"))?;
+    let rx = capture.rx.take().context("capture channel")?;
+    std::thread::Builder::new()
+        .name("expand-cast-pump".into())
+        .spawn(move || pump_capture(pump_src, rx))
+        .context("spawning capture pump thread")?;
 
-    let pinned_size = if pin_capture && is_pipewire {
+    let pinned_size = if pin_capture {
         config
             .capture_width
             .zip(config.capture_height)
@@ -622,7 +597,7 @@ fn run_pipeline(
     match wait_for_video_caps(
         video_pad,
         &bus,
-        capture.as_ref(),
+        Some(&capture),
         stop,
         Duration::from_secs(3),
     ) {
@@ -699,7 +674,7 @@ fn run_pipeline(
     let mut reported_send_frames = 0u64;
     let mut logged_capture_caps = false;
     while !stop.load(Ordering::Acquire) {
-        if let Some(error) = capture.as_ref().and_then(PortalCapture::error) {
+        if let Some(error) = capture.error() {
             let _ = pipeline.set_state(gst::State::Null);
             anyhow::bail!("capture pipeline failed: {error}");
         }
@@ -755,7 +730,7 @@ fn run_pipeline(
                     ));
                 }
                 gst::MessageView::Eos(_) => {
-                    if let Some(error) = capture.as_ref().and_then(PortalCapture::error) {
+                    if let Some(error) = capture.error() {
                         let _ = pipeline.set_state(gst::State::Null);
                         anyhow::bail!("capture pipeline failed: {error}");
                     }

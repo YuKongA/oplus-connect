@@ -19,6 +19,7 @@ type Reply<T> = oneshot::Sender<Result<T, String>>;
 
 pub enum BusCommand {
     Start {
+        mode: u8,
         reply: Reply<ExpandCastStatusInfo>,
     },
     Stop {
@@ -102,6 +103,7 @@ pub struct Controller {
     odmf_server: Option<Server>,
     tablet_res: Option<(u32, u32)>,
     active: bool,
+    mode: u8,
 }
 
 impl ExpandCastRegistry {
@@ -147,15 +149,19 @@ impl ExpandCastRegistry {
             odmf_server: None,
             tablet_res: None,
             active: false,
+            mode: 1,
         };
         Some((controller, controller_rx))
     }
 
-    pub async fn start(&self, device_id: &str) -> Result<ExpandCastStatusInfo, String> {
+    pub async fn start(&self, device_id: &str, mode: u8) -> Result<ExpandCastStatusInfo, String> {
+        if !matches!(mode, 1 | 2) {
+            return Err("ExpandCast mode must be 1 or 2".to_string());
+        }
         let sender = self.sender_for(device_id)?;
         let (reply, result) = oneshot::channel();
         sender
-            .send(BusCommand::Start { reply })
+            .send(BusCommand::Start { mode, reply })
             .await
             .map_err(|_| "ExpandCast bus is closed".to_string())?;
         tokio::time::timeout(CONTROL_TIMEOUT, result)
@@ -260,11 +266,13 @@ impl Controller {
         self.receiver.try_recv().ok()
     }
 
-    pub async fn start(&mut self) -> Result<StartPublication, String> {
+    pub async fn start(&mut self, mode: u8) -> Result<StartPublication, String> {
+        if !matches!(mode, 1 | 2) {
+            return Err("ExpandCast mode must be 1 or 2".to_string());
+        }
         if self.active {
             return Err("ExpandCast is already active".to_string());
         }
-        self.active = true;
         self.tablet_res = None;
 
         // Start ODMF TCP signaling server on local_ip:7239
@@ -278,13 +286,15 @@ impl Controller {
             .map_err(|e| format!("Failed to bind ExpandCast ODMF server: {e}"))?;
         let local_addr = server.local_addr();
         self.odmf_server = Some(server);
+        self.active = true;
+        self.mode = mode;
 
         let general_track = expand_cast_dbs_json(
             "pc_general_track",
             json!({
                 "is_arm": 0,
                 "gpu_vendor": "AMD",
-                "extMode": 1,
+                "extMode": mode,
                 "version": "17.20.3"
             }),
         );
@@ -327,6 +337,10 @@ impl Controller {
             general_track,
             pc_device_info,
         })
+    }
+
+    pub fn mode(&self) -> u8 {
+        self.mode
     }
 
     pub async fn stop(&mut self) -> Result<String, String> {
@@ -441,13 +455,33 @@ mod tests {
             .register_bus("TEST_PAD", ip, ip, "OPPO Pad", "Linux-PC", "ABCDEF")
             .unwrap();
 
-        let start_task = tokio::spawn(async move { controller.start().await });
+        let occupied = tokio::net::TcpListener::bind((ip, super::super::EXPAND_CAST_PORT))
+            .await
+            .unwrap();
+        assert!(controller.start(1).await.is_err());
+        drop(occupied);
 
-        let pub_res = start_task.await.unwrap().unwrap();
-        assert_eq!(pub_res.info.status, "waiting_for_tablet");
-        assert!(pub_res.general_track.contains("pc_general_track"));
-        assert!(pub_res.pc_device_info.contains("pc_device_info"));
-        assert!(pub_res.pc_device_info.contains("TEST_PAD"));
+        for mode in [1, 2] {
+            let publication = controller.start(mode).await.unwrap();
+            assert_eq!(publication.info.status, "waiting_for_tablet");
+            assert_eq!(controller.mode(), mode);
+            for (message, field, expected) in [
+                (&publication.general_track, "extMode", mode),
+                (&publication.pc_device_info, "mode", 1),
+            ] {
+                let envelope: serde_json::Value = serde_json::from_str(message).unwrap();
+                let kv: serde_json::Value =
+                    serde_json::from_str(envelope["dbs_msg_payload"].as_str().unwrap()).unwrap();
+                let command: serde_json::Value =
+                    serde_json::from_str(kv["value"].as_str().unwrap()).unwrap();
+                let body: serde_json::Value =
+                    serde_json::from_str(command["msg_body"].as_str().unwrap()).unwrap();
+                assert_eq!(body[field], expected);
+            }
+            controller.stop().await.unwrap();
+        }
+        assert!(controller.start(0).await.is_err());
+        assert!(controller.start(3).await.is_err());
     }
 
     #[test]

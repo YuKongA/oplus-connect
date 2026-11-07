@@ -7,13 +7,9 @@ OPLUS 互联是面向 OPPO / OnePlus 设备的 Linux 原生客户端
 - 连接、管理设备
 - 剪贴板双向同步
 - 手机消息通知镜像
-- 手机投屏：视频、音频与键鼠反控
-- 平板键鼠共享：键鼠双向自由穿梭
-- 平板屏幕共享：电脑端发起，支持镜像屏、虚拟扩展屏、H.264 编码与反向触控
-
-### 尚未实现
-
-- **平板端发起屏幕共享**：目前仅支持从电脑端启动；平板端发起时会停在加载状态。
+- 手机投屏：手机或电脑发起，支持视频、音频与键鼠反控
+- 平板键鼠共享：键鼠双向自由穿梭；平板可主动请求
+- 平板屏幕共享：支持镜像屏、虚拟扩展屏与反向触控
 
 ### 屏幕共享说明
 
@@ -45,15 +41,15 @@ cargo run --release --manifest-path oplus-connect-gui/Cargo.toml
 
 ## 配置
 
-| 环境变量                    | 说明                                                                               |
-| --------------------------- | ---------------------------------------------------------------------------------- |
-| `OPLUS_CONNECT_RUNTIME_DIR` | 指定 daemon 与 GUI 共用的私有 IPC 目录；需要是当前用户所有、权限 `0700` 的绝对路径 |
-| `OPLUS_AUTO_ACCEPT=1`       | 跳过 GUI 审批自动接受连接，仅建议在无头调试时使用                                  |
-| `OPLUS_EXPAND_CAST_PIN_CAPTURE=0` | 关闭「向合成器请求平板采集尺寸」；默认开启，合成器拒绝时自动回退 |
-| `OPLUS_EXPAND_CAST_BITRATE=<kbps>` | 覆盖界面码率并关闭自适应，范围 500–50000 kbps |
-| `OPLUS_EXPAND_CAST_PIPELINE_LATENCY=auto\|<ms>` | 覆盖 pipeline latency；默认 0，`auto` 恢复按元素自动协商 |
-| `OPLUS_EXPAND_CAST_STATS=1` | 每 5 秒打印完整 WebRTC 统计，排查链路问题时使用 |
-| `OPLUS_EXPAND_CAST_FAKE_SINK=1` | 诊断用：编码后本地丢弃，不发送给平板 |
+| 环境变量                                        | 说明                                                                               |
+| ----------------------------------------------- | ---------------------------------------------------------------------------------- |
+| `OPLUS_CONNECT_RUNTIME_DIR`                     | 指定 daemon 与 GUI 共用的私有 IPC 目录；需要是当前用户所有、权限 `0700` 的绝对路径 |
+| `OPLUS_AUTO_ACCEPT=1`                           | 跳过 GUI 审批自动接受连接，仅建议在无头调试时使用                                  |
+| `OPLUS_EXPAND_CAST_PIN_CAPTURE=0`               | 关闭「向合成器请求平板采集尺寸」；默认开启，合成器拒绝时自动回退                   |
+| `OPLUS_EXPAND_CAST_BITRATE=<kbps>`              | 覆盖界面码率并关闭自适应，范围 500–50000 kbps                                      |
+| `OPLUS_EXPAND_CAST_PIPELINE_LATENCY=auto\|<ms>` | 覆盖 pipeline latency；默认 0，`auto` 恢复按元素自动协商                           |
+| `OPLUS_EXPAND_CAST_STATS=1`                     | 每 5 秒打印完整 WebRTC 统计，排查链路问题时使用                                    |
+| `OPLUS_EXPAND_CAST_FAKE_SINK=1`                 | 诊断用：编码后本地丢弃，不发送给平板                                               |
 
 ## 项目结构
 

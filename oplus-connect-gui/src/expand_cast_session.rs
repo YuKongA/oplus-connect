@@ -113,6 +113,7 @@ pub fn start(
     device_id: String,
     events: mpsc::Sender<ExpandCastEvent>,
     settings: ExpandCastSettings,
+    mode: Option<u8>,
 ) -> ExpandCastSessionHandle {
     let (cancel_tx, cancel_rx) = watch::channel(false);
     let (done_tx, done_rx) = watch::channel(false);
@@ -138,7 +139,7 @@ pub fn start(
         let res = if *cancel_worker.borrow() {
             Ok(())
         } else {
-            run_session(&dev_id, &events_clone, cancel_worker, settings).await
+            run_session(&dev_id, &events_clone, cancel_worker, settings, mode).await
         };
         if let Err(err) = res {
             tracing::error!("ExpandCast session failed: {err:#}");
@@ -162,12 +163,13 @@ async fn run_session(
     events: &mpsc::Sender<ExpandCastEvent>,
     mut cancel: watch::Receiver<bool>,
     settings: ExpandCastSettings,
+    mode: Option<u8>,
 ) -> Result<()> {
     let client = DaemonClient::new();
     let _ = events.try_send(ExpandCastEvent::Phase(ExpandCastPhase::Preparing));
 
     let _start_status = client
-        .expand_cast_start(device_id)
+        .expand_cast_start(device_id, mode)
         .await
         .context("启动平板屏幕共享服务失败")?;
 
@@ -227,9 +229,8 @@ async fn run_session(
     };
 
     let _ = events.try_send(ExpandCastEvent::Resolution(tablet_width, tablet_height));
-    let _ = events.try_send(ExpandCastEvent::Phase(ExpandCastPhase::Streaming));
 
-    let mut screencast = match try_acquire_screencast(&mut cancel).await {
+    let mut screencast = match try_acquire_screencast(&mut cancel, mode).await {
         Ok(Some(session)) => {
             tracing::info!(
                 "Acquired portal screencast: node={} fd={}",
@@ -243,8 +244,8 @@ async fn run_session(
             return Ok(());
         }
         Err(err) => {
-            tracing::warn!("Could not acquire portal screencast: {err:#}");
-            None
+            let _ = client.expand_cast_stop(device_id).await;
+            return Err(err).context("无法获得屏幕源授权");
         }
     };
     // The guard keeps the compositor-side session (and thus the PipeWire node)
@@ -306,6 +307,7 @@ async fn run_session(
             return Err(error).context("启动屏幕共享推流管道失败");
         }
     };
+    let _ = events.try_send(ExpandCastEvent::Phase(ExpandCastPhase::Streaming));
 
     // Send SUB_MODE and DISPLAY_RESOLUTION to tablet
     let sub_mode_cmd = serde_json::json!({
@@ -482,8 +484,29 @@ impl ScreencastSession {
     }
 }
 
+fn virtual_source_for_request(
+    mode: Option<u8>,
+    source: Option<ashpd::desktop::screencast::SourceType>,
+    portal_version: u32,
+) -> Result<bool> {
+    use ashpd::desktop::screencast::SourceType;
+    match (mode, source) {
+        (Some(1), Some(SourceType::Virtual)) => Ok(true),
+        (Some(2), Some(SourceType::Monitor)) => Ok(false),
+        // Before v3 the portal cannot report source_type. SelectSources above
+        // requests exactly one type, so that request identifies the source.
+        (Some(1), None) if portal_version < 3 => Ok(true),
+        (Some(2), None) if portal_version < 3 => Ok(false),
+        (None, source) => Ok(source == Some(SourceType::Virtual)),
+        (Some(1), _) => Err(anyhow!("系统未确认选择虚拟扩展屏，无法满足平板扩展请求")),
+        (Some(2), _) => Err(anyhow!("系统未确认选择显示器，无法满足平板镜像请求")),
+        _ => Err(anyhow!("不支持的屏幕共享模式")),
+    }
+}
+
 async fn try_acquire_screencast(
     cancel: &mut watch::Receiver<bool>,
+    mode: Option<u8>,
 ) -> Result<Option<ScreencastSession>> {
     use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};
     use ashpd::enumflags2::BitFlags;
@@ -512,7 +535,10 @@ async fn try_acquire_screencast(
                     portal_session,
                     SelectSourcesOptions::default()
                         .set_cursor_mode(CursorMode::Embedded)
-                        .set_sources(BitFlags::from_flag(SourceType::Monitor))
+                        .set_sources(BitFlags::from_flag(match mode {
+                            Some(1) => SourceType::Virtual,
+                            _ => SourceType::Monitor,
+                        }))
                         .set_multiple(false),
                 )
                 .await
@@ -528,7 +554,7 @@ async fn try_acquire_screencast(
                 .first()
                 .context("no screencast streams in portal response")?;
             let node = stream.pipe_wire_node_id();
-            let virtual_output = matches!(stream.source_type(), Some(SourceType::Virtual));
+            let virtual_output = virtual_source_for_request(mode, stream.source_type(), screencast.version())?;
             let size = stream
                 .size()
                 .and_then(|(w, h)| u32::try_from(w).ok().zip(u32::try_from(h).ok()))
@@ -562,6 +588,16 @@ async fn try_acquire_screencast(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_portal_uses_the_single_requested_source_type() {
+        use ashpd::desktop::screencast::SourceType;
+        assert_eq!(virtual_source_for_request(Some(1), None, 2).unwrap(), true);
+        assert_eq!(virtual_source_for_request(Some(2), None, 2).unwrap(), false);
+        assert!(virtual_source_for_request(Some(1), Some(SourceType::Monitor), 2).is_err());
+        assert!(virtual_source_for_request(Some(2), Some(SourceType::Virtual), 2).is_err());
+        assert!(virtual_source_for_request(Some(2), None, 3).is_err());
+    }
 
     #[tokio::test]
     async fn previous_completion_cannot_clear_replacement() {

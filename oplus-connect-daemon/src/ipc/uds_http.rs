@@ -84,6 +84,18 @@ struct ExpandCastDeviceReq {
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ExpandCastStartReq {
+    device_id: String,
+    #[serde(default = "default_expand_cast_mode")]
+    mode: u8,
+}
+
+fn default_expand_cast_mode() -> u8 {
+    1
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ExpandCastSendReq {
     device_id: String,
     connection_id: u64,
@@ -651,28 +663,54 @@ async fn handle_client(
             }
         }
         ("POST", "/expand_cast/start" | "/expand_cast/status" | "/expand_cast/stop") => {
-            let request = match serde_json::from_str::<ExpandCastDeviceReq>(body) {
-                Ok(request) if !request.device_id.trim().is_empty() => request,
-                _ => {
-                    let response = ApiResponse::error(400, "Malformed expand_cast device request");
-                    return write_response(&mut stream, 400, &serde_json::to_string(&response)?)
+            let (device_id, mode) = if path == "/expand_cast/start" {
+                match serde_json::from_str::<ExpandCastStartReq>(body) {
+                    Ok(request)
+                        if !request.device_id.trim().is_empty()
+                            && matches!(request.mode, 1 | 2) =>
+                    {
+                        (request.device_id, request.mode)
+                    }
+                    _ => {
+                        let response =
+                            ApiResponse::error(400, "Malformed expand_cast start request");
+                        return write_response(
+                            &mut stream,
+                            400,
+                            &serde_json::to_string(&response)?,
+                        )
                         .await;
+                    }
+                }
+            } else {
+                match serde_json::from_str::<ExpandCastDeviceReq>(body) {
+                    Ok(request) if !request.device_id.trim().is_empty() => (request.device_id, 1),
+                    _ => {
+                        let response =
+                            ApiResponse::error(400, "Malformed expand_cast device request");
+                        return write_response(
+                            &mut stream,
+                            400,
+                            &serde_json::to_string(&response)?,
+                        )
+                        .await;
+                    }
                 }
             };
             let result = match path {
                 "/expand_cast/start" => state
                     .expand_cast
-                    .start(&request.device_id)
+                    .start(&device_id, mode)
                     .await
                     .map(|info| serde_json::to_value(info).unwrap()),
                 "/expand_cast/status" => state
                     .expand_cast
-                    .status(&request.device_id)
+                    .status(&device_id)
                     .await
                     .map(|info| serde_json::to_value(info).unwrap()),
                 _ => state
                     .expand_cast
-                    .stop(&request.device_id)
+                    .stop(&device_id)
                     .await
                     .map(|()| serde_json::Value::Null),
             };
@@ -1268,6 +1306,27 @@ mod tests {
             response.starts_with(&format!("HTTP/1.1 {status} ")),
             "{response}"
         );
+    }
+
+    #[tokio::test]
+    async fn expand_cast_start_validates_mode() {
+        let rpc = RpcServer::start();
+        for (body, status) in [
+            (r#"{"device_id":"pad"}"#, 409),
+            (r#"{"device_id":"pad","mode":1}"#, 409),
+            (r#"{"device_id":"pad","mode":2}"#, 409),
+            (r#"{"device_id":"pad","mode":0}"#, 400),
+            (r#"{"device_id":"pad","mode":3}"#, 400),
+            (r#"{"device_id":"pad","mode":null}"#, 400),
+            (r#"{"device_id":"pad","mode":"2"}"#, 400),
+            (r#"{"device_id":"pad","mode":1.0}"#, 400),
+        ] {
+            let request = format!(
+                "POST /expand_cast/start HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            assert_status(&rpc.request(request.as_bytes()).await, status);
+        }
     }
 
     #[tokio::test]

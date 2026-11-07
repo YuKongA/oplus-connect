@@ -348,13 +348,17 @@ impl DaemonClient {
             .await?;
         ensure_ok(&body)
     }
-    pub async fn expand_cast_start(&self, device_id: &str) -> Result<ExpandCastStatus> {
+    pub async fn expand_cast_start(
+        &self,
+        device_id: &str,
+        mode: Option<u8>,
+    ) -> Result<ExpandCastStatus> {
+        let mut request = serde_json::json!({"device_id": device_id});
+        if let Some(mode) = mode {
+            request["mode"] = mode.into();
+        }
         let body = self
-            .control_request(
-                "POST",
-                "/expand_cast/start",
-                Some(&serde_json::json!({"device_id": device_id}).to_string()),
-            )
+            .control_request("POST", "/expand_cast/start", Some(&request.to_string()))
             .await?;
         parse_expand_cast_status(&body)
     }

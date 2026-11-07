@@ -211,12 +211,17 @@ async fn pump_session(
     let mut peers: HashMap<u64, Peer> = HashMap::new();
     let mut input_peer = None;
     let mut video_peer = None;
+    let startup_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut has_frame = false;
     let mut poll = tokio::time::interval(Duration::from_millis(250));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_event = None;
     let result = loop {
         tokio::select! {
             _ = cancelled(cancel) => break Ok(()),
+            _ = tokio::time::sleep_until(startup_deadline), if !has_frame => {
+                break Err(anyhow!("等待手机连接或画面超时，请在手机确认投屏授权后重试"));
+            },
             input = inputs.recv() => {
                 let Some(input) = input else { break Ok(()); };
                 let target = input_peer.or_else(|| video_peer.filter(|id|
@@ -243,6 +248,7 @@ async fn pump_session(
                         }
                     }
                     Some(PeerEvent::Frame(id, frame)) if peers.contains_key(&id) => {
+                        has_frame = true;
                         // A bounded mailbox drops new frames when repaint falls
                         // behind instead of accumulating latency.
                         let displayed = *video_peer.get_or_insert(id);

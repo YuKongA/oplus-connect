@@ -533,6 +533,11 @@ info[]:
   通路；发起端通常优先用该号发送，但确认后并不限制只有发起端或只有一个方向
   能使用它。
 
+加密业务帧的 transport 首字节可能等于 EPI answer 类型 `0x02`：例如 session
+`140` 的帧头以 `02 30` 开始。已确认的业务 session 必须按完整 transport 头和
+加密标志优先分流，再执行 GCM 验证，不能仅按首字节识别 EPI，否则可能丢失
+DBR HELLO，表现为设备已认证但投屏数据通道未就绪。
+
 官方 `app:unite.oplus.onet` 示例：
 
 ```text
@@ -746,6 +751,9 @@ Oplus_HeySynergy_PcConnect_SyncNotification_Subscriber
 ```
 
 `dbs_msg_encrypt` 是 DBS 标志，不代表外层 transport 一定是密文；外层 transport 的 flags 要单独判断。
+业务消息前可能有包含 `{` 的二进制头；定位 JSON 时应验证完整外层对象，不能假设
+`dbs_msg_payload` 之前没有嵌套对象或依赖 JSON 字段顺序。
+
 
 ### 7.5 DBR sequence 重放去重
 
@@ -1241,6 +1249,8 @@ GUI 默认从电脑左侧移出，设置页提供向左、向右两种方位。�
 
 历史隔离 smoke 覆盖真实 IPC 与独立 Python GCM 解码；此次新增真实 TCP 回归测试
 覆盖跨回快照一次性消费、Enter 清除旧跨回和重连后拒绝旧 connection 标识。
+GUI 将该 connection 标识在输入、跨回读取或释放时被拒绝的情况视为旧连接结束，
+立即退出捕获并清理共享；其他 IPC 或输入错误仍向用户报告。
 初版平板真机已验证 KMS TCP 握手和设备类型识别；用户反馈光标间歇不出现，已修正
 相对边缘坐标及 portal/EIS 激活排序。修订版的双向边缘连续操作仍待真机验收，
 不将编译、单元测试或 TCP 已连接等同于 Pad 光标显示正常。
@@ -1262,6 +1272,8 @@ GUI 默认从电脑左侧移出，设置页提供向左、向右两种方位。�
    - 平板连接 PC 7239 端口完成基于 ECDH 的身份认证，建立 WebRTC PeerConnection。
    - PC 作为 Offerer，发送 Offer SDP（包含 H.264 PT100 视频轨道与 SCTP DataChannel 5000）；平板回复 Answer SDP。
    - Linux 端通过 PipeWire / Screencast Portal 捕获画面，使用 VA-API 硬件编码器（`vah264enc`）向平板实时推流，目标码率 10 Mbps。
+   - ScreenCast 版本低于 3 时不会返回 `source_type`；对于平板主动请求，GUI 按
+     本次唯一请求的 Monitor 或 Virtual 类型识别采集源。
    - 平板端的触控与手写笔操作通过 DataChannel 实时反传（采用与投屏反控相同的 24 字节帧格式）。
 
 ---
