@@ -104,7 +104,7 @@ fn accumulate(remainder: &mut f64, delta: f64) -> i32 {
 }
 
 // Physical evdev positions mapped to Windows virtual keys, not Android keycodes.
-// Every key, Escape included, belongs to the tablet while the pointer is there.
+// Every key, Escape included, belongs to the peer device while the pointer is there.
 fn windows_vk(code: u32) -> Option<u8> {
     Some(match code {
         1 => 0x1b,

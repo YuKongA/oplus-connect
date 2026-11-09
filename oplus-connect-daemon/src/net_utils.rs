@@ -149,6 +149,30 @@ pub fn private_interface_ips() -> Vec<Ipv4Addr> {
     }
 }
 
+/// Most recent non-local IPv4 address that sent an SDP query.
+///
+/// Tunnelled or relayed sessions arrive with this machine's own address as
+/// their peer; the SDP source is then the phone's real LAN address.
+static LAST_LAN_PEER: std::sync::Mutex<Option<(Ipv4Addr, std::time::Instant)>> =
+    std::sync::Mutex::new(None);
+
+/// Records the source of an SDP query, ignoring loopback and local addresses.
+pub fn remember_lan_peer(ip: Ipv4Addr) {
+    if ip.is_loopback() || private_interface_ips().contains(&ip) {
+        return;
+    }
+    if let Ok(mut slot) = LAST_LAN_PEER.lock() {
+        *slot = Some((ip, std::time::Instant::now()));
+    }
+}
+
+/// Last remembered LAN peer, if it was seen within `max_age`.
+pub fn last_lan_peer(max_age: std::time::Duration) -> Option<Ipv4Addr> {
+    let slot = LAST_LAN_PEER.lock().ok()?;
+    let (ip, seen) = (*slot)?;
+    (seen.elapsed() <= max_age).then_some(ip)
+}
+
 /// IPv4 broadcast addresses for private-network interfaces.
 ///
 /// Sending only to `255.255.255.250` can select a VPN route instead of the LAN

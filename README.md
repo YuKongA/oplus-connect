@@ -5,10 +5,10 @@ OPLUS 互联是面向 OPPO / OnePlus 设备的 Linux 原生客户端
 ## 功能
 
 - 连接设备
-- 剪贴板双向同步
-- 消息通知镜像
+- 剪贴板双向同步（手机/平板）
+- 消息通知镜像（手机/平板）
+- 键鼠共享（手机/平板）
 - 手机投屏
-- 平板键鼠共享
 - 平板屏幕共享
 
 ### 屏幕共享说明
@@ -31,7 +31,7 @@ OPLUS_CONNECT_SOURCE_URL="file://$PWD" makepkg -si
 
 项目目前未声明许可证，软件包将许可证标记为未知；分发前需由项目维护者明确授权。
 
-直接从源码运行需要支持 Rust 2024 edition 的工具链和 GStreamer 1.24+，GUI 会自动启动内嵌 daemon：
+直接从源码运行需要支持 Rust 工具链和 GStreamer，GUI 会自动启动内嵌 daemon：
 
 ```bash
 cargo run --release --manifest-path oplus-connect-gui/Cargo.toml
@@ -39,7 +39,9 @@ cargo run --release --manifest-path oplus-connect-gui/Cargo.toml
 
 单独调试后端：`cargo run --manifest-path oplus-connect-daemon/Cargo.toml`。
 
-平板键鼠共享需要 Wayland InputCapture portal v2。屏幕共享及触摸反控基于 PipeWire、GStreamer WebRTC 和 RemoteDesktop portal；电脑端发起时在设备详情选择镜像或扩展，再在系统弹窗中授权屏幕与输入控制。
+键鼠共享需要 Wayland InputCapture portal v2。屏幕共享及触摸反控基于 PipeWire、GStreamer WebRTC 和 RemoteDesktop portal；电脑端发起时在设备详情选择镜像或扩展，再在系统弹窗中授权屏幕与输入控制。
+
+键鼠共享卡死与手机/平板无关，属电脑端输入捕获链路（Wayland portal/EIS）停止投递事件：日志会停在 `kms sharing heartbeat` 的 `idle_ms` 持续增长、同时 `/kms/status` 仍为 connected。此时 `Ctrl+Alt+Escape` 也可能收不到按键，只能结束共享（设备侧断开或退出程序）来释放捕获。`OPLUS_CONNECT_LOG=debug` 启动并在终端保留输出可记录 EIS 启停、被丢弃的输入、跨回事件、会话结束原因和每 5 秒一次的共享心跳。
 
 「设置 → 平板屏幕共享」支持 1–144 fps、500–50000 kbps 和动态码率；默认 30 fps、6000 kbps，动态码率开启。实际效果取决于设备、编码性能和网络质量。
 
@@ -48,12 +50,13 @@ cargo run --release --manifest-path oplus-connect-gui/Cargo.toml
 | 环境变量                                        | 说明                                                                               |
 | ----------------------------------------------- | ---------------------------------------------------------------------------------- |
 | `OPLUS_CONNECT_RUNTIME_DIR`                     | 指定 daemon 与 GUI 共用的私有 IPC 目录；需要是当前用户所有、权限 `0700` 的绝对路径 |
+| `OPLUS_CONNECT_LOG`                             | 日志级别 `trace`/`debug`/`info`/`warn`/`error`/`off`，默认 `info`                  |
+| `OPLUS_CONNECT_KMS_IDLE_RELEASE_SECS`           | 键鼠共享在持续无输入事件达该秒数后自动把捕获释放回电脑（默认 10，`0` 关闭）        |
 | `OPLUS_AUTO_ACCEPT=1`                           | 跳过 GUI 审批自动接受连接，仅建议在无头调试时使用                                  |
 | `OPLUS_EXPAND_CAST_PIN_CAPTURE=0`               | 禁止请求调整虚拟屏采集尺寸；默认请求，失败时回退                                   |
 | `OPLUS_EXPAND_CAST_BITRATE=<kbps>`              | 覆盖界面码率并关闭自适应，范围 500–50000 kbps                                      |
 | `OPLUS_EXPAND_CAST_PIPELINE_LATENCY=auto\|<ms>` | 覆盖 pipeline latency；默认 0，`auto` 恢复按元素自动协商                           |
 | `OPLUS_EXPAND_CAST_STATS`                       | 设置任意值时每 5 秒打印 WebRTC 统计，排查链路问题时使用                            |
-| `OPLUS_EXPAND_CAST_FAKE_SINK=1`                 | 诊断用：编码后本地丢弃，不发送给平板                                               |
 
 ## 项目结构
 

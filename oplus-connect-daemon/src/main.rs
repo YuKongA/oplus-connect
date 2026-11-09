@@ -4,7 +4,7 @@ use oplus_connect_daemon::ipc::{
 };
 use oplus_connect_daemon::{clipboard::ClipboardSync, discovery, probe, state::AppState};
 use tokio::{net::TcpListener, task::JoinSet};
-use tracing::{Level, info};
+use tracing::info;
 use tracing_subscriber::FmtSubscriber;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -12,7 +12,7 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
+        .with_max_level(oplus_connect_daemon::log_level_from_env())
         .with_target(false)
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;

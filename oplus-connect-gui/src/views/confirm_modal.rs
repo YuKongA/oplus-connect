@@ -70,7 +70,12 @@ impl ConfirmModal {
                                 "Wi-Fi"
                             },
                         ))
-                        .child(Self::row("地址", &req.device_address))
+                        .child(Self::row(
+                            "地址",
+                            req.device_lan_address
+                                .as_deref()
+                                .unwrap_or(&req.device_address),
+                        ))
                         .child(Self::row("识别码", &req.connection_id))
                         .child(
                             div()

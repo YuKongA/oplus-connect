@@ -1,11 +1,14 @@
-//! Independent tablet keyboard/mouse sharing lifecycle; no video session is involved.
+//! Independent keyboard/mouse sharing lifecycle; no video session is involved.
 use crate::{
     client::{CastRequestRejected, DaemonClient},
     kms_capture::{self, CaptureEvent},
     kms_input::InputMapper,
 };
 use anyhow::{Context, Result, anyhow};
-use std::{future::Future, time::Duration};
+use std::{
+    future::Future,
+    time::{Duration, Instant},
+};
 use tokio::sync::{mpsc, watch};
 
 // Outlast the client's 17-second and daemon's 15-second start deadlines so
@@ -182,8 +185,8 @@ async fn run_session(
             client.kms_input(device_id, connection_id, event),
         )
         .await
-        .context("发送平板输入请求超时")?
-        .context("发送平板输入失败")
+        .context("发送设备输入请求超时")?
+        .context("发送设备输入失败")
     }
 
     async fn flush_motion(
@@ -225,7 +228,7 @@ async fn run_session(
         started = true;
         // A start request can already have reached the daemon. Finish it before
         // issuing stop, including when cancellation occurs during the request.
-        request(client.kms_start(device_id, width, height, direction.wire_value())).await.context("启动平板键鼠服务失败")?;
+        request(client.kms_start(device_id, width, height, direction.wire_value())).await.context("启动键鼠共享失败")?;
         let connected = tokio::time::timeout(CONNECT_TIMEOUT, async {
             let mut poll = tokio::time::interval(Duration::from_millis(250));
             poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -239,7 +242,7 @@ async fn run_session(
                         // Never replay a stale activation or held input after
                         // connection. The disabled portal must not capture yet.
                         Some(CaptureEvent::Deactivated) => {},
-                        Some(_) => return Err(anyhow!("平板就绪前系统意外捕获了输入")),
+                        Some(_) => return Err(anyhow!("设备就绪前系统意外捕获了输入")),
                         None => return Err(anyhow!("系统输入捕获已关闭")),
                     },
                     _ = poll.tick() => {
@@ -250,7 +253,7 @@ async fn run_session(
                     }
                 }
             }
-        }).await.context("等待平板键鼠连接超时，请在平板确认连接")??;
+        }).await.context("等待键鼠连接超时，请在设备确认连接")??;
         let Some(id) = connected else { return Ok(()); };
         connection_id = Some(id);
         if *cancel.borrow() { return Ok(()); }
@@ -272,6 +275,12 @@ async fn run_session(
         let mut pending_dy: i32 = 0;
         let mut status_poll = tokio::time::interval(Duration::from_millis(500));
         status_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut status_failures = 0u32;
+        let mut status_ticks = 0u64;
+        // Host capture liveness: a silent compositor and an idle user look the
+        // same to this loop, so record when the last capture event arrived and
+        // report it periodically instead of guessing.
+        let mut last_capture_at = Instant::now();
         let mut return_poll = tokio::time::interval(Duration::from_millis(60));
         return_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut motion_flush = tokio::time::interval(Duration::from_millis(8));
@@ -301,15 +310,38 @@ async fn run_session(
                     if connection_result(flush_motion(&client, device_id, id, &mut pending_dx, &mut pending_dy).await)?.is_none() { return Ok(()); }
                 },
                 _ = status_poll.tick() => {
+                    status_ticks = status_ticks.saturating_add(1);
+                    if sharing && status_ticks % 10 == 0 {
+                        tracing::debug!(
+                            device_id,
+                            idle_ms = last_capture_at.elapsed().as_millis() as u64,
+                            return_sent = return_sent.is_some(),
+                            "kms sharing heartbeat"
+                        );
+                    }
                     let status_res = tokio::time::timeout(Duration::from_millis(600), client.kms_status(device_id)).await;
-                    if let Ok(Ok(status)) = status_res {
-                        if status.connection_id != Some(id) || status.status.as_deref() != Some("connected") {
-                            return Ok(());
+                    match status_res {
+                        Ok(Ok(status)) => {
+                            status_failures = 0;
+                            if status.connection_id != Some(id) || status.status.as_deref() != Some("connected") {
+                                return Ok(());
+                            }
+                        }
+                        _ => {
+                            status_failures += 1;
+                            if status_failures == 1 || status_failures % 10 == 0 {
+                                tracing::warn!(
+                                    device_id,
+                                    status_failures,
+                                    "KMS daemon status poll failed while sharing"
+                                );
+                            }
                         }
                     }
                 },
                 event = capture_rx.recv() => {
                     let event = event.context("系统输入捕获已关闭")?;
+                    last_capture_at = Instant::now();
                     match &event {
                         CaptureEvent::Ready { .. } => return Err(anyhow!("显示器布局已改变，请重新启动共享")),
                         CaptureEvent::Activated { activation: current, .. } => {
@@ -334,7 +366,7 @@ async fn run_session(
                             pending_dy = 0;
                             return_tx.send(None).context("系统输入返回通道已退出")?;
                             tracing::debug!(device_id, activation = ?retired, "kms activation returned");
-                            if connection_result(request(client.kms_release(device_id, id)).await.context("释放平板按键失败"))?.is_none() {
+                            if connection_result(request(client.kms_release(device_id, id)).await.context("释放按键失败"))?.is_none() {
                                 return Ok(());
                             }
                             mapper.reset();
@@ -358,7 +390,7 @@ async fn run_session(
                             }
                             discrete => {
                                 if connection_result(flush_motion(&client, device_id, id, &mut pending_dx, &mut pending_dy).await)?.is_none() { return Ok(()); }
-                                tracing::debug!(?discrete, "sending discrete event to tablet");
+                                tracing::debug!(?discrete, "sending discrete event to peer");
                                 if connection_result(fast_input(&client, device_id, id, &discrete).await)?.is_none() { return Ok(()); }
                             }
                         }
@@ -382,8 +414,8 @@ async fn run_session(
             )
             .await
             {
-                Ok(result) => connection_result(result.context("释放平板按键失败")).map(|_| ()),
-                Err(_) => Err(anyhow!("释放平板按键超时")),
+                Ok(result) => connection_result(result.context("释放按键失败")).map(|_| ()),
+                Err(_) => Err(anyhow!("释放按键超时")),
             }
         } else {
             Ok(())
@@ -391,8 +423,8 @@ async fn run_session(
         let stop = if started {
             tokio::time::timeout(Duration::from_millis(1500), client.kms_stop(device_id))
                 .await
-                .map_err(|_| anyhow!("停止平板键鼠服务超时"))
-                .and_then(|r| r.context("停止平板键鼠服务失败"))
+                .map_err(|_| anyhow!("停止键鼠共享超时"))
+                .and_then(|r| r.context("停止键鼠共享失败"))
         } else {
             Ok(())
         };

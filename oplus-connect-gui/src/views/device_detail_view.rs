@@ -220,37 +220,20 @@ impl DeviceDetailView {
                             cx.notify();
                         })),
                 );
-            } else if device.device_type == "tablet" {
-                let sharing = kms.device_id == device.device_id && kms.active();
-                let label = if sharing {
-                    match kms.phase {
-                        KmsPhase::Stopping => "停止中…",
-                        KmsPhase::Armed | KmsPhase::Sharing => "停止键鼠共享",
-                        _ => "共享启动中",
-                    }
-                } else {
-                    "键鼠共享"
-                };
-                let kms_id = device_id.clone();
-                actions = actions.child(
-                    Button::new(("btn-kms", index))
-                        .primary()
-                        .disabled(
-                            (kms.active() && !sharing)
-                                || kms.phase == KmsPhase::Stopping
-                                || state.cast.active()
-                                || expand_cast.active(),
-                        )
-                        .label(label)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if this.kms.active() {
-                                this.stop_kms(cx);
-                            } else {
-                                this.start_kms(kms_id.clone(), cx);
-                            }
-                        })),
-                );
+            }
 
+            if device.kms_capable() {
+                actions = actions.child(Self::render_kms_action(
+                    device,
+                    state,
+                    kms,
+                    expand_cast,
+                    cx,
+                    index,
+                ));
+            }
+
+            if device.device_type == "tablet" {
                 let ext_active = expand_cast.device_id == device.device_id && expand_cast.active();
                 if ext_active {
                     let ext_label = match expand_cast.phase {
@@ -337,6 +320,43 @@ impl DeviceDetailView {
         div().flex().flex_col().gap(px(8.0)).child(card)
     }
 
+    fn render_kms_action(
+        device: &DeviceInfo,
+        state: &AppState,
+        kms: &KmsViewState,
+        expand_cast: &ExpandCastViewState,
+        cx: &mut Context<crate::RootView>,
+        index: usize,
+    ) -> impl IntoElement {
+        let sharing = kms.device_id == device.device_id && kms.active();
+        let label = if sharing {
+            match kms.phase {
+                KmsPhase::Stopping => "停止中…",
+                KmsPhase::Armed | KmsPhase::Sharing => "停止键鼠共享",
+                _ => "共享启动中",
+            }
+        } else {
+            "键鼠共享"
+        };
+        let kms_id = device.device_id.clone();
+        Button::new(("btn-kms", index))
+            .primary()
+            .disabled(
+                (kms.active() && !sharing)
+                    || kms.phase == KmsPhase::Stopping
+                    || state.cast.active()
+                    || expand_cast.active(),
+            )
+            .label(label)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if this.kms.active() {
+                    this.stop_kms(cx);
+                } else {
+                    this.start_kms(kms_id.clone(), cx);
+                }
+            }))
+    }
+
     fn render_disconnected_actions(
         device: &DeviceInfo,
         state: &AppState,
@@ -349,49 +369,73 @@ impl DeviceDetailView {
             .clone()
             .filter(|address| !address.trim().is_empty());
 
+        let forget_id = device.device_id.clone();
+        let forget = Button::new(("btn-forget", index))
+            .secondary()
+            .label("删除")
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.forget_device(forget_id.clone(), cx);
+            }));
+
         let Some(address) = address else {
             return div()
-                .text_xs()
-                .text_color(Theme::text_muted())
-                .child("缺少上次连接地址，请在手机控制中心选择本机");
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(Theme::text_muted())
+                        .child("缺少上次连接地址，请在手机控制中心选择本机"),
+                )
+                .child(forget);
         };
 
         let click_address = address.clone();
         let click_id = device.device_id.clone();
         div().flex().flex_col().gap(px(8.0)).child(
-            Button::new(("btn-reverse-connect", index))
-                .primary()
-                .disabled(pending)
-                .label(if pending {
-                    "等待手机确认…"
-                } else {
-                    "连接"
-                })
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if this.state.connect_pending {
-                        return;
-                    }
-                    this.state.connect_pending = true;
-                    this.state.set_toast("正在连接，请在手机上确认");
-                    let address = click_address.clone();
-                    let device_id = click_id.clone();
-                    cx.notify();
-                    cx.spawn(async move |this, app| {
-                        let client = DaemonClient::new();
-                        let result = app
-                            .background_executor()
-                            .spawn(async move { client.connect_device(&address, &device_id).await })
-                            .await;
-                        if let Err(error) = result {
-                            let _ = this.update(app, |view, cx| {
-                                view.state.connect_pending = false;
-                                view.state.set_toast(format!("连接失败：{error}"));
-                                cx.notify();
-                            });
-                        }
-                    })
-                    .detach();
-                })),
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    Button::new(("btn-reverse-connect", index))
+                        .primary()
+                        .disabled(pending)
+                        .label(if pending {
+                            "等待手机确认…"
+                        } else {
+                            "连接"
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if this.state.connect_pending {
+                                return;
+                            }
+                            this.state.connect_pending = true;
+                            this.state.set_toast("正在连接，请在手机上确认");
+                            let address = click_address.clone();
+                            let device_id = click_id.clone();
+                            cx.notify();
+                            cx.spawn(async move |this, app| {
+                                let client = DaemonClient::new();
+                                let result = app
+                                    .background_executor()
+                                    .spawn(async move {
+                                        client.connect_device(&address, &device_id).await
+                                    })
+                                    .await;
+                                if let Err(error) = result {
+                                    let _ = this.update(app, |view, cx| {
+                                        view.state.connect_pending = false;
+                                        view.state.set_toast(format!("连接失败：{error}"));
+                                        cx.notify();
+                                    });
+                                }
+                            })
+                            .detach();
+                        })),
+                )
+                .child(forget),
         )
     }
 

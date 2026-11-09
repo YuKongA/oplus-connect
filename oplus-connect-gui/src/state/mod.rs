@@ -69,6 +69,7 @@ pub struct ConnectionRequest {
     pub device_type: String,
     pub connect_type: String,
     pub device_address: String,
+    pub device_lan_address: Option<String>,
     pub connection_id: String,
 }
 
@@ -87,6 +88,13 @@ pub struct DeviceInfo {
     pub ip_address: Option<String>,
     pub is_connected: bool,
     pub last_seen: i64,
+}
+
+impl DeviceInfo {
+    /// Phones and tablets expose the same keyboard/mouse sharing (KMS) entry.
+    pub fn kms_capable(&self) -> bool {
+        matches!(self.device_type.as_str(), "phone" | "tablet")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -319,10 +327,31 @@ impl AppState {
         if device.device_id.is_empty() && device.device_name.is_empty() {
             return false;
         }
+        // Our own PDID must never be stored as a peer: a looped-back Sync or
+        // remote payload used to surface the PC itself in the device list.
+        if !device.device_id.is_empty()
+            && device
+                .device_id
+                .eq_ignore_ascii_case(&oplus_connect_daemon::net_utils::pdid())
+        {
+            return false;
+        }
 
         let mut incoming = device.clone();
         incoming.is_connected = true;
         incoming.last_seen = Local::now().timestamp();
+        // A looped-back payload can carry this machine's own interface address
+        // as the peer's; persisting it makes "connect" dial ourselves.
+        if incoming
+            .ip_address
+            .as_deref()
+            .and_then(|address| address.trim().parse::<std::net::Ipv4Addr>().ok())
+            .is_some_and(|address| {
+                oplus_connect_daemon::net_utils::private_interface_ips().contains(&address)
+            })
+        {
+            incoming.ip_address = None;
+        }
 
         let Some(index) = self
             .known_devices

@@ -109,6 +109,10 @@ SDP 发现
 PC 后拨 `10150`/`10152`（PC 为 SCP server），或 PC 主动拨手机的 `10152`（PC 为
 SCP client，见 §3.2）。无论哪种，业务数据通道仍由手机拨回 PC 通告的端口。
 
+PC 收到手机的 business interaction 后会主动连手机的 `10153`，确认 WLAN 路径可达；
+若该 SCP 会话的源地址是本机地址（USB/adb 隧道或中继），PC 改用手机 SDP 查询的
+来源地址连接，并把该地址记为设备的 LAN 地址。
+
 设备移除跟随**数据通道**，不跟随 SCP 控制连接：手机在 `SyncSecure` 和 business
 interaction 之后会关闭 SCP 握手 socket（PLZ110 实测在 business interaction 后约
 0.2 秒关闭），而剪贴板、通知继续走数据通道。daemon 在握手 socket 关闭时只安排一次
@@ -1130,11 +1134,11 @@ Panta 主循环直接等待各控制器的命令队列，避免跨设备共享�
 不能将“没有已接入的文本路径”归因为 GPUI 无 IME 能力。右键未实现；
 端到端延迟与长时间稳定性未测量。
 
-#### KMS Rust 协议层与平板键鼠共享（2026-11-04）
+#### KMS Rust 协议层与键鼠共享（2026-11-04）
 
-`kms/` 实现平板键鼠共享的编解码、动态监听、Panta 通告和显式输入发送。
-GUI 通过 KDE/Wayland InputCapture + EIS 捕获全局键鼠，并只向协议确认的
-tablet（EPI category `10`）提供此入口；手机仍使用独立投屏链路。
+`kms/` 实现键鼠共享的编解码、动态监听、Panta 通告和显式输入发送。
+GUI 通过 KDE/Wayland InputCapture + EIS 捕获全局键鼠，并向协议确认的
+手机（EPI category `8`）与平板（`10`）提供此入口；手机同时保留独立投屏链路。
 
 24 字节帧头精确布局如下（多字节整数均为大端）：
 
@@ -1175,14 +1179,14 @@ magic 尝试恢复。序号分配、超时、设备身份校验和连接生命�
 | --- | --- |
 | `/kms/start` | `{"device_id":"设备 PDID","width":3840,"height":2160,"direction":1}`；`direction` 范围 1..=4（1=Left, 2=Right, 3=Above, 4=Below） |
 | `/kms/status` | `{"device_id":"设备 PDID"}` |
-| `/kms/receive` | `{"device_id":"设备 PDID","connection_id":1}`；消费一次 Pad→电脑的跨回事件 |
+| `/kms/receive` | `{"device_id":"设备 PDID","connection_id":1}`；消费一次对端→电脑的跨回事件 |
 | `/kms/stop` | `{"device_id":"设备 PDID"}` |
 
 尺寸范围为 1..16384；`direction` 经逆向官方 `screenshare.exe`（`handleArrangePosition`）
 证实对应平板相对电脑的方位（1=Left, 2=Right, 3=Above, 4=Below），并在 arrange 中同步发给平板。KMS 启动前
-要求已认证的平板 owner；手机或未知设备不会绑定服务。Start 成功表示 listener 已绑定，
+要求已认证的手机或平板 owner；未知类别不会绑定服务。Start 成功表示 listener 已绑定，
 且确认的 unite session 已发出追加 `Oplus_KeyMouseLink` 的 topic sync 和
-`kms_ability_sync/pc_device_info`，不表示平板已完成连接。响应只含设备、地址和状态，
+`kms_ability_sync/pc_device_info`，不表示设备已完成连接。响应只含设备、地址和状态，
 不含 randomPwd/testData。状态为 listening/handshaking/connected/closed；没有运行的
 KMS 服务时 status/local_addr 为 null。
 
@@ -1190,7 +1194,7 @@ KMS 服务时 status/local_addr 为 null。
 要求 deviceid 一致且 supportEncrypt=1。设备 ID 是明文一致性检查，**不是密码学
 身份认证**。完成 resolution 后发送加密 arrange/resolution；心跳 type4/5 为
 明文、sequence=0，type100 接受 alive。daemon 不注入本机输入；收到合法的
-Pad→电脑 type-2 pointer cross-back 后只保留最新一次
+对端→电脑 type-2 pointer cross-back 后只保留最新一次
 跨回快照，由 `/kms/receive` 按 connection_id 消费。握手限时10秒、空闲90秒、
 心跳间隔30秒、写入限时5秒；这些是本实现的保守超时策略，不是已定案的官方常量。
 心跳 tick 不取消正在读取的半帧。
@@ -1233,15 +1237,15 @@ POST `/kms/release` 使用 `{"device_id":"设备 PDID","connection_id":1}`，
 正常 Stop 也会尝试释放后关闭；掉线、进程退出/强制取消或写入失败时**不能保证远端
 收到 key-up**，只清除本地状态并关闭连接，绝不在新连接补发旧输入。
 
-输入经过有界队列，成功响应表示实际写入完成，不表示平板已经应用。旧 connection_id、
+输入经过有界队列，成功响应表示实际写入完成，不表示设备已经应用。旧 connection_id、
 未连接、队列满或写失败返回错误；重连前残留输入被拒绝。输入发送和心跳不会取消
 正在读取的半帧。按下状态采用固定大小存储，不记录输入历史。
 
 GUI 默认从电脑左侧移出，设置页提供向左、向右两种方位。左侧移出发送 `pctX=1`，
-右侧移出发送 `pctX=0`，`pctY` 保持电脑光标高度。Pad 回传的 pointer 坐标按 Pad
+右侧移出发送 `pctX=0`，`pctY` 保持电脑光标高度。对端回传的 pointer 坐标按对端
 握手分辨率归一化，GUI 以对应边缘固定 7 像素内缩位置释放电脑光标，随后重新等待下一次
-边缘激活。键盘事件（包括 Escape）在指针位于 Pad 时全部发送给 Pad，不会被本机拦截；
-回移只由 Pad 的 cross-back 事件触发。
+边缘激活。键盘事件（包括 Escape）在指针位于对端时全部发送给对端，不会被本机拦截；
+回移只由对端的 cross-back 事件触发。
 
 逆向官方 `screenshare.exe` 表明，键鼠共享下鼠标钩子仅激活了左右边缘（`setCrossEdge: 3`，
 即 `1|2` 掩码）；官方 `Above/Below` 仅用于扩展屏（虚拟显示器）。实测表明向 Pad 发送垂直进入
@@ -1255,6 +1259,13 @@ GUI 将该 connection 标识在输入、跨回读取或释放时被拒绝的情�
 初版平板真机已验证 KMS TCP 握手和设备类型识别；用户反馈光标间歇不出现，已修正
 相对边缘坐标及 portal/EIS 激活排序。修订版的双向边缘连续操作仍待真机验收，
 不将编译、单元测试或 TCP 已连接等同于 Pad 光标显示正常。
+
+2026-11-09 卡死观测：该故障与 peer 类别无关，手机与平板均可复现。故障日志表现为
+InputCapture 激活保持（无 `Deactivated`/`disabled` 信号）、EIS 无 `StopEmulating`/`DevicePaused`、
+GUI 仍以 60 ms 轮询跨回且 `/kms/status` 持续 connected，但共享期间 EIS 输入事件完全停止、
+`/kms/input` 不再出现；此时 `Ctrl+Alt+Escape` 也因收不到按键而失效，只有结束会话
+（设备侧断开或进程退出）才会释放 portal。判断为电脑端输入捕获链路静默，
+不归因于手机或平板；GUI 每 5 秒输出的 `kms sharing heartbeat`（`idle_ms`）可量化该静默。
 
 #### ExpandCast 平板扩展屏协议（2026-11-04）
 

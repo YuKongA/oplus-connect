@@ -158,10 +158,10 @@ impl SettingsView {
                 GroupBox::new()
                     .id("settings-kms")
                     .outline()
-                    .title("平板键鼠共享")
+                    .title("键鼠共享")
                     .child(Self::control_row(
                         "光标移出方向",
-                        "从所选方向移出屏幕进入平板",
+                        "从所选方向移出屏幕进入设备",
                         div().w(px(160.0)).children(kms_direction.map(|state| {
                             Select::new(state)
                                 .w_full()

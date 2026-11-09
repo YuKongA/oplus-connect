@@ -69,7 +69,7 @@ pub struct RootView {
     kms_session: Option<kms_session::KmsSessionHandle>,
     pub expand_cast: expand_cast_session::ExpandCastViewState,
     expand_cast_session: Option<expand_cast_session::ExpandCastSessionHandle>,
-    tablet_share_started_at: Option<Instant>,
+    share_started_at: Option<Instant>,
     poll_guard: PollGuard,
     cast_session: Option<cast_session::CastSessionHandle>,
     cast_window: Option<WindowHandle<views::cast_window::CastWindow>>,
@@ -130,7 +130,7 @@ impl PollGuard {
 }
 
 // A request begun before a share started can contain an older device list, even
-// if its response arrives after the tablet's share request was handled.
+// if its response arrives after a device-initiated share request was handled.
 fn current_device_snapshot(
     devices: Result<Vec<DeviceInfo>, String>,
     requested_at: Instant,
@@ -141,7 +141,7 @@ fn current_device_snapshot(
         .filter(|_| share_started_at.is_none_or(|started_at| requested_at > started_at))
 }
 
-fn tablet_missing(devices: &[DeviceInfo], device_id: &str) -> bool {
+fn device_missing(devices: &[DeviceInfo], device_id: &str) -> bool {
     !devices
         .iter()
         .any(|device| device.device_id == device_id && device.is_connected)
@@ -240,7 +240,7 @@ impl RootView {
             kms_session: None,
             expand_cast: expand_cast_session::ExpandCastViewState::default(),
             expand_cast_session: None,
-            tablet_share_started_at: None,
+            share_started_at: None,
             poll_guard: PollGuard::default(),
             cast_session: None,
             cast_window: None,
@@ -308,14 +308,12 @@ impl RootView {
             || self.expand_cast.active()
             || self.state.cast.active()
             || !self.state.known_devices.iter().any(|device| {
-                device.device_id == device_id
-                    && device.is_connected
-                    && device.device_type == "tablet"
+                device.device_id == device_id && device.is_connected && device.kms_capable()
             })
         {
             return;
         }
-        self.tablet_share_started_at = Some(Instant::now());
+        self.share_started_at = Some(Instant::now());
         let generation = self.kms.generation.wrapping_add(1);
         self.kms = kms_session::KmsViewState {
             device_id: device_id.clone(),
@@ -342,12 +340,12 @@ impl RootView {
                             KmsEvent::Phase(phase) => {
                                 view.kms.phase = phase;
                                 view.kms.detail = match phase {
-                                    KmsPhase::Waiting => "等待平板键鼠通道连接…",
+                                    KmsPhase::Waiting => "等待键鼠通道连接…",
                                     KmsPhase::Armed => {
-                                        "已就绪：从设置的电脑边缘移入平板；从平板相对边缘移回"
+                                        "已就绪：从设置的电脑边缘移入设备；从设备相对边缘移回"
                                     }
                                     KmsPhase::Sharing => {
-                                        "正在控制平板 · 键鼠均作用于平板，从相对边缘移回电脑"
+                                        "正在控制设备 · 键鼠均作用于设备，从相对边缘移回电脑"
                                     }
                                     _ => "正在准备键鼠共享…",
                                 }
@@ -406,7 +404,7 @@ impl RootView {
         {
             return;
         }
-        self.tablet_share_started_at = Some(Instant::now());
+        self.share_started_at = Some(Instant::now());
         let generation = self.expand_cast.generation.wrapping_add(1);
         self.expand_cast = expand_cast_session::ExpandCastViewState {
             device_id: device_id.clone(),
@@ -819,6 +817,28 @@ impl RootView {
         });
     }
 
+    pub fn forget_device(&mut self, device_id: String, cx: &mut Context<Self>) {
+        let before = self.state.known_devices.len();
+        self.state
+            .known_devices
+            .retain(|device| !device.device_id.eq_ignore_ascii_case(&device_id));
+        if self.state.known_devices.len() == before {
+            return;
+        }
+        if self
+            .state
+            .connected_device
+            .as_ref()
+            .is_some_and(|device| device.device_id.eq_ignore_ascii_case(&device_id))
+        {
+            self.state.connected_device = None;
+            self.state.remote_details = None;
+        }
+        persisted::save_known_devices(&self.state.known_devices);
+        self.state.set_toast("已删除该设备");
+        cx.notify();
+    }
+
     pub fn handle_app_event(&mut self, event: AppEvent, cx: &mut Context<Self>) -> bool {
         match event {
             AppEvent::DaemonPolled {
@@ -829,7 +849,7 @@ impl RootView {
             } => {
                 let mut changed = false;
                 let share_started_at = if self.kms.active() || self.expand_cast.active() {
-                    self.tablet_share_started_at
+                    self.share_started_at
                 } else {
                     None
                 };
@@ -881,12 +901,12 @@ impl RootView {
                     current_device_snapshot(devices, devices_requested_at, share_started_at)
                 {
                     if self.expand_cast.active()
-                        && tablet_missing(&dev_list, &self.expand_cast.device_id)
+                        && device_missing(&dev_list, &self.expand_cast.device_id)
                     {
                         self.stop_expand_cast(cx);
                         changed = true;
                     }
-                    if self.kms.active() && tablet_missing(&dev_list, &self.kms.device_id) {
+                    if self.kms.active() && device_missing(&dev_list, &self.kms.device_id) {
                         self.stop_kms(cx);
                         changed = true;
                     }
@@ -1029,6 +1049,10 @@ impl RootView {
                             .as_str()
                             .unwrap_or_default()
                             .to_string(),
+                        device_lan_address: data["device_lan_address"]
+                            .as_str()
+                            .map(str::to_string)
+                            .filter(|address| !address.is_empty()),
                         connection_id: data["connection_id"]
                             .as_str()
                             .unwrap_or_default()
@@ -1358,19 +1382,31 @@ impl Render for RootView {
 #[cfg(test)]
 mod polling_tests {
     use super::{
-        DAEMON_MAX_CONSECUTIVE_FAILURES, PollGuard, current_device_snapshot, tablet_missing,
+        DAEMON_MAX_CONSECUTIVE_FAILURES, PollGuard, current_device_snapshot, device_missing,
     };
     use crate::models::DeviceInfo;
     use crate::state::AppState;
     use std::time::{Duration, Instant};
 
-    fn tablet(id: &str, connected: bool) -> DeviceInfo {
+    fn device(id: &str, device_type: &str, connected: bool) -> DeviceInfo {
         DeviceInfo {
             device_id: id.into(),
-            device_type: "tablet".into(),
+            device_type: device_type.into(),
             is_connected: connected,
             ..Default::default()
         }
+    }
+
+    fn tablet(id: &str, connected: bool) -> DeviceInfo {
+        device(id, "tablet", connected)
+    }
+
+    #[test]
+    fn keyboard_mouse_sharing_accepts_phones_and_tablets_only() {
+        assert!(device("phone-1", "phone", true).kms_capable());
+        assert!(tablet("tablet-1", true).kms_capable());
+        assert!(!device("unknown-1", "unknown", true).kms_capable());
+        assert!(!device("empty-1", "", true).kms_capable());
     }
 
     #[test]
@@ -1390,7 +1426,7 @@ mod polling_tests {
     }
 
     #[test]
-    fn stale_snapshot_cannot_stop_new_share_or_mark_tablet_offline() {
+    fn stale_snapshot_cannot_stop_new_share_or_mark_device_offline() {
         let start = Instant::now();
         let before = start - Duration::from_millis(1);
         let after = start + Duration::from_millis(1);
@@ -1407,7 +1443,7 @@ mod polling_tests {
         let connected =
             current_device_snapshot(Ok(vec![tablet("tablet-1", true)]), after, Some(start))
                 .unwrap();
-        assert!(!tablet_missing(&connected, "tablet-1"));
+        assert!(!device_missing(&connected, "tablet-1"));
         state.sync_known_devices(&connected);
         assert!(state.known_devices[0].is_connected);
 
@@ -1416,9 +1452,9 @@ mod polling_tests {
         let offline =
             current_device_snapshot(Ok(vec![tablet("tablet-1", false)]), after, Some(start))
                 .unwrap();
-        assert!(tablet_missing(&offline, "tablet-1"));
+        assert!(device_missing(&offline, "tablet-1"));
         let missing = current_device_snapshot(Ok(vec![]), after, Some(start)).unwrap();
-        assert!(tablet_missing(&missing, "tablet-1"));
+        assert!(device_missing(&missing, "tablet-1"));
         state.sync_known_devices(&missing);
         assert!(!state.known_devices[0].is_connected);
 

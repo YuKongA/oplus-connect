@@ -110,6 +110,27 @@ async fn clear_awaiting_approval(peer_ip: &str, connection_id: &str) {
     }
 }
 
+/// True for loopback and for this machine's own interface addresses.
+fn is_local_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback() || crate::net_utils::private_interface_ips().contains(&v4)
+        }
+        std::net::IpAddr::V6(v6) => v6.is_loopback(),
+    }
+}
+
+/// Address to dial for phone-side connections.
+///
+/// Falls back to the last SDP query source when the peer address is local, and
+/// returns `None` when only a local address is available.
+fn phone_lan_address(peer: std::net::SocketAddr) -> Option<std::net::IpAddr> {
+    if !is_local_ip(peer.ip()) {
+        return Some(peer.ip());
+    }
+    crate::net_utils::last_lan_peer(std::time::Duration::from_secs(120)).map(std::net::IpAddr::V4)
+}
+
 async fn decide_peer(peer_ip: &str, connection_id: &str, command: PeerCommand) -> bool {
     let mut active = peers().lock().await;
     let Some(peer) = active.get_mut(peer_ip) else {
@@ -395,6 +416,11 @@ async fn serve_peer_with_policy(
                         hex(&chunk[..n.min(128)])
                     );
                     log_capture(port, &peer, &chunk[..n]);
+                    // The phone dials the address we advertise, so answer with
+                    // the local address of the link it reached us on.
+                    let query_response = crate::net_utils::local_ip_for(Some(&peer.ip().to_string()))
+                        .map(|ip| crate::discovery::announce::announce_payload_for(port, &ip))
+                        .unwrap_or_else(|| crate::discovery::announce::announce_payload(port));
                     loop {
                         let total = match incoming_len(&buf) {
                             Ok(Some(total)) => total,
@@ -406,7 +432,7 @@ async fn serve_peer_with_policy(
                         };
                         read_deadline = tokio::time::Instant::now() + FRAME_TIMEOUT;
                         if buf.starts_with(b"QUERY ") {
-                            let response = crate::discovery::announce::announce_payload(port);
+                            let response = &query_response;
                             if let Err(error) = sock.write_all(response.as_bytes()).await {
                                 warn!("probe[{}]: cannot answer TCP SDP query: {}", port, error);
                                 break 'connection;
@@ -688,31 +714,46 @@ async fn handle_frame(
             reply.is_business = true;
             reply.flags = 0;
             sock.write_all(&reply.encode()).await?;
-            match tokio::time::timeout(
-                tokio::time::Duration::from_millis(100),
-                TcpStream::connect(std::net::SocketAddr::new(peer.ip(), 10153)),
-            )
-            .await
-            {
-                Ok(Ok(probe)) => {
-                    *cloud_probe = Some(probe);
+            // Dialling 10153 at a local peer would hit ourselves and the
+            // phone's WLAN switch would fail, so probe its LAN address.
+            if let Some(probe_target) = phone_lan_address(*peer) {
+                if probe_target != peer.ip() {
                     info!(
-                        "probe[{}]: connected reverse WLAN probe to {}:10153",
+                        "probe[{}]: peer {} is local; probing the phone's LAN address {}",
                         port,
-                        peer.ip()
+                        peer.ip(),
+                        probe_target
                     );
                 }
-                Ok(Err(error)) => warn!(
-                    "probe[{}]: reverse WLAN probe to {}:10153 failed: {}",
-                    port,
-                    peer.ip(),
-                    error
-                ),
-                Err(_) => warn!(
-                    "probe[{}]: reverse WLAN probe to {}:10153 timed out",
+                match tokio::time::timeout(
+                    tokio::time::Duration::from_millis(100),
+                    TcpStream::connect(std::net::SocketAddr::new(probe_target, 10153)),
+                )
+                .await
+                {
+                    Ok(Ok(probe)) => {
+                        *cloud_probe = Some(probe);
+                        info!(
+                            "probe[{}]: connected reverse WLAN probe to {}:10153",
+                            port, probe_target
+                        );
+                    }
+                    Ok(Err(error)) => warn!(
+                        "probe[{}]: reverse WLAN probe to {}:10153 failed: {}",
+                        port, probe_target, error
+                    ),
+                    Err(_) => warn!(
+                        "probe[{}]: reverse WLAN probe to {}:10153 timed out",
+                        port, probe_target
+                    ),
+                }
+            } else {
+                warn!(
+                    "probe[{}]: peer {} is local and no recent LAN address is known; \
+                     skipping the reverse WLAN probe",
                     port,
                     peer.ip()
-                ),
+                );
             }
             info!("probe[{}]: accepted SCP business interaction", port);
         } else {
@@ -793,6 +834,7 @@ async fn handle_frame(
                             "device_type": device_type,
                             "connect_type": "wlan",
                             "device_address": peer.ip().to_string(),
+                            "device_lan_address": phone_lan_address(*peer).map(|ip| ip.to_string()),
                             "connection_id": connection_id,
                         }
                     });
@@ -851,7 +893,7 @@ async fn handle_frame(
                 battery: 100,
                 is_charging: false,
                 connect_type: "wifi".to_string(),
-                ip_address: Some(peer.ip().to_string()),
+                ip_address: phone_lan_address(*peer).map(|ip| ip.to_string()),
                 is_connected: true,
                 last_seen: now,
             };
@@ -911,6 +953,8 @@ async fn handle_frame(
                                 "device_type": device_type,
                                 "connect_type": "wlan",
                                 "device_address": peer.ip().to_string(),
+                                "device_lan_address": phone_lan_address(*peer)
+                                    .map(|ip| ip.to_string()),
                                 "connection_id": connection_id,
                             }
                         });

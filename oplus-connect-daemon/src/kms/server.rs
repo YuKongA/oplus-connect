@@ -463,13 +463,20 @@ async fn accept_loop(
                 &connection_id,
             );
             tokio::pin!(connection);
-            loop {
+            let outcome = loop {
                 tokio::select! {
-                    _ = &mut connection => break,
+                    result = &mut connection => break result,
                     accepted = listener.accept() => match accepted {
                         Ok((extra, _)) => drop(extra),
                         Err(_) => return,
                     },
+                }
+            };
+            if let Err(error) = outcome {
+                if error.kind() == io::ErrorKind::UnexpectedEof {
+                    tracing::debug!(peer = %peer, "KMS peer disconnected");
+                } else {
+                    tracing::warn!(peer = %peer, "KMS peer session ended: {error}");
                 }
             }
         }
@@ -686,6 +693,11 @@ async fn handle_connection(
         // Official peers use plaintext controls even with supportEncrypt=1.
         // Heartbeats also leave this server plaintext, sequence zero, as captured;
         // arrangement and resolution always retain authenticated encryption.
+        tracing::trace!(
+            frame_type = frame.header.metadata.event_type,
+            body_len = frame.body.len(),
+            "KMS peer frame"
+        );
         match frame.header.metadata.event_type {
             4 => {
                 let echo: Heartbeat = serde_json::from_slice(frame.body)
@@ -695,8 +707,11 @@ async fn handle_connection(
             5 => {
                 let _: Heartbeat = serde_json::from_slice(frame.body)
                     .map_err(|_| invalid("invalid KMS heartbeat echo"))?;
+                tracing::debug!("KMS peer heartbeat echo");
             }
-            100 if frame.body == b"alive" => {}
+            100 if frame.body == b"alive" => {
+                tracing::debug!("KMS peer alive");
+            }
             1 => {
                 let (width, height) = parse_resolution(frame.body)?;
                 peer_width = width;
@@ -705,6 +720,7 @@ async fn handle_connection(
             2 => {
                 let event = parse_pointer_event(frame.body)?;
                 if let Some((pct_x, pct_y)) = cross_back_pct(&event, peer_width, peer_height) {
+                    tracing::debug!(generation, pct_x, pct_y, "KMS peer cross-back stored");
                     latest_cross_back.send_replace(Some(CrossBackSnapshot {
                         generation,
                         pct_x,
@@ -713,7 +729,16 @@ async fn handle_connection(
                 }
                 latest_pointer.send_replace(Some(Arc::new(event)));
             }
-            _ => return Err(invalid("unsupported KMS control frame")),
+            other => {
+                // Frames are length-delimited and authenticated, so an unknown
+                // control type can be skipped without desynchronising the wire.
+                // Ending the session here turned a benign extension into a drop.
+                tracing::debug!(
+                    frame_type = other,
+                    body_len = frame.body.len(),
+                    "ignoring unsupported KMS control frame"
+                );
+            }
         }
     }
 }

@@ -4,7 +4,9 @@ use oplus_connect_gui::assets::LocalAssets;
 use tracing::info;
 
 fn main() {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_max_level(oplus_connect_daemon::log_level_from_env())
+        .init();
     info!("Starting OPLUS CONNECT GUI (GPUI Kit)");
 
     gpui_kit::application()

@@ -29,13 +29,25 @@ use crate::kms_settings::ExitDirection;
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// KWin 6.8 has been observed to keep a pointer-barrier capture active while it
+/// stops delivering motion and key events, leaving the desktop unusable until
+/// the session ends. Hand the activation back after this much EIS silence so the
+/// host always recovers. `OPLUS_CONNECT_KMS_IDLE_RELEASE_SECS=0` disables it.
+fn capture_idle_release() -> Option<Duration> {
+    let seconds = std::env::var("OPLUS_CONNECT_KMS_IDLE_RELEASE_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(10);
+    (seconds > 0).then(|| Duration::from_secs(seconds))
+}
+
 #[derive(Debug)]
 pub enum CaptureEvent {
     Ready {
         width: u32,
         height: u32,
     },
-    /// Target Pad entry edge, with Y normalized over the host desktop rectangle.
+    /// Target device entry edge, with Y normalized over the host desktop rectangle.
     Activated {
         activation: u64,
         pct_x: f64,
@@ -50,7 +62,7 @@ pub enum CaptureEvent {
         code: u32,
         pressed: bool,
     },
-    /// Linux evdev key code. All keys, including Escape, belong to the Pad.
+    /// Linux evdev key code. All keys, including Escape, belong to the device.
     Key {
         code: u32,
         pressed: bool,
@@ -71,7 +83,7 @@ pub struct ReturnRequest {
     pub pct_y: f64,
 }
 
-/// Prepare global capture, publish geometry, then wait for the Pad connection gate.
+/// Prepare global capture, publish geometry, then wait for the device connection gate.
 /// Callers cancel and await this task rather than aborting its portal cleanup.
 pub async fn run(
     events: mpsc::Sender<CaptureEvent>,
@@ -454,6 +466,22 @@ fn is_current(devices: &[InputDevice], device: &Device, active: Option<Activatio
     })
 }
 
+/// A capture activation only forwards input from EIS devices whose emulation
+/// sequence matches. Anything else is dropped, which is indistinguishable from
+/// a dead session without telemetry; log the first drop of every episode and
+/// then sample so a stuck host leaves an explanation in the log.
+fn note_dropped_input(dropped: &mut u64, order: &ActivationOrder) {
+    *dropped += 1;
+    if *dropped == 1 || (*dropped % 1000 == 0) {
+        tracing::warn!(
+            dropped,
+            active = ?order.active.map(|active| active.id),
+            eis_sequence = ?order.eis_started,
+            "dropping EIS input without a matching capture activation"
+        );
+    }
+}
+
 async fn capture_events(
     portal: &InputCapture,
     session: &Session<InputCapture>,
@@ -519,8 +547,15 @@ async fn capture_events(
     let mut armed = false;
     let mut order = ActivationOrder::default();
     let mut devices: Vec<InputDevice> = Vec::new();
+    let mut dropped_input = 0u64;
     let mut ctrl_held = false;
     let mut alt_held = false;
+    let idle_release = capture_idle_release();
+    let mut last_input_at = Instant::now();
+    // Proves the capture task is still polling EIS while the session reports
+    // Sharing but no input arrives.
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         if !armed && *enabled.borrow_and_update() {
             portal.enable(session, Default::default()).await?;
@@ -542,12 +577,42 @@ async fn capture_events(
             .unwrap_or_else(|| Instant::now() + ACTIVATION_TIMEOUT);
         tokio::select! {
             biased;
+            _ = heartbeat.tick() => {
+                if let Some(active) = order.active {
+                    if idle_release.is_some_and(|limit| last_input_at.elapsed() >= limit) {
+                        tracing::warn!(
+                            activation = active.id,
+                            idle_ms = last_input_at.elapsed().as_millis() as u64,
+                            "releasing capture after prolonged input silence"
+                        );
+                        let _ = timeout(
+                            Duration::from_millis(500),
+                            portal.release(session, ReleaseOptions::default()
+                                .set_activation_id(active.id)
+                                .set_cursor_position(desktop.return_position(active.zone, 0.5))),
+                        ).await;
+                        order.deactivate(active.id);
+                        ctrl_held = false;
+                        alt_held = false;
+                        for device in &mut devices { device.reset_scroll(); }
+                        emit(events, CaptureEvent::Deactivated)?;
+                        continue;
+                    }
+                }
+                tracing::debug!(
+                    active = ?order.active.map(|active| active.id),
+                    eis_started = ?order.eis_started,
+                    devices = devices.len(),
+                    armed,
+                    "capture loop heartbeat"
+                );
+            }
             changed = return_rx.changed() => {
-                changed.context("Pad return control disconnected")?;
+                changed.context("device return control disconnected")?;
                 let request = *return_rx.borrow_and_update();
                 if let Some(request) = request {
                     if let Some(active) = order.return_activation(request) {
-                        ensure!(request.pct_x.is_finite() && request.pct_y.is_finite(), "Pad return request contained invalid coordinates");
+                        ensure!(request.pct_x.is_finite() && request.pct_y.is_finite(), "device return request contained invalid coordinates");
                         portal.release(session, ReleaseOptions::default()
                             .set_activation_id(active.id)
                             .set_cursor_position(desktop.return_position(active.zone, request.pct_y))).await?;
@@ -575,7 +640,7 @@ async fn capture_events(
             signal = activated.next() => {
                 let signal = signal.context("Input capture activation stream ended")?;
                 if signal.session_handle().as_str() != session_path { continue; }
-                ensure!(armed, "Desktop activated capture before the Pad was connected");
+                ensure!(armed, "Desktop activated capture before the device was connected");
                 let id = signal.activation_id().context("Portal activation omitted its EIS sequence id")?;
                 let barrier = match signal.barrier_id() {
                     Some(ActivatedBarrier::Barrier(id)) => id,
@@ -589,8 +654,8 @@ async fn capture_events(
                 order.portal_started(Activation { id, cursor, zone: desktop.barrier_zones[index] })?;
             }
             changed = enabled.changed() => {
-                changed.context("Pad capture enable gate disconnected")?;
-                ensure!(!armed || *enabled.borrow_and_update(), "Pad capture enable gate was revoked");
+                changed.context("device capture enable gate disconnected")?;
+                ensure!(!armed || *enabled.borrow_and_update(), "device capture enable gate was revoked");
             }
             _ = tokio::time::sleep_until(activation_deadline), if order.deadline.is_some() => {
                 bail!("Portal and EIS did not complete the matching capture activation");
@@ -600,6 +665,7 @@ async fn capture_events(
             // through old StopEmulating events to the new StartEmulating.
             event = input.next(), if order.eis_started.is_none() => {
                 let event = event.context("EIS input transport disconnected")??;
+                last_input_at = Instant::now();
                 match event {
                     EiEvent::Disconnected(_) => bail!("EIS server disconnected capture"),
                     EiEvent::SeatAdded(event) => {
@@ -607,30 +673,59 @@ async fn capture_events(
                         context.flush().context("Binding EIS input capabilities")?;
                     }
                     EiEvent::SeatRemoved(_) => bail!("EIS input seat was removed"),
-                    EiEvent::DeviceAdded(event) => devices.push(InputDevice {
-                        device: event.device, sequence: None,
-                        continuous: (0.0, 0.0), discrete: (None, None),
-                    }),
+                    EiEvent::DeviceAdded(event) => {
+                        tracing::debug!(device = ?event.device, "EIS device added");
+                        devices.push(InputDevice {
+                            device: event.device, sequence: None,
+                            continuous: (0.0, 0.0), discrete: (None, None),
+                        });
+                    }
                     EiEvent::DeviceRemoved(event) => {
+                        tracing::debug!(device = ?event.device, "EIS device removed");
                         ensure!(!is_current(&devices, &event.device, order.active), "Active EIS input device was removed");
                         devices.retain(|entry| entry.device != event.device);
                     }
                     EiEvent::DevicePaused(event) => {
+                        tracing::debug!(
+                            device = ?event.device,
+                            active = ?order.active.map(|active| active.id),
+                            "EIS device paused"
+                        );
                         ensure!(!is_current(&devices, &event.device, order.active), "Active EIS input device was paused");
                         let device = device_mut(&mut devices, &event.device)?;
                         device.sequence = None;
                         device.reset_scroll();
                     }
                     EiEvent::DeviceStartEmulating(event) => {
+                        tracing::debug!(
+                            device = ?event.device,
+                            sequence = event.sequence,
+                            "EIS device start emulating"
+                        );
                         let device = device_mut(&mut devices, &event.device)?;
                         device.sequence = Some(event.sequence);
                         device.reset_scroll();
                         order.eis_started(event.sequence)?;
+                        dropped_input = 0;
                     }
                     EiEvent::DeviceStopEmulating(event) => {
+                        // Losing emulation while the portal still reports an
+                        // active capture is a host-side stall: nothing is
+                        // forwarded until a new StartEmulating arrives.
+                        if order.active.is_some() {
+                            tracing::warn!(
+                                device = ?event.device,
+                                serial = event.serial,
+                                active = ?order.active.map(|active| active.id),
+                                "EIS device stopped emulating during an active capture"
+                            );
+                        } else {
+                            tracing::debug!(device = ?event.device, serial = event.serial, "EIS device stop emulating");
+                        }
                         let device = device_mut(&mut devices, &event.device)?;
                         device.sequence = None;
                         device.reset_scroll();
+                        dropped_input = 0;
                     }
                     EiEvent::PointerMotion(event) if is_current(&devices, &event.device, order.active) => {
                         emit(events, CaptureEvent::Motion { dx: f64::from(event.dx), dy: f64::from(event.dy) })?;
@@ -639,13 +734,20 @@ async fn capture_events(
                         tracing::debug!(code = event.button, pressed = (event.state == ButtonState::Press), "EIS button captured");
                         emit(events, CaptureEvent::Button { code: event.button, pressed: event.state == ButtonState::Press })?;
                     }
-                    EiEvent::KeyboardKey(event) if is_current(&devices, &event.device, order.active) => {
+                    EiEvent::KeyboardKey(event) => {
                         match event.key {
                             29 | 97 => ctrl_held = event.state == KeyState::Press,
                             56 | 100 => alt_held = event.state == KeyState::Press,
+                            // The escape must work even after EIS changed its
+                            // emulation sequence: that is exactly the state in
+                            // which every other key is dropped.
                             1 if event.state == KeyState::Press && ctrl_held && alt_held => {
-                                tracing::warn!("emergency host escape shortcut (Ctrl+Alt+Escape) triggered");
-                                if let Some(active) = order.active {
+                                let target = order.active.or(order.pending);
+                                tracing::warn!(
+                                    activation = ?target.map(|active| active.id),
+                                    "emergency host escape shortcut (Ctrl+Alt+Escape) triggered"
+                                );
+                                if let Some(active) = target {
                                     let _ = portal.release(session, ReleaseOptions::default()
                                         .set_activation_id(active.id)
                                         .set_cursor_position(desktop.return_position(active.zone, 0.5))).await;
@@ -659,6 +761,10 @@ async fn capture_events(
                                 continue;
                             }
                             _ => {}
+                        }
+                        if !is_current(&devices, &event.device, order.active) {
+                            note_dropped_input(&mut dropped_input, &order);
+                            continue;
                         }
                         emit(events, CaptureEvent::Key { code: event.key, pressed: event.state == KeyState::Press })?;
                     }
@@ -678,6 +784,15 @@ async fn capture_events(
                         let dy = device.discrete.1.unwrap_or(device.continuous.1);
                         device.reset_scroll();
                         if dx != 0.0 || dy != 0.0 { emit(events, CaptureEvent::Scroll { dx, dy })?; }
+                    }
+                    // Guarded input arms fall through here when their device is
+                    // not part of the active capture; make that observable.
+                    EiEvent::PointerMotion(_)
+                    | EiEvent::Button(_)
+                    | EiEvent::ScrollDelta(_)
+                    | EiEvent::ScrollDiscrete(_)
+                    | EiEvent::Frame(_) => {
+                        note_dropped_input(&mut dropped_input, &order);
                     }
                     _ => {}
                 }

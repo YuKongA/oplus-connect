@@ -48,16 +48,13 @@ pub const SDP_BROADCAST: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 250);
 pub const DEVICE_TYPE_PC: u16 = 6;
 
 /// Builds the native Windows-style SDP announce used both for UDP responses
-/// and for the phone's TCP `QUERY * HTTP/1.1` probe.
-pub fn announce_payload(connect_port: u16) -> String {
+/// and for the phone's TCP `QUERY * HTTP/1.1` probe. `VIRTUAL_IP` is the address
+/// the phone should dial, so it must be the local address on the link that
+/// reaches that phone, not an arbitrary interface.
+pub fn announce_payload_for(connect_port: u16, virtual_ip: &str) -> String {
     let pdid = crate::net_utils::pdid();
     let display_name = std::env::var("OPLUS_DN").unwrap_or_else(|_| crate::net_utils::hostname());
     let account_digest = std::env::var("OPLUS_AD").unwrap_or_else(|_| "456564".to_string());
-    let virtual_ip = std::env::var("OPLUS_VIRTUAL_IP")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .or_else(local_ipv4)
-        .unwrap_or_else(|| "127.0.0.1".to_string());
     format!(
         concat!(
             "ANNOUNCE * HTTP/1.1\r\n",
@@ -81,6 +78,16 @@ pub fn announce_payload(connect_port: u16) -> String {
         name = display_name,
         virtual_ip = virtual_ip,
     )
+}
+
+/// Convenience wrapper for callers that do not know the peer link yet.
+pub fn announce_payload(connect_port: u16) -> String {
+    let virtual_ip = std::env::var("OPLUS_VIRTUAL_IP")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| crate::net_utils::local_ip_for(None))
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    announce_payload_for(connect_port, &virtual_ip)
 }
 
 pub struct Announcer {
@@ -153,7 +160,7 @@ impl Announcer {
         let virtual_ip = std::env::var("OPLUS_VIRTUAL_IP")
             .ok()
             .filter(|value| !value.is_empty())
-            .or_else(local_ipv4)
+            .or_else(|| crate::net_utils::local_ip_for(None))
             .unwrap_or_else(|| "127.0.0.1".to_string());
 
         Ok(Self {
@@ -170,6 +177,10 @@ impl Announcer {
     }
 
     pub fn payload(&self) -> String {
+        self.payload_with(&self.virtual_ip)
+    }
+
+    pub fn payload_with(&self, virtual_ip: &str) -> String {
         if self.official_sdp {
             // PLZ110 rejects the old tablet namespace as an unsupported LAN
             // packet. This is the native Windows scp.device announcement.
@@ -194,7 +205,7 @@ impl Announcer {
                 ad = self.account_digest,
                 dt = DEVICE_TYPE_PC,
                 name = self.display_name,
-                virtual_ip = self.virtual_ip,
+                virtual_ip = virtual_ip,
             );
         }
 
@@ -222,27 +233,40 @@ impl Announcer {
     }
 
     /// Publishes via SSDP, every detected private subnet, and a known peer.
+    /// Each target carries the local address of the link it leaves from, so the
+    /// phone dials an address it can actually reach on a multi-homed host.
     pub fn announce_once(&self, peer: Option<Ipv4Addr>) {
-        let payload = self.payload();
-        let bytes = payload.as_bytes();
+        let default = self.payload();
+        let directed: Vec<(Ipv4Addr, String)> = self
+            .private_broadcasts
+            .iter()
+            .map(|ip| {
+                let virtual_ip = crate::net_utils::local_ip_for(Some(&ip.to_string()))
+                    .unwrap_or_else(|| self.virtual_ip.clone());
+                (*ip, self.payload_with(&virtual_ip))
+            })
+            .collect();
+        let unicast = peer.map(|ip| {
+            let virtual_ip = crate::net_utils::local_ip_for(Some(&ip.to_string()))
+                .unwrap_or_else(|| self.virtual_ip.clone());
+            (ip, self.payload_with(&virtual_ip))
+        });
 
         for port in [SDP_ANNOUNCE_PORT, SDP_SOURCE_PORT] {
             let bcast = SocketAddr::from((SDP_BROADCAST, port));
-            if let Err(e) = self.socket.send_to(bytes, bcast) {
+            if let Err(e) = self.socket.send_to(default.as_bytes(), bcast) {
                 warn!("sdp announce broadcast {} failed: {}", bcast, e);
             }
-            for ip in &self.private_broadcasts {
-                let directed = SocketAddr::from((*ip, port));
-                if let Err(e) = self.socket.send_to(bytes, directed) {
-                    warn!("sdp directed broadcast {} failed: {}", directed, e);
+            for (ip, payload) in &directed {
+                let target = SocketAddr::from((*ip, port));
+                if let Err(e) = self.socket.send_to(payload.as_bytes(), target) {
+                    warn!("sdp directed broadcast {} failed: {}", target, e);
                 }
             }
-        }
-        if let Some(ip) = peer {
-            for port in [SDP_ANNOUNCE_PORT, SDP_SOURCE_PORT] {
-                let unicast = SocketAddr::from((ip, port));
-                if let Err(e) = self.socket.send_to(bytes, unicast) {
-                    warn!("sdp announce unicast {} failed: {}", unicast, e);
+            if let Some((ip, payload)) = &unicast {
+                let target = SocketAddr::from((*ip, port));
+                if let Err(e) = self.socket.send_to(payload.as_bytes(), target) {
+                    warn!("sdp announce unicast {} failed: {}", target, e);
                 }
             }
         }
@@ -269,9 +293,15 @@ impl Announcer {
                                 .any(|part| part == b"NS: scp.device")
                         {
                             info!("sdp query from {}", source);
+                            if let SocketAddr::V4(v4) = source {
+                                crate::net_utils::remember_lan_peer(*v4.ip());
+                            }
                             // The reply must leave from the official source port
                             // 10151; an ephemeral port is ignored by the phone.
-                            let response = self.payload();
+                            let virtual_ip =
+                                crate::net_utils::local_ip_for(Some(&source.ip().to_string()))
+                                    .unwrap_or_else(|| self.virtual_ip.clone());
+                            let response = self.payload_with(&virtual_ip);
                             let destination = SocketAddr::from((source.ip(), source.port()));
                             if let Err(error) =
                                 self.socket.send_to(response.as_bytes(), destination)
@@ -307,12 +337,6 @@ impl Announcer {
             worker: Some(worker),
         }
     }
-}
-
-fn local_ipv4() -> Option<String> {
-    let socket = UdpSocket::bind(("0.0.0.0", 0)).ok()?;
-    socket.connect(("192.168.2.1", 9)).ok()?;
-    socket.local_addr().ok().map(|addr| addr.ip().to_string())
 }
 
 #[cfg(test)]

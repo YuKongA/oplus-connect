@@ -621,30 +621,10 @@ fn run_pipeline(
                 .context("send queue sink pad")?,
         )
         .context("linking payloader to send queue")?;
-    // Diagnostic mode discards RTP locally to isolate the network leg.
-    let fake_sink = match std::env::var("OPLUS_EXPAND_CAST_FAKE_SINK").as_deref() {
-        Ok("1") => {
-            let sink = gst::ElementFactory::make("fakesink")
-                .property("sync", false)
-                .build()
-                .context("creating diagnostic fakesink")?;
-            pipeline.add(&sink).context("adding diagnostic fakesink")?;
-            tracing::warn!(
-                "OPLUS_EXPAND_CAST_FAKE_SINK=1: discarding RTP locally; the tablet gets no video"
-            );
-            Some(sink)
-        }
-        _ => None,
-    };
     let send_queue_src = send_queue.static_pad("src").context("send queue src pad")?;
-    match &fake_sink {
-        Some(sink) => send_queue_src
-            .link(&sink.static_pad("sink").context("fakesink sink pad")?)
-            .context("linking send queue to diagnostic fakesink")?,
-        None => send_queue_src
-            .link(&webrtc_sink)
-            .context("linking send queue to webrtcbin")?,
-    };
+    send_queue_src
+        .link(&webrtc_sink)
+        .context("linking send queue to webrtcbin")?;
     let _ = webrtc.emit_by_name::<Option<gst_webrtc::WebRTCRTPTransceiver>>(
         "add-transceiver",
         &[
@@ -778,13 +758,8 @@ fn run_pipeline(
     }
 
     // Wait for the video caps so the offer carries the m=video section.
-    let video_pad = if fake_sink.is_some() {
-        &pay_src
-    } else {
-        &webrtc_sink
-    };
     match wait_for_video_caps(
-        video_pad,
+        &webrtc_sink,
         &bus,
         Some(&capture),
         stop,

@@ -186,7 +186,9 @@ pub fn save_kms_direction(exit_direction: crate::kms_settings::ExitDirection) ->
     save_bytes(&kms_settings_path(), &bytes)
 }
 
-fn normalize(devices: &mut [DeviceInfo]) {
+fn normalize(devices: &mut Vec<DeviceInfo>) {
+    let local = oplus_connect_daemon::net_utils::pdid();
+    devices.retain(|device| !device.device_id.eq_ignore_ascii_case(&local));
     for device in devices {
         device.is_connected = false;
         device.battery = 0;

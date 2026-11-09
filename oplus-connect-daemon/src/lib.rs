@@ -20,6 +20,25 @@ pub struct DaemonHandle {
     _shutdown_tx: tokio::sync::oneshot::Sender<()>,
 }
 
+/// Log level from `OPLUS_CONNECT_LOG` (`trace`, `debug`, `info`, `warn`, `error`,
+/// `off`); unknown or missing values select `INFO`. The GUI and its embedded
+/// daemon share one subscriber, so this knob covers both.
+pub fn log_level_from_env() -> tracing_subscriber::filter::LevelFilter {
+    use tracing_subscriber::filter::LevelFilter;
+    match std::env::var("OPLUS_CONNECT_LOG")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "trace" => LevelFilter::TRACE,
+        "debug" => LevelFilter::DEBUG,
+        "warn" => LevelFilter::WARN,
+        "error" => LevelFilter::ERROR,
+        "off" => LevelFilter::OFF,
+        _ => LevelFilter::INFO,
+    }
+}
+
 /// Starts the OPLUS CONNECT daemon service in-process on the active Tokio runtime.
 /// If an external daemon process is already running (instance lock held), returns Ok(None)
 /// so the caller can attach via standard UDS IPC client.
