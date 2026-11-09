@@ -9,7 +9,8 @@ permissions:
   contents: read
 
 jobs:
-  arch-linux:
+  test:
+    name: Test (Arch Linux)
     runs-on: ubuntu-latest
     container: archlinux:base-devel
     defaults:
@@ -35,19 +36,114 @@ jobs:
       - name: Compute dependency key
         id: dependencies
         env:
-          DEPENDENCY_HASH: ${{ hashFiles('PKGBUILD', 'oplus-connect-gui/Cargo.lock', 'oplus-connect-daemon/Cargo.lock') }}
+          DEPENDENCY_HASH: ${{ hashFiles('PKGBUILD', '**/Cargo.toml', '**/Cargo.lock') }}
         run: echo "hash=$DEPENDENCY_HASH" >> "$GITHUB_OUTPUT"
 
       - name: Restore Cargo downloads
         id: cargo-downloads
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@v6
         with:
           path: |
             /home/builder/.cargo/registry
             /home/builder/.cargo/git
-          key: ${{ runner.os }}-arch-cargo-v1-${{ steps.dependencies.outputs.hash }}
+          key: ${{ runner.os }}-arch-cargo-${{ steps.dependencies.outputs.hash }}
           restore-keys: |
-            ${{ runner.os }}-arch-cargo-v1-
+            ${{ runner.os }}-arch-cargo-
+
+      - name: Fix Cargo cache ownership
+        run: |
+          install -d -o builder -g builder /home/builder/.cargo
+          chown -R builder:builder /home/builder/.cargo
+
+      - name: Install package dependencies and fetch sources
+        run: |
+          commit=$(sudo -u builder git rev-parse HEAD)
+          sudo -u builder env HOME=/home/builder \
+            OPLUS_CONNECT_SOURCE_URL="file://${GITHUB_WORKSPACE}#commit=${commit}" \
+            makepkg --syncdeps --nobuild --noconfirm --nosign
+
+      - name: Fingerprint toolchain and system packages
+        id: system
+        run: |
+          fingerprint=$( { rustc --version --verbose; pacman -Q; } | sha256sum | cut -d ' ' -f1)
+          echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+
+      - name: Restore test artifacts
+        id: cargo-test
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            oplus-connect-gui/target
+            oplus-connect-daemon/target
+          key: ${{ runner.os }}-arch-test-target-${{ steps.system.outputs.fingerprint }}-${{ steps.dependencies.outputs.hash }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-arch-test-target-${{ steps.system.outputs.fingerprint }}-${{ steps.dependencies.outputs.hash }}-
+
+      - name: Fix test cache ownership
+        run: |
+          install -d -o builder -g builder oplus-connect-gui/target oplus-connect-daemon/target
+          chown -R builder:builder oplus-connect-gui/target oplus-connect-daemon/target
+
+      - name: Check formatting
+        run: |
+          sudo -u builder env HOME=/home/builder cargo fmt --manifest-path oplus-connect-gui/Cargo.toml -- --check
+          sudo -u builder env HOME=/home/builder cargo fmt --manifest-path oplus-connect-daemon/Cargo.toml -- --check
+
+      - name: Test GUI
+        run: sudo -u builder env HOME=/home/builder CARGO_INCREMENTAL=0 cargo test --release --locked --manifest-path oplus-connect-gui/Cargo.toml
+
+      - name: Test daemon
+        run: sudo -u builder env HOME=/home/builder CARGO_INCREMENTAL=0 cargo test --release --locked --manifest-path oplus-connect-daemon/Cargo.toml
+
+      - name: Save test artifacts
+        if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && steps.cargo-test.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            oplus-connect-gui/target
+            oplus-connect-daemon/target
+          key: ${{ steps.cargo-test.outputs.cache-primary-key }}
+
+  build:
+    name: Build package (Arch Linux)
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install build tools
+        run: pacman -Syu --needed --noconfirm git sudo rust zstd
+
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare unprivileged builder
+        run: |
+          useradd --create-home --shell /bin/bash builder
+          echo 'builder ALL=(ALL) NOPASSWD: /usr/bin/pacman' > /etc/sudoers.d/builder
+          chmod 440 /etc/sudoers.d/builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+
+      - name: Compute dependency key
+        id: dependencies
+        env:
+          DEPENDENCY_HASH: ${{ hashFiles('PKGBUILD', '**/Cargo.toml', '**/Cargo.lock') }}
+        run: echo "hash=$DEPENDENCY_HASH" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Cargo downloads
+        id: cargo-downloads
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            /home/builder/.cargo/registry
+            /home/builder/.cargo/git
+          key: ${{ runner.os }}-arch-cargo-${{ steps.dependencies.outputs.hash }}
+          restore-keys: |
+            ${{ runner.os }}-arch-cargo-
 
       - name: Fix Cargo cache ownership
         run: |
@@ -69,39 +165,29 @@ jobs:
 
       - name: Restore compiled artifacts
         id: cargo-build
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@v6
         with:
-          path: |
-            src/target
-            oplus-connect-daemon/target/release
-          key: ${{ runner.os }}-arch-target-v1-${{ steps.system.outputs.fingerprint }}-${{ steps.dependencies.outputs.hash }}-${{ github.sha }}
+          path: src/target
+          key: ${{ runner.os }}-arch-build-target-${{ steps.system.outputs.fingerprint }}-${{ steps.dependencies.outputs.hash }}-${{ github.sha }}
           restore-keys: |
-            ${{ runner.os }}-arch-target-v1-${{ steps.system.outputs.fingerprint }}-${{ steps.dependencies.outputs.hash }}-
+            ${{ runner.os }}-arch-build-target-${{ steps.system.outputs.fingerprint }}-${{ steps.dependencies.outputs.hash }}-
 
       - name: Fix build cache ownership
         run: |
-          install -d -o builder -g builder src/target oplus-connect-daemon/target/release
-          chown -R builder:builder src/target oplus-connect-daemon/target
+          install -d -o builder -g builder src/target
+          chown -R builder:builder src/target
 
-      - name: Check formatting
-        run: |
-          sudo -u builder env HOME=/home/builder cargo fmt --manifest-path oplus-connect-gui/Cargo.toml -- --check
-          sudo -u builder env HOME=/home/builder cargo fmt --manifest-path oplus-connect-daemon/Cargo.toml -- --check
-
-      - name: Build package and test GUI
+      - name: Build package
         run: |
           commit=$(sudo -u builder git rev-parse HEAD)
           # A stable epoch avoids invalidating native build-script caches each run.
           sudo -u builder env HOME=/home/builder CARGO_INCREMENTAL=0 SOURCE_DATE_EPOCH=1 \
             OPLUS_CONNECT_SOURCE_URL="file://${GITHUB_WORKSPACE}#commit=${commit}" \
-            makepkg --syncdeps --noextract --noconfirm --nosign
-
-      - name: Test daemon
-        run: sudo -u builder env HOME=/home/builder CARGO_INCREMENTAL=0 cargo test --release --locked --manifest-path oplus-connect-daemon/Cargo.toml
+            makepkg --syncdeps --noextract --nocheck --noconfirm --nosign
 
       - name: Save Cargo downloads
         if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && steps.cargo-downloads.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@v6
         with:
           path: |
             /home/builder/.cargo/registry
@@ -110,11 +196,9 @@ jobs:
 
       - name: Save compiled artifacts
         if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && steps.cargo-build.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@v6
         with:
-          path: |
-            src/target
-            oplus-connect-daemon/target/release
+          path: src/target
           key: ${{ steps.cargo-build.outputs.cache-primary-key }}
 
       - name: Upload package
