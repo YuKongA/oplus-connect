@@ -1,6 +1,6 @@
 [package]
 name = "oplus-connect-gui"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 
 [dependencies]
@@ -38,6 +38,7 @@ ashpd = { version = "0.14", default-features = false, features = [
 reis = { version = "0.7.1", features = ["tokio"] }
 futures-util = "0.3"
 zbus = { version = "6", default-features = false, features = ["tokio"] }
+ksni = { version = "0.3", features = ["blocking"] }
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 

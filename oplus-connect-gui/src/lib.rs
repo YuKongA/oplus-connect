@@ -18,6 +18,7 @@ mod output_geometry;
 mod persisted;
 pub mod state;
 pub mod theme;
+pub mod tray;
 pub mod views;
 
 /// Version shown in the title bar and settings.
@@ -28,6 +29,8 @@ use gpui_kit::component::WindowExt;
 use gpui_kit::*;
 use models::*;
 use state::{AppState, CastEvent, CastPhase, CastViewState};
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -61,6 +64,38 @@ pub fn shutdown_in_process_daemon() {
             tokio::time::sleep(Duration::from_millis(150)).await;
         }
     });
+}
+
+/// Opens or reattaches the main window without dropping active sharing sessions.
+pub fn open_main_window(
+    cx: &mut App,
+    main_window_id: Rc<Cell<Option<WindowId>>>,
+    root_holder: Rc<RefCell<Option<Entity<RootView>>>>,
+) -> anyhow::Result<AnyWindowHandle> {
+    let bounds = Bounds::centered(None, size(px(1020.0), px(680.0)), cx);
+    let window_options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        window_decorations: Some(WindowDecorations::Client),
+        app_id: Some("oplus-connect".into()),
+        titlebar: Some(TitlebarOptions {
+            title: Some("OPLUS 互联".into()),
+            ..gpui_kit::component::TitleBar::title_bar_options()
+        }),
+        focus: true,
+        show: true,
+        ..gpui_kit::component::TitleBar::window_options()
+    };
+    let root_for_window = root_holder.clone();
+    let (handle, _) = gpui_kit::open_window(window_options, cx, move |_, cx| {
+        if let Some(root) = root_for_window.borrow().clone() {
+            return root;
+        }
+        let root = cx.new(RootView::new);
+        *root_for_window.borrow_mut() = Some(root.clone());
+        root
+    })?;
+    main_window_id.set(Some(handle.window_id()));
+    Ok(handle)
 }
 
 pub struct RootView {
