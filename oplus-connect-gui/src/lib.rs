@@ -616,13 +616,16 @@ impl RootView {
         self.cast_frame_size = (width, height);
     }
 
-    /// Outer window size for a phone-sized video area.
+    /// Outer window size for a phone-sized picture, including the titlebar and
+    /// the navigation bar.
     fn cast_window_size(&self, width: u32, height: u32) -> Size<Pixels> {
         let max_height = 900.0_f32;
         let scale = (max_height / height.max(1) as f32).min(1.0);
         size(
             px(width as f32 * scale),
-            px(height as f32 * scale) + gpui_kit::component::TITLE_BAR_HEIGHT,
+            px(height as f32 * scale)
+                + gpui_kit::component::TITLE_BAR_HEIGHT
+                + px(crate::cast_input::NAV_BAR_HEIGHT),
         )
     }
 
@@ -632,8 +635,9 @@ impl RootView {
         height: u32,
         cx: &mut Context<Self>,
     ) -> WindowOptions {
-        // The titlebar is drawn inside the window, so the window must be that
-        // much taller than the video area; otherwise `Contain` letterboxes it.
+        // The titlebar and navigation bar are drawn inside the window, so the
+        // window is that much taller than the picture; otherwise `Contain`
+        // letterboxes it.
         let bounds = Bounds::centered(None, self.cast_window_size(width, height), cx);
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),

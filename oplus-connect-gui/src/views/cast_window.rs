@@ -1,7 +1,9 @@
 use crate::cast_input;
 use crate::cast_media::VideoFrame;
 use crate::cast_session::InputSender;
+use gpui_kit::component::Icon;
 use gpui_kit::component::TitleBar as KitTitleBar;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::*;
 use smallvec::SmallVec;
 use std::sync::{Arc, Mutex};
@@ -15,6 +17,12 @@ struct WheelState {
     width: u32,
     height: u32,
 }
+
+// Navigation glyphs as 16-unit SVGs; GPUI paints the data as an alpha mask
+// tinted by the icon color.
+const NAV_MENU_GLYPH: &[u8] = include_bytes!("../../assets/nav/ic_sysbar_recent.svg");
+const NAV_HOME_GLYPH: &[u8] = include_bytes!("../../assets/nav/ic_sysbar_home.svg");
+const NAV_BACK_GLYPH: &[u8] = include_bytes!("../../assets/nav/ic_sysbar_back.svg");
 
 pub struct CastWindow {
     frame: Option<Arc<RenderImage>>,
@@ -168,15 +176,82 @@ impl CastWindow {
         }
     }
 
-    /// Map through the displayed picture, excluding the titlebar and letterbox.
+    /// Map a window point into phone pixels through the displayed picture.
     fn phone_point(&self, position: Point<Pixels>, window: &Window) -> (i32, i32) {
         let bounds = window.bounds();
         cast_input::to_phone(
             (position.x.into(), position.y.into()),
             (bounds.size.width.into(), bounds.size.height.into()),
             f32::from(gpui_kit::component::TITLE_BAR_HEIGHT),
+            cast_input::NAV_BAR_HEIGHT,
             self.size,
         )
+    }
+
+    /// Press and release once with an Android navigation keycode.
+    fn send_nav_key(&self, keycode: u8) {
+        let Some(input) = &self.input else { return };
+        let _ = input.send(cast_input::key(keycode, 0, true).to_vec());
+        let _ = input.send(cast_input::key(keycode, 0, false).to_vec());
+    }
+
+    /// Bottom bar split into three equal, fully clickable thirds.
+    fn nav_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let nav_button = |id: &'static str,
+                          glyph: &'static [u8],
+                          label: &'static str,
+                          keycode: u8,
+                          cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .flex_1()
+                .h_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(|style| style.bg(crate::theme::Theme::bg_card_hover()))
+                .aria_label(label)
+                .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
+                .on_click(cx.listener(move |this, _, _, _| this.send_nav_key(keycode)))
+                .child(
+                    Icon::default()
+                        .data(glyph)
+                        .size(px(18.0))
+                        .text_color(crate::theme::Theme::text_secondary()),
+                )
+        };
+
+        div()
+            .h(px(cast_input::NAV_BAR_HEIGHT))
+            .w_full()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .bg(crate::theme::Theme::bg_header())
+            .border_t_1()
+            .border_color(crate::theme::Theme::border_subtle())
+            .child(nav_button(
+                "cast-nav-menu",
+                NAV_MENU_GLYPH,
+                "菜单",
+                cast_input::KEYCODE_APP_SWITCH,
+                cx,
+            ))
+            .child(nav_button(
+                "cast-nav-home",
+                NAV_HOME_GLYPH,
+                "主页",
+                cast_input::KEYCODE_HOME,
+                cx,
+            ))
+            .child(nav_button(
+                "cast-nav-back",
+                NAV_BACK_GLYPH,
+                "返回",
+                cast_input::KEYCODE_BACK,
+                cx,
+            ))
     }
 
     pub fn dimensions(&self) -> (u32, u32) {
@@ -356,5 +431,6 @@ impl Render for CastWindow {
                             .size_full()
                     })),
             )
+            .child(self.nav_bar(cx))
     }
 }

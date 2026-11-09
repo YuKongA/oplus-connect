@@ -970,7 +970,7 @@ Windows 后端使用 `winrt-toast-reborn`（稳定 tag/group 更新、toast hist
 - ODMF/ODMF key 与 DBS 的 KSC 不同
 - 媒体走 UDP，部分封装在 Wintun IP-in-IP 隧道
 
-Rust `cast/` 提供显式启动、ODMF 认证与加密信令收发；GUI 的 `cast_session.rs` 和 `cast_media.rs` 提供 H.264/H.265 视频接收、GPUI 投屏窗口、Opus 音频播放与键鼠反控。中文输入暂不支持。
+Rust `cast/` 提供显式启动、ODMF 认证与加密信令收发；GUI 的 `cast_session.rs` 和 `cast_media.rs` 提供 H.264/H.265 视频接收、GPUI 投屏窗口、Opus 音频播放与键鼠反控。投屏窗口底部绘制菜单、主页、返回三个按钮，通过反控通道发送 Android 键码 187/3/4，与官方 `handleKeyMenuEvent`、`handleKeyHomeEvent`、`handleKeyBackEvent` 的日志一致。中文输入暂不支持。
 
 2026-11-03 补充（证据见 `analysis/cast-kms-20261102/` 与 `analysis/scp-log-recovery-20261102/`）：
 

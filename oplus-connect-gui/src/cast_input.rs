@@ -25,6 +25,16 @@ pub const META_ALT: u32 = 0x12;
 /// Android `META_CTRL_ON | META_CTRL_LEFT_ON`.
 pub const META_CTRL: u32 = 0x3000;
 
+/// Android `KEYCODE_HOME`.
+pub const KEYCODE_HOME: u8 = 3;
+/// Android `KEYCODE_BACK`.
+pub const KEYCODE_BACK: u8 = 4;
+/// Android `KEYCODE_APP_SWITCH`.
+pub const KEYCODE_APP_SWITCH: u8 = 187;
+
+/// Height of the cast window's three-button navigation bar below the picture.
+pub const NAV_BAR_HEIGHT: f32 = 44.0;
+
 fn frame(
     kind: u16,
     class: u8,
@@ -214,11 +224,17 @@ impl KeyboardState {
     }
 }
 
-/// Frame rectangle inside the window: the picture keeps its aspect ratio, so
+/// Picture rectangle inside the window: the picture keeps its aspect ratio, so
 /// the offset is the letterbox margin when the window is not the phone's shape.
-pub fn picture_rect(window: (f32, f32), titlebar: f32, phone: (u32, u32)) -> (f32, f32, f32) {
+/// `titlebar` and `bottom` are window chrome and reduce the available height.
+pub fn picture_rect(
+    window: (f32, f32),
+    titlebar: f32,
+    bottom: f32,
+    phone: (u32, u32),
+) -> (f32, f32, f32) {
     let (window_width, window_height) = window;
-    let content_height = (window_height - titlebar).max(1.0);
+    let content_height = (window_height - titlebar - bottom).max(1.0);
     let phone_width = phone.0.max(1) as f32;
     let phone_height = phone.1.max(1) as f32;
     let scale = (window_width / phone_width).min(content_height / phone_height);
@@ -232,9 +248,10 @@ pub fn to_phone(
     position: (f32, f32),
     window: (f32, f32),
     titlebar: f32,
+    bottom: f32,
     phone: (u32, u32),
 ) -> (i32, i32) {
-    let (left, top, scale) = picture_rect(window, titlebar, phone);
+    let (left, top, scale) = picture_rect(window, titlebar, bottom, phone);
     let x = ((position.0 - left) / scale).round();
     let y = ((position.1 - top) / scale).round();
     (
@@ -346,14 +363,36 @@ mod tests {
                 (360.0, 34.0 + 780.0),
                 (720.0, 34.0 + 1560.0),
                 34.0,
+                0.0,
                 (720, 1560)
             ),
             (360, 780)
         );
         // Outside the picture clamps instead of sending negative coordinates.
         assert_eq!(
-            to_phone((0.0, 0.0), (720.0, 34.0 + 1560.0), 34.0, (720, 1560)),
+            to_phone((0.0, 0.0), (720.0, 34.0 + 1560.0), 34.0, 0.0, (720, 1560)),
             (0, 0)
+        );
+        // Excluding the navigation bar keeps the phone mapping unchanged.
+        assert_eq!(
+            to_phone(
+                (360.0, 34.0 + 780.0),
+                (720.0, 34.0 + 1560.0 + NAV_BAR_HEIGHT),
+                34.0,
+                NAV_BAR_HEIGHT,
+                (720, 1560)
+            ),
+            (360, 780)
+        );
+        // A bar-shrunk picture area letterboxes instead of cropping.
+        assert_eq!(
+            picture_rect(
+                (720.0, 34.0 + 780.0 + NAV_BAR_HEIGHT),
+                34.0,
+                NAV_BAR_HEIGHT,
+                (720, 1560)
+            ),
+            (180.0, 34.0, 0.5)
         );
     }
 }
