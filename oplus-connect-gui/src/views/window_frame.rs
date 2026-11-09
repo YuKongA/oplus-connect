@@ -110,9 +110,7 @@ impl WindowFrame {
             .px(px(8.0))
             .py(px(6.0))
             .rounded_lg()
-            .bg(Theme::bg_card())
-            .border_1()
-            .border_color(Theme::border_card())
+            .bg(Theme::bg_card_hover())
             .child(
                 div()
                     .flex_1()
@@ -123,12 +121,14 @@ impl WindowFrame {
                     .child("守护进程"),
             )
             .child(
+                // The dot alone carries the state; the label stays for a11y.
                 div()
+                    .id("sidebar-daemon-status-dot")
+                    .size(px(8.0))
+                    .rounded_full()
+                    .bg(status_color)
                     .flex_shrink_0()
-                    .text_xs()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(status_color)
-                    .child(status_label),
+                    .aria_label(status_label),
             )
     }
 
@@ -142,20 +142,10 @@ impl WindowFrame {
         // Keep the glyph light in both themes; dark success_foreground is green.
         let icon_color: Hsla = rgb(0xfafafa).into();
         let icon_radius = kit_theme.radius;
-        let (name, status, name_color, status_color) = if let Some(dev) = &state.connected_device {
-            (
-                dev.device_name.clone(),
-                Some("已连接"),
-                Theme::text_primary(),
-                Theme::primary(),
-            )
+        let (name, name_color) = if let Some(dev) = &state.connected_device {
+            (dev.device_name.clone(), Theme::text_primary())
         } else {
-            (
-                "未连接设备".to_string(),
-                None,
-                Theme::text_secondary(),
-                Theme::text_muted(),
-            )
+            ("未连接设备".to_string(), Theme::text_secondary())
         };
 
         div()
@@ -191,14 +181,6 @@ impl WindowFrame {
                     .text_color(name_color)
                     .child(name),
             )
-            .children(status.map(|status| {
-                div()
-                    .flex_shrink_0()
-                    .text_xs()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(status_color)
-                    .child(status)
-            }))
     }
 
     fn nav_item(

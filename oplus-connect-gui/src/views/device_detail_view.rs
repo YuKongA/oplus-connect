@@ -94,8 +94,7 @@ impl DeviceDetailView {
             .ip_address
             .as_deref()
             .filter(|address| !address.is_empty())
-            .map(|address| format!("{address}:10150"))
-            .unwrap_or_else(|| "未提供".to_string());
+            .unwrap_or("未提供");
         let link = if device.connect_type == "usb" {
             "USB"
         } else {
@@ -108,11 +107,6 @@ impl DeviceDetailView {
             "未连接"
         };
         let status_color = if is_connected {
-            Theme::primary()
-        } else {
-            Theme::text_muted()
-        };
-        let icon_color = if is_connected {
             Theme::primary()
         } else {
             Theme::text_muted()
@@ -141,9 +135,11 @@ impl DeviceDetailView {
                     .gap(px(16.0))
                     .min_w_0()
                     .child(
-                        Icon::new(IconName::Smartphone)
-                            .size(px(40.0))
-                            .text_color(icon_color)
+                        // The device artwork keeps its transparent margins; cover
+                        // crops them so the phone fills the square thumbnail.
+                        img(crate::assets::asset_path("phone.png"))
+                            .size(px(48.0))
+                            .object_fit(ObjectFit::Cover)
                             .flex_shrink_0(),
                     )
                     .child(
@@ -152,7 +148,7 @@ impl DeviceDetailView {
                             .min_w_0()
                             .flex()
                             .flex_col()
-                            .gap(px(4.0))
+                            .gap(px(2.0))
                             .child(
                                 div()
                                     .flex()
@@ -161,6 +157,7 @@ impl DeviceDetailView {
                                     .child(
                                         div()
                                             .text_lg()
+                                            .line_height(rems(1.25))
                                             .font_weight(FontWeight::BOLD)
                                             .text_color(Theme::text_primary())
                                             .child(device.device_name.clone()),
@@ -180,6 +177,7 @@ impl DeviceDetailView {
                             .child(
                                 div()
                                     .text_xs()
+                                    .line_height(rems(1.25))
                                     .text_color(Theme::text_secondary())
                                     .child(meta),
                             ),
