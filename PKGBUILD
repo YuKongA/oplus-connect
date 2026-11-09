@@ -1,6 +1,6 @@
 # Maintainer: OPLUS Connect contributors
 pkgname=oplus-connect-git
-pkgver=0.1.0.r0.g0000000
+pkgver=1.0.0.r0.g0000000
 pkgrel=1
 pkgdesc='Linux client for OPPO and OnePlus device connectivity'
 arch=('x86_64')
@@ -31,7 +31,7 @@ sha256sums=('SKIP' 'd710c773ba7476e0df6a726d3e7b30447e81afb9eaba8b518f15ba662bf3
 
 pkgver() {
   cd "$srcdir/$_source_name"
-  printf '0.1.0.r%s.g%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+  printf '1.0.0.r%s.g%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
 }
 
 prepare() {
