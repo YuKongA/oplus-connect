@@ -1,11 +1,11 @@
 # Maintainer: OPLUS Connect contributors
-pkgname=oplus-connect-git
+pkgname=oplus-connect
 pkgver=1.0.0.r0.g0000000
 pkgrel=1
 pkgdesc='Linux client for OPPO and OnePlus device connectivity'
 arch=('x86_64')
 url='https://github.com/YuKongA/oplus-connect'
-license=('LicenseRef-unknown')
+license=('MIT')
 # GCC LTO objects from C dependencies are incompatible with Rust's linker.
 options=('!lto' '!debug')
 depends=(
@@ -20,8 +20,6 @@ optdepends=(
   'libva-driver: GPU-specific VA-API driver'
   'networkmanager: determine the current Wi-Fi network'
 )
-provides=('oplus-connect')
-conflicts=('oplus-connect')
 _source_name=oplus-connect
 if [[ -n ${OPLUS_CONNECT_SOURCE_URL:-} ]]; then
   _source_name=oplus-connect-local
@@ -74,4 +72,5 @@ package() {
   install -d "$pkgdir/usr/share/oplus-connect/assets"
   install -m644 oplus-connect-gui/assets/*.png "$pkgdir/usr/share/oplus-connect/assets/"
   install -Dm644 README.md "$pkgdir/usr/share/doc/oplus-connect/README.md"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

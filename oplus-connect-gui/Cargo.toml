@@ -2,6 +2,7 @@
 name = "oplus-connect-gui"
 version = "1.0.0"
 edition = "2024"
+license = "MIT"
 
 [dependencies]
 gpui-kit = "0.9.0"

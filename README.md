@@ -29,8 +29,6 @@ OPLUS_CONNECT_SOURCE_URL="file://$PWD" makepkg -si
 
 上述命令构建本地仓库当前分支已提交的代码，不包含未提交更改；不设置 `OPLUS_CONNECT_SOURCE_URL` 时使用远端最新提交。构建会运行 GUI 测试。安装后从应用菜单启动，或运行 `oplus-connect`。VA-API 需要适配显卡的驱动；无可用 H.264 硬件编码器时可安装 `gst-plugins-ugly` 使用软件编码。
 
-项目目前未声明许可证，软件包将许可证标记为未知；分发前需由项目维护者明确授权。
-
 直接从源码运行需要支持 Rust 工具链和 GStreamer，GUI 会自动启动内嵌 daemon：
 
 ```bash
@@ -66,6 +64,7 @@ oplus-connect-gui/      # GPUI Kit 桌面客户端
 docs/                   # 协议与调试文档
 PKGBUILD                # Arch Linux 软件包构建配方
 oplus-connect.desktop   # 桌面入口
+LICENSE                 # MIT 许可证
 ```
 
 ## 开发
@@ -81,3 +80,7 @@ cargo test --manifest-path oplus-connect-daemon/Cargo.toml
 ```
 
 协议细节见 [docs/oplus-connect-protocol.md](docs/oplus-connect-protocol.md)
+
+## 许可证
+
+本项目以 [MIT 许可证](LICENSE) 发布。
