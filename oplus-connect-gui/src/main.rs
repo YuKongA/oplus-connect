@@ -73,16 +73,16 @@ fn main() {
                                         .any(|window| window.window_id() == window_id)
                                 })
                             });
-                            if !is_open {
-                                if let Err(error) = app.update(|cx| {
+                            if !is_open
+                                && let Err(error) = app.update(|cx| {
                                     oplus_connect_gui::open_main_window(
                                         cx,
                                         tray_window_id.clone(),
                                         tray_root_holder.clone(),
                                     )
-                                }) {
-                                    warn!("cannot reopen main window: {error:#}");
-                                }
+                                })
+                            {
+                                warn!("cannot reopen main window: {error:#}");
                             }
                             app.update(|cx| cx.activate(true));
                         }

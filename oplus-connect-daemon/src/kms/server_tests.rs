@@ -383,10 +383,10 @@ const PEER_POINTER: &[u8] = br#"{"type":1,"down_t":0,"event_t":279847801,"act":7
 async fn wait_pointer(server: &Server, event_time: u64) -> Arc<PeerPointerEvent> {
     timeout(Duration::from_secs(2), async {
         loop {
-            if let Some(event) = server.latest_peer_pointer() {
-                if event.event_t == event_time {
-                    return event;
-                }
+            if let Some(event) = server.latest_peer_pointer()
+                && event.event_t == event_time
+            {
+                return event;
             }
             tokio::task::yield_now().await;
         }

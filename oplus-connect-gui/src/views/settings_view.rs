@@ -2,7 +2,7 @@ use crate::RootView;
 use crate::state::AppState;
 use crate::theme::Theme;
 use gpui_kit::component::group_box::{GroupBox, GroupBoxVariants};
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::Input;
 use gpui_kit::component::select::Select;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::*;
@@ -12,25 +12,16 @@ pub struct SettingsView;
 impl SettingsView {
     pub fn render(
         state: &AppState,
-        codec: Option<
-            &Entity<
-                gpui_kit::component::select::SelectState<
-                    gpui_kit::component::searchable_list::SearchableVec<&'static str>,
-                >,
-            >,
-        >,
-        kms_direction: Option<
-            &Entity<
-                gpui_kit::component::select::SelectState<
-                    gpui_kit::component::searchable_list::SearchableVec<&'static str>,
-                >,
-            >,
-        >,
-        expand_cast_fps: Option<&Entity<InputState>>,
-        expand_cast_bitrate: Option<&Entity<InputState>>,
+        controls: crate::views::SettingsControls<'_>,
         _window: &mut Window,
         cx: &mut Context<RootView>,
     ) -> impl IntoElement {
+        let crate::views::SettingsControls {
+            codec,
+            kms_direction,
+            expand_cast_fps,
+            expand_cast_bitrate,
+        } = controls;
         div()
             .id("settings-view-scroll")
             .flex_1()

@@ -73,10 +73,10 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                         output.proxy.release();
                     }
                 }
-                if state.manager.as_ref().is_some_and(|(id, _)| *id == name) {
-                    if let Some((_, manager)) = state.manager.take() {
-                        manager.destroy();
-                    }
+                if state.manager.as_ref().is_some_and(|(id, _)| *id == name)
+                    && let Some((_, manager)) = state.manager.take()
+                {
+                    manager.destroy();
                 }
             }
             _ => {}

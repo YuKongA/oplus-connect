@@ -420,10 +420,10 @@ impl AppState {
             return;
         }
 
-        if let Some(first) = self.clipboard_history.first() {
-            if first.content == content {
-                return;
-            }
+        if let Some(first) = self.clipboard_history.first()
+            && first.content == content
+        {
+            return;
         }
 
         let record = ClipboardRecord {

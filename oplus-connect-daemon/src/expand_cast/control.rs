@@ -104,6 +104,9 @@ pub struct Controller {
     tablet_res: Option<(u32, u32)>,
     active: bool,
     mode: u8,
+    /// Tests pick a spare port so the fixed one stays free for session tests.
+    #[cfg(test)]
+    port: Option<u16>,
 }
 
 impl ExpandCastRegistry {
@@ -148,6 +151,8 @@ impl ExpandCastRegistry {
             identity: Arc::new(Identity::new()),
             odmf_server: None,
             tablet_res: None,
+            #[cfg(test)]
+            port: None,
             active: false,
             mode: 1,
         };
@@ -276,10 +281,14 @@ impl Controller {
         self.tablet_res = None;
 
         // Start ODMF TCP signaling server on local_ip:7239
+        #[cfg(test)]
+        let port = self.port.unwrap_or(super::EXPAND_CAST_PORT);
+        #[cfg(not(test))]
+        let port = super::EXPAND_CAST_PORT;
         let server_config = ServerConfig {
             bind_ip: self.local_ip,
             peer_ip: self.peer_ip,
-            port: Some(super::EXPAND_CAST_PORT),
+            port: Some(port),
         };
         let server = Server::bind_with_identity(server_config, self.identity.clone())
             .await
@@ -455,11 +464,12 @@ mod tests {
             .register_bus("TEST_PAD", ip, ip, "OPPO Pad", "Linux-PC", "ABCDEF")
             .unwrap();
 
-        let occupied = tokio::net::TcpListener::bind((ip, super::super::EXPAND_CAST_PORT))
-            .await
-            .unwrap();
+        // Hold a spare port to exercise the busy-port rejection.
+        let probe = tokio::net::TcpListener::bind((ip, 0)).await.unwrap();
+        controller.port = Some(probe.local_addr().unwrap().port());
         assert!(controller.start(1).await.is_err());
-        drop(occupied);
+        drop(probe);
+        controller.port = Some(0);
 
         for mode in [1, 2] {
             let publication = controller.start(mode).await.unwrap();

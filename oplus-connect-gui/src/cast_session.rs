@@ -262,14 +262,13 @@ async fn pump_session(
                                 _ = cancelled(cancel) => break Ok(()),
                                 status = client.cast_status(device_id) => status,
                             };
-                            if let Ok(status) = status {
-                                if status.status.as_ref().is_some_and(|s| !s.connection_ids.contains(&id)) {
+                            if let Ok(status) = status
+                                && status.status.as_ref().is_some_and(|s| !s.connection_ids.contains(&id)) {
                                     if input_peer == Some(id) { break result; }
                                     if video_peer == Some(id) { video_peer = None; }
                                     if let Some(peer) = peers.remove(&id) { stop_peer(peer).await; }
                                     continue;
                                 }
-                            }
                         }
                         break result;
                     }

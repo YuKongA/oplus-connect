@@ -315,15 +315,15 @@ impl AppState {
                 }
             }
             "notification_deleted" => {
-                if let Some(data) = val.get("data") {
-                    if let Some(key) = data.get("key").and_then(|v| v.as_str()) {
-                        let key = key.to_string();
-                        let notifs_lock = self.notifications.clone();
-                        tokio::spawn(async move {
-                            let mut notifs = notifs_lock.write().await;
-                            notifs.retain(|n| n.key != key);
-                        });
-                    }
+                if let Some(data) = val.get("data")
+                    && let Some(key) = data.get("key").and_then(|v| v.as_str())
+                {
+                    let key = key.to_string();
+                    let notifs_lock = self.notifications.clone();
+                    tokio::spawn(async move {
+                        let mut notifs = notifs_lock.write().await;
+                        notifs.retain(|n| n.key != key);
+                    });
                 }
             }
             "clipboard_callback" => {
@@ -363,10 +363,10 @@ impl AppState {
                     let history_lock = self.clipboard_history.clone();
                     tokio::spawn(async move {
                         let mut history = history_lock.write().await;
-                        if let Some(first) = history.first() {
-                            if first.content == item.content {
-                                return;
-                            }
+                        if let Some(first) = history.first()
+                            && first.content == item.content
+                        {
+                            return;
                         }
                         history.insert(0, item);
                         if history.len() > 100 {
@@ -377,6 +377,12 @@ impl AppState {
             }
             _ => {}
         }
+    }
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

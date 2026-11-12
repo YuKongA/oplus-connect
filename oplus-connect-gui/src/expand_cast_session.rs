@@ -420,8 +420,8 @@ async fn run_session(
                                     sdp: sdp.to_string(),
                                 });
                             }
-                        } else if inner_obj.get("type").and_then(|v| v.as_str()) == Some("candidate") {
-                            if let Some(candidate) = inner_obj.get("candidate").and_then(|v| v.as_str()) {
+                        } else if inner_obj.get("type").and_then(|v| v.as_str()) == Some("candidate")
+                            && let Some(candidate) = inner_obj.get("candidate").and_then(|v| v.as_str()) {
                                 let label = inner_obj.get("label").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                                 let _ = media.incoming.try_send(SignalingMessage::Ice {
                                     candidate: candidate.to_string(),
@@ -429,7 +429,6 @@ async fn run_session(
                                     mid: Some("0".into()),
                                 });
                             }
-                        }
                     }
                 }
             }
@@ -437,7 +436,7 @@ async fn run_session(
                 let status = match client.expand_cast_status(device_id).await {
                     Ok(status) => status,
                     Err(error) => {
-                        result = Err(error.into());
+                        result = Err(error);
                         break;
                     }
                 };
@@ -450,25 +449,23 @@ async fn run_session(
     }
 
     let _ = events.try_send(ExpandCastEvent::Phase(ExpandCastPhase::Stopping));
-    if pressed {
-        if let Some(session) = &screencast {
-            if let Err(error) = session.release_touch().await {
-                tracing::warn!("释放远程触控失败: {error:#}");
-                if result.is_ok() {
-                    result = Err(error.context("释放远程触控失败"));
-                }
-            }
+    if pressed
+        && let Some(session) = &screencast
+        && let Err(error) = session.release_touch().await
+    {
+        tracing::warn!("释放远程触控失败: {error:#}");
+        if result.is_ok() {
+            result = Err(error.context("释放远程触控失败"));
         }
     }
     media.stop.store(true, Ordering::Release);
     let _ = client.expand_cast_stop(device_id).await;
-    if !sender_finished {
-        if tokio::time::timeout(Duration::from_secs(5), &mut media.finished)
+    if !sender_finished
+        && tokio::time::timeout(Duration::from_secs(5), &mut media.finished)
             .await
             .is_err()
-        {
-            tracing::warn!("ExpandCast sender did not stop within 5 seconds");
-        }
+    {
+        tracing::warn!("ExpandCast sender did not stop within 5 seconds");
     }
     if let Some(session) = &mut screencast {
         session.session.close().await;
@@ -583,14 +580,9 @@ impl ScreencastSession {
         let Some((x, y)) = map_touch(
             touch.x,
             touch.y,
-            tablet_width,
-            tablet_height,
-            geometry.out_width,
-            geometry.out_height,
-            geometry.render_width,
-            geometry.render_height,
-            logical_width,
-            logical_height,
+            (tablet_width, tablet_height),
+            geometry,
+            (logical_width, logical_height),
         ) else {
             return Ok(());
         };
@@ -613,15 +605,19 @@ impl ScreencastSession {
 fn map_touch(
     x: u32,
     y: u32,
-    tablet_width: u32,
-    tablet_height: u32,
-    output_width: u32,
-    output_height: u32,
-    render_width: u32,
-    render_height: u32,
-    logical_width: u32,
-    logical_height: u32,
+    tablet: (u32, u32),
+    geometry: expand_cast_media::MediaGeometry,
+    logical: (u32, u32),
 ) -> Option<(f64, f64)> {
+    let (tablet_width, tablet_height) = tablet;
+    let (logical_width, logical_height) = logical;
+    let expand_cast_media::MediaGeometry {
+        out_width: output_width,
+        out_height: output_height,
+        render_width,
+        render_height,
+        ..
+    } = geometry;
     if tablet_width == 0
         || tablet_height == 0
         || output_width == 0
@@ -779,32 +775,79 @@ async fn try_acquire_screencast(
 mod tests {
     use super::*;
 
+    fn geometry(out: (u32, u32), render: (u32, u32)) -> expand_cast_media::MediaGeometry {
+        expand_cast_media::MediaGeometry {
+            out_width: out.0,
+            out_height: out.1,
+            render_width: render.0,
+            render_height: render.1,
+            pad_x: 0,
+            pad_y: 0,
+        }
+    }
+
     #[test]
     fn maps_content_and_rejects_black_bars() {
         // A 1920x1080 image centered in a 1920x1280 frame, displayed on
         // a 1200x800 tablet, maps to a HiDPI 960x540 logical stream.
         assert_eq!(
-            map_touch(600, 400, 1200, 800, 1920, 1280, 1920, 1080, 960, 540),
+            map_touch(
+                600,
+                400,
+                (1200, 800),
+                geometry((1920, 1280), (1920, 1080)),
+                (960, 540)
+            ),
             Some((480.0, 270.0))
         );
         assert_eq!(
-            map_touch(0, 0, 1200, 800, 1920, 1280, 1920, 1080, 960, 540),
+            map_touch(
+                0,
+                0,
+                (1200, 800),
+                geometry((1920, 1280), (1920, 1080)),
+                (960, 540)
+            ),
             None
         );
         assert_eq!(
-            map_touch(600, 799, 1200, 800, 1920, 1280, 1920, 1080, 960, 540),
+            map_touch(
+                600,
+                799,
+                (1200, 800),
+                geometry((1920, 1280), (1920, 1080)),
+                (960, 540)
+            ),
             None
         );
         assert_eq!(
-            map_touch(1200, 400, 1200, 800, 1920, 1280, 1920, 1080, 960, 540),
+            map_touch(
+                1200,
+                400,
+                (1200, 800),
+                geometry((1920, 1280), (1920, 1080)),
+                (960, 540)
+            ),
             None
         );
         assert_eq!(
-            map_touch(0, 0, 0, 800, 1920, 1280, 1920, 1080, 960, 540),
+            map_touch(
+                0,
+                0,
+                (0, 800),
+                geometry((1920, 1280), (1920, 1080)),
+                (960, 540)
+            ),
             None
         );
         assert_eq!(
-            map_touch(600, 400, 1200, 800, 1200, 800, 1200, 800, 1200, 800),
+            map_touch(
+                600,
+                400,
+                (1200, 800),
+                geometry((1200, 800), (1200, 800)),
+                (1200, 800)
+            ),
             Some((600.0, 400.0))
         );
     }
@@ -812,8 +855,8 @@ mod tests {
     #[test]
     fn legacy_portal_uses_the_single_requested_source_type() {
         use ashpd::desktop::screencast::SourceType;
-        assert_eq!(virtual_source_for_request(Some(1), None, 2).unwrap(), true);
-        assert_eq!(virtual_source_for_request(Some(2), None, 2).unwrap(), false);
+        assert!(virtual_source_for_request(Some(1), None, 2).unwrap());
+        assert!(!virtual_source_for_request(Some(2), None, 2).unwrap());
         assert!(virtual_source_for_request(Some(1), Some(SourceType::MONITOR), 2).is_err());
         assert!(virtual_source_for_request(Some(2), Some(SourceType::VIRTUAL), 2).is_err());
         assert!(virtual_source_for_request(Some(2), None, 3).is_err());

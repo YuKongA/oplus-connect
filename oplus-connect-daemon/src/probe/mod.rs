@@ -92,21 +92,22 @@ pub async fn peer_connection_id(peer_ip: &str) -> Option<String> {
 /// the deadline or create a second approval after a decision.
 async fn note_awaiting_approval(peer_ip: &str, connection_id: &str) {
     let mut active = peers().lock().await;
-    if let Some(peer) = active.get_mut(peer_ip) {
-        if peer.connection_id == connection_id && !peer.decision_made {
-            peer.approval_deadline
-                .get_or_insert_with(|| tokio::time::Instant::now() + APPROVAL_TIMEOUT);
-        }
+    if let Some(peer) = active.get_mut(peer_ip)
+        && peer.connection_id == connection_id
+        && !peer.decision_made
+    {
+        peer.approval_deadline
+            .get_or_insert_with(|| tokio::time::Instant::now() + APPROVAL_TIMEOUT);
     }
 }
 
 async fn clear_awaiting_approval(peer_ip: &str, connection_id: &str) {
     let mut active = peers().lock().await;
-    if let Some(peer) = active.get_mut(peer_ip) {
-        if peer.connection_id == connection_id {
-            peer.approval_deadline = None;
-            peer.decision_made = true;
-        }
+    if let Some(peer) = active.get_mut(peer_ip)
+        && peer.connection_id == connection_id
+    {
+        peer.approval_deadline = None;
+        peer.decision_made = true;
     }
 }
 
@@ -334,20 +335,15 @@ async fn serve_peer_with_policy(
 
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
     let mut chunk = [0u8; READ_CHUNK_LEN];
-    let mut server_handshake: Option<crate::scp::ukey2::ServerHandshake> = None;
-    let mut pending_server_init: Option<Vec<u8>> = None;
-    let mut cloud_probe: Option<TcpStream> = None;
-    let mut accepted = false;
-    let mut sync_identity: Option<crate::scp::proto::ScpSyncData> = None;
-    let mut session_device_id: Option<String> = None;
-    let mut approval_requested = false;
+    let mut session = ProbeSession::default();
+
     let handshake_deadline = tokio::time::Instant::now() + APPROVAL_TIMEOUT;
     let mut read_deadline = tokio::time::Instant::now();
     let mut data_connections = JoinSet::new();
     'connection: loop {
         tokio::select! {
             Some(_) = data_connections.join_next(), if !data_connections.is_empty() => {}
-            _ = tokio::time::sleep_until(handshake_deadline), if server_handshake.as_ref().and_then(|server| server.secure_channel()).is_none() => {
+            _ = tokio::time::sleep_until(handshake_deadline), if session.handshake.as_ref().and_then(|server| server.secure_channel()).is_none() => {
                 warn!("probe[{}]: handshake or approval timed out for {}", port, peer);
                 break;
             }
@@ -357,15 +353,14 @@ async fn serve_peer_with_policy(
             }
             Some(command) = rx.recv() => match command {
                 PeerCommand::Accept => {
-                    accepted = true;
+                    session.accepted = true;
                     clear_awaiting_approval(&peer_ip, &connection_id).await;
                     info!("probe[{}]: accepted connection request from {}", port, peer);
-                    if let Some(server_init) = pending_server_init.take() {
-                        if let Err(error) = send_ukey2_server_init(port, &mut sock, server_init).await {
+                    if let Some(server_init) = session.pending_server_init.take()
+                        && let Err(error) = send_ukey2_server_init(port, &mut sock, server_init).await {
                             warn!("probe[{}]: cannot send UKEY2 ServerInit after acceptance: {}", port, error);
                             break;
                         }
-                    }
                 }
                 PeerCommand::Close => {
                     clear_awaiting_approval(&peer_ip, &connection_id).await;
@@ -442,29 +437,19 @@ async fn serve_peer_with_policy(
                         }
                         let raw = buf[..total].to_vec();
                         buf.drain(..total);
-                        if let Err(e) = handle_frame(
+                        let ctx = FrameContext {
                             port,
-                            &peer,
-                            &connection_id,
-                            &raw,
-                            &state,
-                            &mut sock,
-                            &mut server_handshake,
-                            &mut pending_server_init,
-                            &mut cloud_probe,
-                            &mut sync_identity,
-                            &mut session_device_id,
-                            &mut approval_requested,
-                            accepted,
-                        )
-                        .await
-                        {
+                            peer: &peer,
+                            connection_id: &connection_id,
+                            state: &state,
+                        };
+                        if let Err(e) = handle_frame(&ctx, &mut session, &mut sock, &raw).await {
                             warn!("probe[{}]: frame handling failed: {}", port, e);
                             break 'connection;
                         }
-                        if !accepted && auto_accept {
-                            if let Some(server_init) = pending_server_init.take() {
-                                accepted = true;
+                        if !session.accepted && auto_accept
+                            && let Some(server_init) = session.pending_server_init.take() {
+                                session.accepted = true;
                                 clear_awaiting_approval(&peer_ip, &connection_id).await;
                                 match send_ukey2_server_init(port, &mut sock, server_init).await {
                                     Ok(()) => info!(
@@ -477,7 +462,6 @@ async fn serve_peer_with_policy(
                                     }
                                 }
                             }
-                        }
                     }
                 }
                 Err(e) => {
@@ -511,7 +495,7 @@ async fn serve_peer_with_policy(
         state.broadcast_event(&event.to_string());
     }
 
-    if let Some(device_id) = session_device_id {
+    if let Some(device_id) = session.device_id.take() {
         // The phone closes this handshake socket right after SyncSecure while
         // the data channel keeps running, so only arm a delayed cleanup. An
         // authenticated data channel cancels it.
@@ -667,25 +651,41 @@ fn decode_scp_error(data: &[u8]) -> Option<String> {
     reason
 }
 
-async fn handle_frame(
+/// Fixed identity of the connection whose frames are being handled.
+struct FrameContext<'a> {
     port: u16,
-    peer: &std::net::SocketAddr,
-    connection_id: &str,
-    raw: &[u8],
-    state: &crate::state::AppState,
-    sock: &mut tokio::net::TcpStream,
-    server_handshake: &mut Option<crate::scp::ukey2::ServerHandshake>,
-    pending_server_init: &mut Option<Vec<u8>>,
-    cloud_probe: &mut Option<TcpStream>,
-    sync_identity: &mut Option<crate::scp::proto::ScpSyncData>,
-    session_device_id: &mut Option<String>,
-    approval_requested: &mut bool,
+    peer: &'a std::net::SocketAddr,
+    connection_id: &'a str,
+    state: &'a crate::state::AppState,
+}
+
+/// Protocol state that outlives a single frame on an SCP connection.
+#[derive(Default)]
+struct ProbeSession {
+    handshake: Option<crate::scp::ukey2::ServerHandshake>,
+    pending_server_init: Option<Vec<u8>>,
+    cloud_probe: Option<TcpStream>,
+    sync_identity: Option<crate::scp::proto::ScpSyncData>,
+    device_id: Option<String>,
+    approval_requested: bool,
     accepted: bool,
+}
+
+async fn handle_frame(
+    ctx: &FrameContext<'_>,
+    session: &mut ProbeSession,
+    sock: &mut tokio::net::TcpStream,
+    raw: &[u8],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let port = ctx.port;
+    let peer = ctx.peer;
+    let connection_id = ctx.connection_id;
+    let state = ctx.state;
     let frame = ScpFrame::decode(raw)?;
     let decrypted;
     let payload = if frame.is_encrypted {
-        let channel = server_handshake
+        let channel = session
+            .handshake
             .as_ref()
             .and_then(|server| server.secure_channel())
             .ok_or_else(|| std::io::Error::other("encrypted SCP frame before UKEY2 completion"))?;
@@ -699,7 +699,8 @@ async fn handle_frame(
             return Err(std::io::Error::other("plaintext SCP business frame rejected").into());
         }
         if payload == b"interact hello" || payload == b"reconnect interact hello" {
-            let channel = server_handshake
+            let channel = session
+                .handshake
                 .as_ref()
                 .and_then(|server| server.secure_channel())
                 .ok_or_else(|| {
@@ -732,7 +733,7 @@ async fn handle_frame(
                 .await
                 {
                     Ok(Ok(probe)) => {
-                        *cloud_probe = Some(probe);
+                        session.cloud_probe = Some(probe);
                         info!(
                             "probe[{}]: connected reverse WLAN probe to {}:10153",
                             port, probe_target
@@ -813,8 +814,8 @@ async fn handle_frame(
                 // The phone names itself here, before SyncSecure. Keep these
                 // values for this connection rather than reporting placeholders.
                 let device_name = sync.device_name.clone();
-                let device_type = crate::state::device_type_name(sync.device_type as u64);
-                *sync_identity = Some(sync);
+                let device_type = crate::state::device_type_name(sync.device_type);
+                session.sync_identity = Some(sync);
                 send_sync_identity(
                     port,
                     sock,
@@ -823,7 +824,7 @@ async fn handle_frame(
                 )
                 .await?;
 
-                if !accepted && !*approval_requested {
+                if !session.accepted && !session.approval_requested {
                     note_awaiting_approval(&peer.ip().to_string(), connection_id).await;
                     let dev = state.get_active_device().await;
                     let payload = serde_json::json!({
@@ -843,7 +844,7 @@ async fn handle_frame(
                         "payload": payload,
                     });
                     state.broadcast_event(&evt.to_string());
-                    *approval_requested = true;
+                    session.approval_requested = true;
                 }
             }
         } else if wrap.msg_type == crate::scp::proto::MSG_SYNC_SECURE {
@@ -856,7 +857,8 @@ async fn handle_frame(
                 String::from_utf8_lossy(&secure.ksc_alias),
                 secure.ksc.len()
             );
-            let channel = server_handshake
+            let channel = session
+                .handshake
                 .as_ref()
                 .and_then(|server| server.secure_channel())
                 .ok_or_else(|| std::io::Error::other("SyncSecure before UKEY2 completion"))?;
@@ -869,8 +871,8 @@ async fn handle_frame(
                 );
             }
             remember_session_ksc(&secure.device_id, &secure.ksc).await;
-            if session_device_id.is_none() {
-                *session_device_id = Some(secure.device_id.clone());
+            if session.device_id.is_none() {
+                session.device_id = Some(secure.device_id.clone());
             }
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -879,13 +881,13 @@ async fn handle_frame(
             // Only the address and session identity are known here. The name,
             // model and firmware come from the phone's Sync frame, and the brand
             // is not carried by this protocol, so absent values stay empty.
-            let identity = sync_identity.as_ref();
+            let identity = session.sync_identity.as_ref();
             let dev_info = crate::state::DeviceInfo {
                 device_id: secure.device_id.clone(),
                 device_name: identity.map(|s| s.device_name.clone()).unwrap_or_default(),
                 device_model: identity.map(|s| s.model_id.clone()).unwrap_or_default(),
                 device_type: crate::state::device_type_name(
-                    identity.map(|s| s.device_type as u64).unwrap_or(0),
+                    identity.map(|s| s.device_type).unwrap_or(0),
                 )
                 .into(),
                 brand: String::new(),
@@ -925,25 +927,28 @@ async fn handle_frame(
         } else if wrap.msg_type == crate::scp::proto::MSG_UKEY2_INIT {
             let message_type = crate::scp::ukey2::message_type(&wrap.data)?;
             if message_type == 2 {
-                let server =
-                    server_handshake.get_or_insert_with(crate::scp::ukey2::ServerHandshake::new);
+                let server = session
+                    .handshake
+                    .get_or_insert_with(crate::scp::ukey2::ServerHandshake::new);
                 let server_init = server.handle_client_init(&wrap.data)?;
-                if accepted {
+                if session.accepted {
                     send_ukey2_server_init(port, sock, server_init).await?;
                 } else {
-                    *pending_server_init = Some(server_init);
+                    session.pending_server_init = Some(server_init);
                     note_awaiting_approval(&peer.ip().to_string(), connection_id).await;
-                    if !*approval_requested {
+                    if !session.approval_requested {
                         let dev = state.get_active_device().await;
-                        let device_name = sync_identity
+                        let device_name = session
+                            .sync_identity
                             .as_ref()
                             .map(|sync| sync.device_name.clone())
                             .filter(|name| !name.trim().is_empty())
                             .or_else(|| dev.as_ref().map(|d| d.device_name.clone()))
                             .unwrap_or_default();
-                        let device_type = sync_identity
+                        let device_type = session
+                            .sync_identity
                             .as_ref()
-                            .map(|sync| crate::state::device_type_name(sync.device_type as u64))
+                            .map(|sync| crate::state::device_type_name(sync.device_type))
                             .unwrap_or("unknown");
                         let payload = serde_json::json!({
                             "event": "onConnectRequested",
@@ -963,7 +968,7 @@ async fn handle_frame(
                             "payload": payload,
                         });
                         state.broadcast_event(&evt.to_string());
-                        *approval_requested = true;
+                        session.approval_requested = true;
                     }
                     info!(
                         "probe[{}]: received phone UKEY2 ClientInit; awaiting approval",
@@ -971,12 +976,12 @@ async fn handle_frame(
                     );
                 }
             } else if message_type == 4 {
-                if !accepted {
+                if !session.accepted {
                     return Err(
                         std::io::Error::other("UKEY2 ClientFinished before approval").into(),
                     );
                 }
-                let server = server_handshake.as_mut().ok_or_else(|| {
+                let server = session.handshake.as_mut().ok_or_else(|| {
                     std::io::Error::other("UKEY2 ClientFinished without ClientInit")
                 })?;
                 let shared_secret = server.handle_client_finished(&wrap.data)?;
@@ -989,13 +994,14 @@ async fn handle_frame(
                 return Err(std::io::Error::other("unexpected UKEY2 message type").into());
             }
         } else if wrap.msg_type == crate::scp::proto::MSG_UKEY2_FINISHED {
-            if !accepted {
+            if !session.accepted {
                 return Err(std::io::Error::other("UKEY2 ClientFinished before approval").into());
             }
             if crate::scp::ukey2::message_type(&wrap.data)? != 4 {
                 return Err(std::io::Error::other("unexpected UKEY2 Finished payload").into());
             }
-            let server = server_handshake
+            let server = session
+                .handshake
                 .as_mut()
                 .ok_or_else(|| std::io::Error::other("UKEY2 ClientFinished without ClientInit"))?;
             let shared_secret = server.handle_client_finished(&wrap.data)?;
@@ -1039,19 +1045,38 @@ fn encode_hello(hello: &ScpHelloData) -> Vec<u8> {
     out
 }
 
+fn protocol_log_dir() -> Option<&'static std::path::Path> {
+    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        std::env::var_os("OPLUS_PROTOCOL_LOG_DIR")
+            .filter(|dir| !dir.is_empty())
+            .map(std::path::PathBuf::from)
+    })
+    .as_deref()
+}
+
+/// Opt-in raw SCP transcript (`OPLUS_PROTOCOL_LOG_DIR`), written `0600`.
 fn log_capture(port: u16, peer: &std::net::SocketAddr, chunk: &[u8]) {
-    let path = if let Ok(dir) = std::env::var("OPLUS_PROTOCOL_LOG_DIR") {
-        std::path::PathBuf::from(dir).join("oppo-scp-capture.log")
-    } else if cfg!(windows) {
-        std::env::temp_dir().join("oppo-scp-capture.log")
-    } else {
-        std::path::PathBuf::from("/tmp/oppo-scp-capture.log")
+    let Some(dir) = protocol_log_dir() else {
+        return;
     };
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
+    let path = dir.join("oppo-scp-capture.log");
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    if let Ok(mut f) = options.open(path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            // `mode` above only applies when the file is created.
+            let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
         let _ = writeln!(f, "[{}] {} <- {}", port, peer, hex(chunk));
     }
 }
@@ -1087,10 +1112,10 @@ mod tests {
         ));
         let connection_id = timeout(Duration::from_secs(1), async {
             loop {
-                if let Some(id) = peer_connection_id(&peer_ip).await {
-                    if Some(&id) != previous_id.as_ref() {
-                        break id;
-                    }
+                if let Some(id) = peer_connection_id(&peer_ip).await
+                    && Some(&id) != previous_id.as_ref()
+                {
+                    break id;
                 }
                 tokio::task::yield_now().await;
             }
@@ -1272,27 +1297,25 @@ mod tests {
             .await
             .unwrap();
         let (mut socket, peer) = listener.accept().await.unwrap();
-        let mut handshake = Some(server);
-        let mut sync_identity = None;
-        let mut approval_requested = false;
+        let mut session = ProbeSession {
+            handshake: Some(server),
+            accepted: true,
+            ..ProbeSession::default()
+        };
         let state = crate::state::AppState::new();
         let mut send = async |payload: Vec<u8>, encrypted: bool| {
             let mut frame = ScpFrame::new(CMD_ACTIVE_CONNECTION, payload);
             frame.is_encrypted = encrypted;
             handle_frame(
-                10152,
-                &peer,
-                "identity-test",
-                &frame.encode(),
-                &state,
+                &FrameContext {
+                    port: 10152,
+                    peer: &peer,
+                    connection_id: "identity-test",
+                    state: &state,
+                },
+                &mut session,
                 &mut socket,
-                &mut handshake,
-                &mut None,
-                &mut None,
-                &mut sync_identity,
-                &mut None,
-                &mut approval_requested,
-                true,
+                &frame.encode(),
             )
             .await
         };
@@ -1334,27 +1357,26 @@ mod tests {
             .await
             .unwrap();
         let (mut socket, peer) = listener.accept().await.unwrap();
-        let mut handshake = Some(server);
-        let mut approval_requested = false;
+        let mut session = ProbeSession {
+            handshake: Some(server),
+            accepted: true,
+            ..ProbeSession::default()
+        };
         let state = crate::state::AppState::new();
         for (payload, encrypted) in [(body, false), (ciphertext, true)] {
             let mut frame = ScpFrame::new(CMD_ACTIVE_CONNECTION, payload);
             frame.is_encrypted = encrypted;
             assert!(
                 handle_frame(
-                    10152,
-                    &peer,
-                    "auth-test",
-                    &frame.encode(),
-                    &state,
+                    &FrameContext {
+                        port: 10152,
+                        peer: &peer,
+                        connection_id: "auth-test",
+                        state: &state,
+                    },
+                    &mut session,
                     &mut socket,
-                    &mut handshake,
-                    &mut None,
-                    &mut None,
-                    &mut None,
-                    &mut None,
-                    &mut approval_requested,
-                    true
+                    &frame.encode(),
                 )
                 .await
                 .is_err()

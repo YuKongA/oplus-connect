@@ -7,6 +7,8 @@ use tokio::sync::broadcast;
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 
+const MAX_SUBSCRIBERS: usize = 16;
+
 pub struct EventHub {
     listeners: Vec<(BoundSocket, broadcast::Receiver<String>)>,
 }
@@ -42,6 +44,22 @@ async fn run_event_listener(
         tokio::select! {
             accepted = socket.listener.accept() => {
                 let (stream, _) = accepted?;
+                while let Some(result) = clients.try_join_next() {
+                    if let Err(error) = result {
+                        warn!("Event subscriber task failed: {}", error);
+                    }
+                }
+                if let Err(error) = crate::ipc::runtime::verify_peer(&stream) {
+                    warn!("Rejected event subscriber: {}", error);
+                    continue;
+                }
+                if clients.len() >= MAX_SUBSCRIBERS {
+                    warn!(
+                        "Rejected event subscriber: {} already connected",
+                        clients.len()
+                    );
+                    continue;
+                }
                 let mut client_rx = rx.resubscribe();
                 clients.spawn(async move {
                     if let Err(error) = stream_events_to_client(stream, &mut client_rx).await {
@@ -66,12 +84,11 @@ async fn stream_events_to_client(
     let mut init_buf = [0u8; 1024];
     tokio::select! {
         read_res = stream.read(&mut init_buf) => {
-            if let Ok(n) = read_res {
-                if n > 0 {
+            if let Ok(n) = read_res
+                && n > 0 {
                     let msg = String::from_utf8_lossy(&init_buf[..n]);
                     info!("Event subscriber handshake: {}", msg.trim());
                 }
-            }
         }
         _ = tokio::time::sleep(tokio::time::Duration::from_millis(50)) => {}
     }

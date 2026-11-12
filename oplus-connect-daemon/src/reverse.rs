@@ -262,7 +262,7 @@ fn parse_phone_sync(frame: &[u8]) -> Result<PhoneSync, String> {
     Ok(PhoneSync {
         name: sync.device_name,
         model: sync.model_id,
-        device_type: sync.device_type as u64,
+        device_type: sync.device_type,
     })
 }
 

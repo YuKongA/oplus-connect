@@ -261,7 +261,16 @@ impl ServerHandshake {
     }
 }
 
-/// The SCP peer uses one AES-256-GCM key and the ClientFinished nonce in both directions.
+impl Default for ServerHandshake {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// One key and nonce per session, both directions, every frame.
+///
+/// Mirrors the vendor wire format: any two frames leak `P1 ^ P2` and the repeated
+/// nonce exposes the GHASH key. Never add a long-lived secret to this channel.
 pub struct SecureChannel {
     key: [u8; 32],
     nonce: [u8; 12],

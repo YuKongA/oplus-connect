@@ -147,23 +147,20 @@ impl CastWindow {
             action,
             cast_input::ACTION_MOVE | cast_input::ACTION_HOVER_MOVE
         );
-        if action == cast_input::ACTION_HOVER_MOVE {
-            if let Some(at) = self.release_at {
-                if at.elapsed() < std::time::Duration::from_millis(250) {
-                    return;
-                }
-            }
+        if action == cast_input::ACTION_HOVER_MOVE
+            && let Some(at) = self.release_at
+            && at.elapsed() < std::time::Duration::from_millis(250)
+        {
+            return;
         }
         if action == cast_input::ACTION_UP {
             self.release_at = Some(now);
         }
-        if throttle {
-            if let Some((last_action, last_x, last_y, at)) = self.last_pointer {
-                let unchanged = last_action == action && last_x == x && last_y == y;
-                let too_soon = at.elapsed() < std::time::Duration::from_millis(16);
-                if unchanged || too_soon {
-                    return;
-                }
+        if throttle && let Some((last_action, last_x, last_y, at)) = self.last_pointer {
+            let unchanged = last_action == action && last_x == x && last_y == y;
+            let too_soon = at.elapsed() < std::time::Duration::from_millis(16);
+            if unchanged || too_soon {
+                return;
             }
         }
         self.last_pointer = Some((action, x, y, now));

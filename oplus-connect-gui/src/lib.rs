@@ -316,10 +316,9 @@ impl RootView {
                         if was_pending && view.state.connection_request.is_none() {
                             window.close_dialog(cx);
                         }
-                        if !was_pending {
-                            if let Some(request) = view.state.connection_request.clone() {
-                                views::confirm_modal::ConfirmModal::open(request, window, cx);
-                            }
+                        if !was_pending && let Some(request) = view.state.connection_request.clone()
+                        {
+                            views::confirm_modal::ConfirmModal::open(request, window, cx);
                         }
                         if view.state.known_devices_dirty {
                             view.state.known_devices_dirty = false;
@@ -764,11 +763,19 @@ impl RootView {
 
     fn start_event_stream_listener(tx: mpsc::Sender<AppEvent>) {
         TOKIO_RT.spawn(async move {
-            let socket_path = DaemonClient::event_socket_path();
+            let mut warned = false;
             loop {
                 if tx.is_closed() {
                     return;
                 }
+                let Some(socket_path) = DaemonClient::event_socket_path() else {
+                    if !warned {
+                        warned = true;
+                        warn!("No private daemon IPC directory; retrying in 3s...");
+                    }
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    continue;
+                };
                 match UnixStream::connect(&socket_path).await {
                     Ok(stream) => {
                         info!("Connected to IPC event stream at {:?}", socket_path);
@@ -917,11 +924,11 @@ impl RootView {
                         }
                     }
                 }
-                if let Some(running) = running {
-                    if self.state.daemon_running != running {
-                        self.state.daemon_running = running;
-                        changed = true;
-                    }
+                if let Some(running) = running
+                    && self.state.daemon_running != running
+                {
+                    self.state.daemon_running = running;
+                    changed = true;
                 }
                 if running == Some(false) && self.kms.active() {
                     self.stop_kms(cx);
@@ -1145,7 +1152,12 @@ impl RootView {
                                     }
                                     None => None,
                                 },
-                                icon_base64: data["icon"].as_str().map(|s| s.to_string()),
+                                icon_base64: data["icon"]
+                                    .as_str()
+                                    .filter(|encoded| {
+                                        encoded.len() <= crate::icons::MAX_ENCODED_ICON_LEN
+                                    })
+                                    .map(|s| s.to_string()),
                                 timestamp: chrono::Local::now(),
                             };
                             self.state.add_notification_record(record);
@@ -1198,19 +1210,19 @@ impl RootView {
                             });
                         if disconnected_id
                             .as_deref()
-                            .map_or(true, |id| id == self.state.cast.device_id)
+                            .is_none_or(|id| id == self.state.cast.device_id)
                         {
                             self.stop_cast(cx);
                         }
                         if disconnected_id
                             .as_deref()
-                            .map_or(true, |id| id == self.kms.device_id)
+                            .is_none_or(|id| id == self.kms.device_id)
                         {
                             self.stop_kms(cx);
                         }
                         if disconnected_id
                             .as_deref()
-                            .map_or(true, |id| id == self.expand_cast.device_id)
+                            .is_none_or(|id| id == self.expand_cast.device_id)
                         {
                             self.stop_expand_cast(cx);
                         }
@@ -1400,14 +1412,17 @@ impl Render for RootView {
                 }));
             self.expand_cast_bitrate_input = Some(input);
         }
+        let controls = views::SettingsControls {
+            codec: self.codec_select.as_ref(),
+            kms_direction: self.kms_direction_select.as_ref(),
+            expand_cast_fps: self.expand_cast_fps_input.as_ref(),
+            expand_cast_bitrate: self.expand_cast_bitrate_input.as_ref(),
+        };
         views::MainContainer::render(
             &self.state,
             &self.kms,
             &self.expand_cast,
-            self.codec_select.as_ref(),
-            self.kms_direction_select.as_ref(),
-            self.expand_cast_fps_input.as_ref(),
-            self.expand_cast_bitrate_input.as_ref(),
+            controls,
             window,
             cx,
         )

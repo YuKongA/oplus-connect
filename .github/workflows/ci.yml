@@ -29,9 +29,22 @@ jobs:
       - name: Prepare unprivileged builder
         run: |
           useradd --create-home --shell /bin/bash builder
-          echo 'builder ALL=(ALL) NOPASSWD: /usr/bin/pacman' > /etc/sudoers.d/builder
-          chmod 440 /etc/sudoers.d/builder
           chown -R builder:builder "$GITHUB_WORKSPACE"
+
+      - name: Resolve package dependencies
+        run: |
+          sudo -u builder env HOME=/home/builder bash -c \
+            'source PKGBUILD && printf "%s\n" "${depends[@]}" "${makedepends[@]}"' \
+            > "$RUNNER_TEMP/dependencies"
+
+      - name: Install package dependencies
+        run: |
+          mapfile -t dependencies < <(grep -xE '^[[:alnum:]@._+\-]+$' "$RUNNER_TEMP/dependencies" | sort -u)
+          if ((${#dependencies[@]} == 0)); then
+            echo 'no package dependencies were resolved' >&2
+            exit 1
+          fi
+          pacman -S --needed --noconfirm "${dependencies[@]}"
 
       - name: Compute dependency key
         id: dependencies
@@ -60,7 +73,7 @@ jobs:
           commit=$(sudo -u builder git rev-parse HEAD)
           sudo -u builder env HOME=/home/builder \
             OPLUS_CONNECT_SOURCE_URL="file://${GITHUB_WORKSPACE}#commit=${commit}" \
-            makepkg --syncdeps --nobuild --noconfirm --nosign
+            makepkg --nodeps --nobuild --noconfirm --nosign
 
       - name: Fingerprint toolchain and system packages
         id: system
@@ -124,9 +137,22 @@ jobs:
       - name: Prepare unprivileged builder
         run: |
           useradd --create-home --shell /bin/bash builder
-          echo 'builder ALL=(ALL) NOPASSWD: /usr/bin/pacman' > /etc/sudoers.d/builder
-          chmod 440 /etc/sudoers.d/builder
           chown -R builder:builder "$GITHUB_WORKSPACE"
+
+      - name: Resolve package dependencies
+        run: |
+          sudo -u builder env HOME=/home/builder bash -c \
+            'source PKGBUILD && printf "%s\n" "${depends[@]}" "${makedepends[@]}"' \
+            > "$RUNNER_TEMP/dependencies"
+
+      - name: Install package dependencies
+        run: |
+          mapfile -t dependencies < <(grep -xE '^[[:alnum:]@._+\-]+$' "$RUNNER_TEMP/dependencies" | sort -u)
+          if ((${#dependencies[@]} == 0)); then
+            echo 'no package dependencies were resolved' >&2
+            exit 1
+          fi
+          pacman -S --needed --noconfirm "${dependencies[@]}"
 
       - name: Compute dependency key
         id: dependencies
@@ -155,7 +181,7 @@ jobs:
           commit=$(sudo -u builder git rev-parse HEAD)
           sudo -u builder env HOME=/home/builder \
             OPLUS_CONNECT_SOURCE_URL="file://${GITHUB_WORKSPACE}#commit=${commit}" \
-            makepkg --syncdeps --nobuild --noconfirm --nosign
+            makepkg --nodeps --nobuild --noconfirm --nosign
 
       - name: Fingerprint toolchain and system packages
         id: system
@@ -183,7 +209,7 @@ jobs:
           # A stable epoch avoids invalidating native build-script caches each run.
           sudo -u builder env HOME=/home/builder CARGO_INCREMENTAL=0 SOURCE_DATE_EPOCH=1 \
             OPLUS_CONNECT_SOURCE_URL="file://${GITHUB_WORKSPACE}#commit=${commit}" \
-            makepkg --syncdeps --noextract --nocheck --noconfirm --nosign
+            makepkg --nodeps --noextract --nocheck --noconfirm --nosign
 
       - name: Save Cargo downloads
         if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && steps.cargo-downloads.outputs.cache-hit != 'true'
@@ -201,9 +227,16 @@ jobs:
           path: src/target
           key: ${{ steps.cargo-build.outputs.cache-primary-key }}
 
+      - name: Checksum package
+        if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        run: sha256sum -- *.pkg.tar.zst > SHA256SUMS
+
       - name: Upload package
+        if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         uses: actions/upload-artifact@v7
         with:
-          name: oplus-connect-arch-x86_64
-          path: "*.pkg.tar.zst"
+          name: oplus-connect-arch-x86_64-${{ github.sha }}
+          path: |
+            *.pkg.tar.zst
+            SHA256SUMS
           if-no-files-found: error

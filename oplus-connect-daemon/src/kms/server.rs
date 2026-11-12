@@ -253,15 +253,19 @@ impl Server {
         let connection_id = Arc::new(AtomicU64::new(0));
         let task = tokio::spawn(accept_loop(
             listener,
-            config,
-            codec,
-            status_tx,
-            latest_pointer.clone(),
-            latest_cross_back.clone(),
-            timing,
-            input_rx,
-            shutdown_rx,
-            connection_id.clone(),
+            ServerShared {
+                config,
+                codec,
+                status: status_tx,
+                latest_pointer: latest_pointer.clone(),
+                latest_cross_back: latest_cross_back.clone(),
+                timing,
+                connection_id: connection_id.clone(),
+            },
+            ConnectionIo {
+                input_rx,
+                shutdown_rx,
+            },
         ));
         Ok(Self {
             task,
@@ -408,20 +412,26 @@ impl Drop for Server {
     }
 }
 
-async fn accept_loop(
-    listener: TcpListener,
+/// Channels and protocol constants every accepted KMS connection needs.
+struct ServerShared {
     config: ServerConfig,
     codec: Codec,
     status: watch::Sender<SessionStatus>,
     latest_pointer: watch::Sender<Option<Arc<PeerPointerEvent>>>,
     latest_cross_back: watch::Sender<Option<CrossBackSnapshot>>,
     timing: Timing,
-    mut input_rx: mpsc::Receiver<InputCommand>,
-    mut shutdown_rx: watch::Receiver<bool>,
     connection_id: Arc<AtomicU64>,
-) {
+}
+
+/// The GUI side of the link, owned by the accept loop between connections.
+struct ConnectionIo {
+    input_rx: mpsc::Receiver<InputCommand>,
+    shutdown_rx: watch::Receiver<bool>,
+}
+
+async fn accept_loop(listener: TcpListener, shared: ServerShared, mut io: ConnectionIo) {
     loop {
-        if *shutdown_rx.borrow() {
+        if *io.shutdown_rx.borrow() {
             break;
         }
         let (stream, peer) = tokio::select! {
@@ -429,7 +439,7 @@ async fn accept_loop(
                 Ok(value) => value,
                 Err(_) => break,
             },
-            command = input_rx.recv() => {
+            command = io.input_rx.recv() => {
                 if let Some(command) = command {
                     reject_command(command, not_connected());
                 } else {
@@ -437,31 +447,21 @@ async fn accept_loop(
                 }
                 continue;
             }
-            changed = shutdown_rx.changed() => {
-                if changed.is_err() || *shutdown_rx.borrow() { break; }
+            changed = io.shutdown_rx.changed() => {
+                if changed.is_err() || *io.shutdown_rx.borrow() { break; }
                 continue;
             }
         };
-        if canonical_ip(peer.ip()) != canonical_ip(config.peer_ip) {
+        if canonical_ip(peer.ip()) != canonical_ip(shared.config.peer_ip) {
             drop(stream);
             continue;
         }
-        status.send_replace(SessionStatus::Handshaking);
+        shared.status.send_replace(SessionStatus::Handshaking);
         {
             // Keep the entire session future alive while rejecting extra peers.
             // There are no spawned connection workers and no unbounded queues.
-            let connection = handle_connection(
-                stream,
-                &config,
-                &codec,
-                &status,
-                &latest_pointer,
-                &latest_cross_back,
-                timing,
-                &mut input_rx,
-                &mut shutdown_rx,
-                &connection_id,
-            );
+            let connection =
+                handle_connection(stream, &shared, &mut io.input_rx, &mut io.shutdown_rx);
             tokio::pin!(connection);
             let outcome = loop {
                 tokio::select! {
@@ -480,16 +480,16 @@ async fn accept_loop(
                 }
             }
         }
-        connection_id.store(0, Ordering::Release);
-        drain_pending_commands(&mut input_rx);
-        latest_pointer.send_replace(None);
-        latest_cross_back.send_replace(None);
-        if *shutdown_rx.borrow() {
+        shared.connection_id.store(0, Ordering::Release);
+        drain_pending_commands(&mut io.input_rx);
+        shared.latest_pointer.send_replace(None);
+        shared.latest_cross_back.send_replace(None);
+        if *io.shutdown_rx.borrow() {
             break;
         }
-        status.send_replace(SessionStatus::Listening);
+        shared.status.send_replace(SessionStatus::Listening);
     }
-    status.send_replace(SessionStatus::Closed);
+    shared.status.send_replace(SessionStatus::Closed);
 }
 
 fn canonical_ip(ip: IpAddr) -> IpAddr {
@@ -534,16 +534,20 @@ fn parse_resolution(body: &[u8]) -> io::Result<(u32, u32)> {
 
 async fn handle_connection(
     mut stream: TcpStream,
-    config: &ServerConfig,
-    codec: &Codec,
-    status: &watch::Sender<SessionStatus>,
-    latest_pointer: &watch::Sender<Option<Arc<PeerPointerEvent>>>,
-    latest_cross_back: &watch::Sender<Option<CrossBackSnapshot>>,
-    timing: Timing,
+    shared: &ServerShared,
     input_rx: &mut mpsc::Receiver<InputCommand>,
     shutdown_rx: &mut watch::Receiver<bool>,
-    connection_id: &Arc<AtomicU64>,
 ) -> io::Result<()> {
+    let ServerShared {
+        config,
+        codec,
+        status,
+        latest_pointer,
+        latest_cross_back,
+        connection_id,
+        ..
+    } = shared;
+    let timing = shared.timing;
     let mut buffer = Vec::new();
     let deadline = Instant::now() + timing.handshake;
     // Timeout cancellation always closes this stream; it is never reused after

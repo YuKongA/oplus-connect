@@ -4,7 +4,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use tokio::net::UnixListener;
+use tokio::net::{UnixListener, UnixStream};
 
 /// Owns the private IPC directory and its exclusive daemon-instance lock.
 pub struct RuntimeDir {
@@ -141,9 +141,46 @@ impl RuntimeDir {
     }
 }
 
-fn effective_uid() -> u32 {
+pub(crate) fn effective_uid() -> u32 {
     // SAFETY: geteuid takes no pointers and has no preconditions.
     unsafe { libc::geteuid() }
+}
+
+/// Rejects IPC peers from another user.
+#[cfg(target_os = "linux")]
+pub(crate) fn verify_peer(stream: &UnixStream) -> io::Result<()> {
+    let mut credential = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: getsockopt writes exactly `length` bytes into the `ucred` we own.
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credential as *mut libc::ucred).cast(),
+            &mut length,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if credential.uid != effective_uid() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "IPC peer runs as a different user",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn verify_peer(_stream: &UnixStream) -> io::Result<()> {
+    // No SO_PEERCRED equivalent; the `0700` directory stays the only gate.
+    Ok(())
 }
 
 fn validate_directory(path: &Path) -> io::Result<()> {
@@ -187,13 +224,12 @@ pub(crate) struct BoundSocket {
 
 impl Drop for BoundSocket {
     fn drop(&mut self) {
-        if let Ok(metadata) = fs::symlink_metadata(&self.path) {
-            if metadata.file_type().is_socket()
-                && metadata.dev() == self.device
-                && metadata.ino() == self.inode
-            {
-                let _ = fs::remove_file(&self.path);
-            }
+        if let Ok(metadata) = fs::symlink_metadata(&self.path)
+            && metadata.file_type().is_socket()
+            && metadata.dev() == self.device
+            && metadata.ino() == self.inode
+        {
+            let _ = fs::remove_file(&self.path);
         }
     }
 }
@@ -285,5 +321,16 @@ mod tests {
         assert!(path.exists());
         drop(owner);
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn peer_credential_check_accepts_the_daemons_own_user() {
+        let runtime = RuntimeDir::temporary().unwrap();
+        let socket = runtime.bind("peer").unwrap();
+        let path = socket.path.to_owned();
+        let client = tokio::spawn(async move { UnixStream::connect(&path).await.unwrap() });
+        let (server, _) = socket.listener.accept().await.unwrap();
+        assert!(verify_peer(&server).is_ok());
+        drop(client.await.unwrap());
     }
 }

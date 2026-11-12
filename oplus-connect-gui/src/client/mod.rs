@@ -4,7 +4,7 @@ use crate::state::{
 use anyhow::{Context, Result, anyhow};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[derive(Debug)]
@@ -24,59 +24,58 @@ pub struct KmsStatus {
     pub status: Option<String>,
 }
 
-#[derive(Clone)]
-pub struct DaemonClient {
-    pub socket_path: PathBuf,
-}
-
-impl Default for DaemonClient {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+/// Resolves on every call: the runtime directory may not exist while the daemon starts.
+#[derive(Clone, Copy, Default)]
+pub struct DaemonClient;
 
 impl DaemonClient {
     pub fn new() -> Self {
-        let socket_path = Self::rpc_socket_path();
-        Self { socket_path }
+        Self
     }
 
-    pub fn rpc_socket_path() -> PathBuf {
-        if let Some(dir) = std::env::var_os("OPLUS_CONNECT_RUNTIME_DIR") {
-            PathBuf::from(dir).join("dsprc-ipc")
-        } else if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-            PathBuf::from(dir).join("oppo-connect").join("dsprc-ipc")
-        } else {
-            PathBuf::from("/tmp/oppo-connect/dsprc-ipc")
-        }
+    /// The daemon's IPC directory, or `None` when it is absent or not owner-only.
+    fn runtime_dir() -> Option<PathBuf> {
+        let dir = match std::env::var_os("OPLUS_CONNECT_RUNTIME_DIR") {
+            Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+            _ => {
+                let root = std::env::var_os("XDG_RUNTIME_DIR").filter(|dir| !dir.is_empty())?;
+                PathBuf::from(root).join("oppo-connect")
+            }
+        };
+        validate_runtime_dir(&dir).then_some(dir)
+    }
+
+    pub fn rpc_socket_path() -> Option<PathBuf> {
+        Some(Self::runtime_dir()?.join("dsprc-ipc"))
     }
 
     pub fn event_socket_paths() -> Vec<PathBuf> {
-        let mut paths = Vec::new();
-        if let Some(dir) = std::env::var_os("OPLUS_CONNECT_RUNTIME_DIR") {
-            paths.push(PathBuf::from(&dir).join("dsp-ipc-event"));
-            paths.push(PathBuf::from(&dir).join("dsprc-ipc-event"));
-        } else if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-            let base = PathBuf::from(dir).join("oppo-connect");
-            paths.push(base.join("dsp-ipc-event"));
-            paths.push(base.join("dsprc-ipc-event"));
-        } else {
-            paths.push(PathBuf::from("/tmp/oppo-connect/dsp-ipc-event"));
-            paths.push(PathBuf::from("/tmp/oppo-connect/dsprc-ipc-event"));
-        }
-        paths
+        let Some(dir) = Self::runtime_dir() else {
+            return Vec::new();
+        };
+        vec![dir.join("dsp-ipc-event"), dir.join("dsprc-ipc-event")]
     }
 
-    pub fn event_socket_path() -> PathBuf {
-        Self::event_socket_paths()
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| PathBuf::from("/tmp/oppo-connect/dsp-ipc-event"))
+    pub fn event_socket_path() -> Option<PathBuf> {
+        Self::event_socket_paths().into_iter().next()
+    }
+
+    fn socket(&self) -> Result<PathBuf> {
+        Self::rpc_socket_path().ok_or_else(|| {
+            anyhow!(
+                "No private daemon IPC directory is available: set XDG_RUNTIME_DIR or \
+                 OPLUS_CONNECT_RUNTIME_DIR to a directory owned by this user with mode 0700"
+            )
+        })
     }
 
     /// Asks the daemon to dial a previously paired device on the LAN.
     pub async fn connect_device(&self, address: &str, device_id: &str) -> Result<()> {
-        let path = format!("/connect_device?ip={address}&device_id={device_id}");
+        let path = format!(
+            "/connect_device?ip={}&device_id={}",
+            encode_query_value(address),
+            encode_query_value(device_id)
+        );
         let body = self.request("POST", &path, None).await?;
         ensure_ok(&body)
     }
@@ -90,7 +89,7 @@ impl DaemonClient {
     }
 
     pub async fn request(&self, method: &str, path: &str, body: Option<&str>) -> Result<String> {
-        let socket_path = self.socket_path.clone();
+        let socket_path = self.socket()?;
         let method = method.to_string();
         let path = path.to_string();
         let body_str = body.unwrap_or("").to_string();
@@ -154,11 +153,11 @@ impl DaemonClient {
     pub async fn get_remote_device(&self) -> Result<Option<RemoteDevicePayload>> {
         let body = self.request("GET", "/get_remote_device", None).await?;
         let resp: serde_json::Value = serde_json::from_str(&body)?;
-        if resp.get("code").and_then(|c| c.as_i64()) == Some(0) {
-            if let Some(data_str) = resp.get("data").and_then(|d| d.as_str()) {
-                let dev: RemoteDevicePayload = serde_json::from_str(data_str)?;
-                return Ok(Some(dev));
-            }
+        if resp.get("code").and_then(|c| c.as_i64()) == Some(0)
+            && let Some(data_str) = resp.get("data").and_then(|d| d.as_str())
+        {
+            let dev: RemoteDevicePayload = serde_json::from_str(data_str)?;
+            return Ok(Some(dev));
         }
         Ok(None)
     }
@@ -572,7 +571,7 @@ impl DaemonClient {
     ) -> Result<String> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         tokio::time::timeout(Duration::from_secs(17), async {
-            let mut stream = tokio::net::UnixStream::connect(&self.socket_path).await?;
+            let mut stream = tokio::net::UnixStream::connect(self.socket()?).await?;
             let body = body.unwrap_or("");
             let request = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
             stream.write_all(request.as_bytes()).await?;
@@ -648,9 +647,53 @@ fn ensure_ok(body: &str) -> Result<()> {
     ))
 }
 
+fn validate_runtime_dir(dir: &Path) -> bool {
+    use std::path::Component;
+    if !dir.is_absolute()
+        || dir
+            .components()
+            .any(|part| matches!(part, Component::ParentDir))
+    {
+        return false;
+    }
+    let mut prefix = PathBuf::new();
+    for component in dir.components() {
+        prefix.push(component);
+        match std::fs::symlink_metadata(&prefix) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            _ => return false,
+        }
+    }
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::symlink_metadata(dir) {
+        Ok(metadata) => metadata.mode() & 0o077 == 0 && metadata.uid() == current_uid(),
+        Err(_) => false,
+    }
+}
+
+fn current_uid() -> u32 {
+    // SAFETY: geteuid takes no pointers and has no preconditions.
+    unsafe { libc::geteuid() }
+}
+
+/// Percent-encodes a peer-supplied value so it cannot add query parameters.
+fn encode_query_value(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(char::from(byte))
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
 #[cfg(test)]
 mod tests {
-    use super::ensure_ok;
+    use super::{encode_query_value, ensure_ok, validate_runtime_dir};
+    use std::path::Path;
 
     #[test]
     fn success_response_is_not_an_error() {
@@ -669,5 +712,44 @@ mod tests {
     fn error_response_carries_the_message() {
         let error = ensure_ok(r#"{"code":400,"msg":"invalid ip"}"#).unwrap_err();
         assert!(error.to_string().contains("invalid ip"));
+    }
+
+    #[test]
+    fn peer_supplied_query_values_cannot_add_parameters() {
+        assert_eq!(encode_query_value("AA:BB&ip=evil"), "AA%3ABB%26ip%3Devil");
+        assert_eq!(encode_query_value("C7 7C"), "C7%207C");
+        assert_eq!(encode_query_value("plain-id_1.2~3"), "plain-id_1.2~3");
+    }
+
+    #[test]
+    fn only_owner_only_real_directories_are_accepted() {
+        use std::fs;
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        let root = std::env::temp_dir().join(format!("oplus-ipc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let private = root.join("private");
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&private)
+            .unwrap();
+        assert!(validate_runtime_dir(&private));
+
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!validate_runtime_dir(&private));
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&private, &link).unwrap();
+        assert!(!validate_runtime_dir(&link));
+        let through_link = link.join("nested");
+        assert!(!validate_runtime_dir(&through_link));
+
+        assert!(!validate_runtime_dir(Path::new("relative/dir")));
+        assert!(!validate_runtime_dir(Path::new("/tmp/../tmp")));
+        assert!(!validate_runtime_dir(Path::new("/tmp")));
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

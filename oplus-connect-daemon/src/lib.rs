@@ -105,14 +105,13 @@ pub async fn start_daemon_service(
 
         let peer_state = state.clone();
         let announcer_worker = announcer.spawn(move || {
-            if let Ok(devices) = peer_state.devices.try_read() {
-                if let Some(ip) = devices
+            if let Ok(devices) = peer_state.devices.try_read()
+                && let Some(ip) = devices
                     .values()
                     .filter_map(|device| device.ip_address.as_deref())
                     .find_map(|ip| ip.parse().ok())
-                {
-                    return Some(ip);
-                }
+            {
+                return Some(ip);
             }
             None
         });

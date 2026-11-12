@@ -319,6 +319,12 @@ impl KmsRegistry {
     }
 }
 
+impl Default for KmsRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BusRegistration {
     pub fn into_controller(
         self,
@@ -375,16 +381,7 @@ impl Controller {
             local_addr: server.local_addr(),
             status: server.status(),
         };
-        let device_info = device_info_json(
-            &self.device_id,
-            self.peer_ip,
-            self.local_ip,
-            &self.peer_name,
-            self.peer_type,
-            &self.local_name,
-            &self.local_device_id,
-            &server,
-        );
+        let device_info = self.device_info_json(&server);
         self.server = Some(server);
         Ok(StartPublication { info, device_info })
     }
@@ -453,24 +450,19 @@ impl Controller {
             server.shutdown().await;
         }
     }
+
+    fn device_info_json(&self, server: &Server) -> String {
+        let body = serde_json::json!({"connection_type":16,"local_device_id":self.local_device_id,"local_device_name":self.local_name,"local_device_type":1,"local_ip":self.local_ip.to_string(),"mode":0,"randomPwd":server.password(),"remote_device_id":self.device_id,"remote_device_ip":self.peer_ip.to_string(),"remote_device_name":self.peer_name,"remote_device_type":self.peer_type,"socket_port":server.local_addr().port(),"testData":server.test_data(),"version":"17.20.3"});
+        let msg = serde_json::json!({"client_id":-1,"msg_body":body.to_string(),"msg_cmd":"pc_device_info","msg_type":0,"msg_value":0});
+        panta::topic_data_json(
+            "Oplus_KeyMouseLink",
+            &serde_json::json!({"key":"kms_ability_sync","value":msg.to_string()}).to_string(),
+        )
+    }
 }
 
-fn device_info_json(
-    device_id: &str,
-    peer_ip: IpAddr,
-    local_ip: IpAddr,
-    peer_name: &str,
-    peer_type: u8,
-    local_name: &str,
-    local_device_id: &str,
-    server: &Server,
-) -> String {
-    let body = serde_json::json!({"connection_type":16,"local_device_id":local_device_id,"local_device_name":local_name,"local_device_type":1,"local_ip":local_ip.to_string(),"mode":0,"randomPwd":server.password(),"remote_device_id":device_id,"remote_device_ip":peer_ip.to_string(),"remote_device_name":peer_name,"remote_device_type":peer_type,"socket_port":server.local_addr().port(),"testData":server.test_data(),"version":"17.20.3"});
-    let msg = serde_json::json!({"client_id":-1,"msg_body":body.to_string(),"msg_cmd":"pc_device_info","msg_type":0,"msg_value":0});
-    panta::topic_data_json(
-        "Oplus_KeyMouseLink",
-        &serde_json::json!({"key":"kms_ability_sync","value":msg.to_string()}).to_string(),
-    )
+fn normalize(id: &str) -> String {
+    id.trim().to_ascii_uppercase()
 }
 
 #[cfg(test)]
@@ -675,7 +667,4 @@ mod tests {
             controller.abort().await;
         }
     }
-}
-fn normalize(id: &str) -> String {
-    id.trim().to_ascii_uppercase()
 }

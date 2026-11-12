@@ -247,9 +247,8 @@ async fn run_session(
                     },
                     _ = poll.tick() => {
                         let status = request(client.kms_status(device_id)).await?;
-                        if status.status.as_deref() == Some("connected") {
-                            if let Some(id) = status.connection_id { return Ok(Some(id)); }
-                        }
+                        if status.status.as_deref() == Some("connected")
+                            && let Some(id) = status.connection_id { return Ok(Some(id)); }
                     }
                 }
             }
@@ -311,7 +310,7 @@ async fn run_session(
                 },
                 _ = status_poll.tick() => {
                     status_ticks = status_ticks.saturating_add(1);
-                    if sharing && status_ticks % 10 == 0 {
+                    if sharing && status_ticks.is_multiple_of(10) {
                         tracing::debug!(
                             device_id,
                             idle_ms = last_capture_at.elapsed().as_millis() as u64,
@@ -329,7 +328,7 @@ async fn run_session(
                         }
                         _ => {
                             status_failures += 1;
-                            if status_failures == 1 || status_failures % 10 == 0 {
+                            if status_failures == 1 || status_failures.is_multiple_of(10) {
                                 tracing::warn!(
                                     device_id,
                                     status_failures,

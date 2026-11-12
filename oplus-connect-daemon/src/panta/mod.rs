@@ -181,8 +181,8 @@ pub fn parse_service_connection_request(body: &[u8]) -> Option<ServiceConnection
 fn fixed_tlv_size(tag: u8) -> Option<usize> {
     Some(match tag {
         1 => 4,
-        2 | 3 | 4 | 5 => 2,
-        10 | 11 | 12 | 13 => 1,
+        2..=5 => 2,
+        10..=13 => 1,
         14 => 6,
         _ => return None,
     })
@@ -343,6 +343,18 @@ pub fn mac_confirm(ksc: &[u8], server_rc2: &[u8; 8], client_fc: u64) -> [u8; 8] 
     input.extend_from_slice(server_rc2);
     input.extend_from_slice(&client_fc.to_le_bytes());
     hmac_truncated(ksc, &input)
+}
+
+/// Compares without an early return so timing cannot leak the 8-byte tag.
+fn mac_matches(expected: &[u8], actual: &[u8]) -> bool {
+    if expected.len() != actual.len() {
+        return false;
+    }
+    expected
+        .iter()
+        .zip(actual)
+        .fold(0u8, |diff, (left, right)| diff | (left ^ right))
+        == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1300,10 +1312,10 @@ impl<B: NotificationBackend> DesktopNotifications<B> {
 
     fn flush_due(&mut self, now: std::time::Instant) {
         for state in self.entries.values_mut() {
-            if now >= state.last_update + NOTIFICATION_UPDATE_INTERVAL {
-                if let Some(snapshot) = state.pending.take() {
-                    Self::update(&mut self.backend, state, snapshot, now);
-                }
+            if now >= state.last_update + NOTIFICATION_UPDATE_INTERVAL
+                && let Some(snapshot) = state.pending.take()
+            {
+                Self::update(&mut self.backend, state, snapshot, now);
             }
         }
     }
@@ -1448,10 +1460,10 @@ static DESKTOP_NOTIFICATIONS: std::sync::LazyLock<
 
 #[cfg(unix)]
 fn enqueue_desktop_notification(command: DesktopNotificationCommand) {
-    if let Some(sender) = &*DESKTOP_NOTIFICATIONS {
-        if let Err(error) = sender.send(command) {
-            warn!("desktop notification worker unavailable: {}", error);
-        }
+    if let Some(sender) = &*DESKTOP_NOTIFICATIONS
+        && let Err(error) = sender.send(command)
+    {
+        warn!("desktop notification worker unavailable: {}", error);
     }
 }
 
@@ -1717,24 +1729,40 @@ pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-fn protocol_log_path(filename: &str) -> std::path::PathBuf {
-    if let Ok(dir) = std::env::var("OPLUS_PROTOCOL_LOG_DIR") {
-        return std::path::PathBuf::from(dir).join(filename);
-    }
-    if cfg!(windows) {
-        std::env::temp_dir().join(filename)
-    } else {
-        std::path::PathBuf::from("/tmp").join(filename)
-    }
+/// Opt-in only; records contain decrypted clipboard and notification payloads.
+fn protocol_log_path(filename: &str) -> Option<std::path::PathBuf> {
+    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    let dir = DIR
+        .get_or_init(|| {
+            std::env::var_os("OPLUS_PROTOCOL_LOG_DIR")
+                .filter(|dir| !dir.is_empty())
+                .map(std::path::PathBuf::from)
+        })
+        .as_ref()?;
+    Some(dir.join(filename))
 }
 
 fn append_protocol_log(filename: &str, line: &str) {
     use std::io::Write;
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(protocol_log_path(filename))
+    let Some(path) = protocol_log_path(filename) else {
+        return;
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    if let Ok(mut file) = options.open(path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            // `mode` above only applies when the file is created.
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
         let _ = writeln!(file, "{line}");
     }
 }
@@ -1806,13 +1834,15 @@ impl Drop for DataSessionGuard {
     }
 }
 
+pub type EventBroadcaster = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
 pub async fn serve_with_events<F, Fut>(
     sock: TcpStream,
     peer: std::net::SocketAddr,
     hostname: &str,
     service_count: u8,
     ksc_for_device: F,
-    event_broadcaster: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
+    event_broadcaster: Option<EventBroadcaster>,
     lifecycle: Option<crate::state::AppState>,
 ) where
     F: Fn(String) -> Fut,
@@ -1828,11 +1858,13 @@ pub async fn serve_with_events<F, Fut>(
     run_session(
         sock,
         peer,
-        hostname,
-        service_count,
+        SessionParams {
+            hostname,
+            service_count,
+            event_broadcaster,
+            lifecycle: lifecycle.as_ref(),
+        },
         ksc_for_device,
-        event_broadcaster,
-        lifecycle.as_ref(),
         &mut session.attached,
     )
     .await;
@@ -1846,20 +1878,25 @@ pub async fn serve_with_events<F, Fut>(
     }
 }
 
+/// Everything `run_session` needs from the listener besides the socket itself.
+struct SessionParams<'a> {
+    hostname: &'a str,
+    service_count: u8,
+    event_broadcaster: Option<EventBroadcaster>,
+    lifecycle: Option<&'a crate::state::AppState>,
+}
+
 async fn run_session<F, Fut>(
     mut sock: TcpStream,
     peer: std::net::SocketAddr,
-    hostname: &str,
-    service_count: u8,
+    params: SessionParams<'_>,
     ksc_for_device: F,
-    event_broadcaster: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
-    lifecycle: Option<&crate::state::AppState>,
     attached_device: &mut Option<(String, u64)>,
 ) where
     F: Fn(String) -> Fut,
     Fut: Future<Output = Option<Vec<u8>>>,
 {
-    let offer = build_offer(hostname, service_count, process_endpoint_id());
+    let offer = build_offer(params.hostname, params.service_count, process_endpoint_id());
     if let Err(error) = write_frame(&mut sock, &offer).await {
         warn!("panta[{}]: cannot send EPI offer: {}", peer, error);
         return;
@@ -1949,76 +1986,46 @@ async fn run_session<F, Fut>(
     loop {
         if let (Some(controller), Some(peer_id)) =
             (kms_controller.as_mut(), authenticated_device_id)
+            && local_session_confirmed
+            && link_info_sent
         {
-            if local_session_confirmed && link_info_sent {
-                for _ in 0..64 {
-                    let Some(command) = controller.try_next() else {
-                        break;
-                    };
-                    match command {
-                        crate::kms::control::BusCommand::Start { config, reply } => {
-                            if reply.is_closed() {
-                                continue;
-                            }
-                            match controller.start(config).await {
-                                Ok(publication) => {
-                                    bus_topics.kms = true;
-                                    for (route_head, json) in [
-                                        (0x2a, bus_topics.sync_json()),
-                                        (0x52, publication.device_info),
-                                    ] {
-                                        let frame = build_data_bus_with(
-                                            local_session,
-                                            our_id,
-                                            peer_id,
-                                            route_head,
-                                            &json,
-                                        );
-                                        if !matches!(
-                                            tokio::time::timeout(
-                                                crate::kms::server::WRITE_TIMEOUT,
-                                                write_frame(&mut sock, &frame)
-                                            )
-                                            .await,
-                                            Ok(Ok(()))
-                                        ) {
-                                            controller.abort().await;
-                                            return;
-                                        }
-                                    }
-                                    if reply.send(Ok(publication.info)).is_err() {
-                                        let _ = controller.stop().await;
-                                        bus_topics.kms = false;
-                                        let frame = build_data_bus_with(
-                                            local_session,
-                                            our_id,
-                                            peer_id,
-                                            0x2a,
-                                            &bus_topics.sync_json(),
-                                        );
-                                        if !matches!(
-                                            tokio::time::timeout(
-                                                crate::kms::server::WRITE_TIMEOUT,
-                                                write_frame(&mut sock, &frame)
-                                            )
-                                            .await,
-                                            Ok(Ok(()))
-                                        ) {
-                                            return;
-                                        }
-                                    }
-                                }
-                                Err(error) => {
-                                    let _ = reply.send(Err(error));
-                                }
-                            }
+            for _ in 0..64 {
+                let Some(command) = controller.try_next() else {
+                    break;
+                };
+                match command {
+                    crate::kms::control::BusCommand::Start { config, reply } => {
+                        if reply.is_closed() {
+                            continue;
                         }
-                        crate::kms::control::BusCommand::Stop { reply } => {
-                            if reply.is_closed() {
-                                continue;
-                            }
-                            match controller.stop().await {
-                                Ok(()) => {
+                        match controller.start(config).await {
+                            Ok(publication) => {
+                                bus_topics.kms = true;
+                                for (route_head, json) in [
+                                    (0x2a, bus_topics.sync_json()),
+                                    (0x52, publication.device_info),
+                                ] {
+                                    let frame = build_data_bus_with(
+                                        local_session,
+                                        our_id,
+                                        peer_id,
+                                        route_head,
+                                        &json,
+                                    );
+                                    if !matches!(
+                                        tokio::time::timeout(
+                                            crate::kms::server::WRITE_TIMEOUT,
+                                            write_frame(&mut sock, &frame)
+                                        )
+                                        .await,
+                                        Ok(Ok(()))
+                                    ) {
+                                        controller.abort().await;
+                                        return;
+                                    }
+                                }
+                                if reply.send(Ok(publication.info)).is_err() {
+                                    let _ = controller.stop().await;
                                     bus_topics.kms = false;
                                     let frame = build_data_bus_with(
                                         local_session,
@@ -2037,40 +2044,70 @@ async fn run_session<F, Fut>(
                                     ) {
                                         return;
                                     }
-                                    let _ = reply.send(Ok(()));
-                                }
-                                Err(error) => {
-                                    let _ = reply.send(Err(error));
                                 }
                             }
-                        }
-                        crate::kms::control::BusCommand::Status { reply } => {
-                            let _ = reply.send(controller.status());
-                        }
-                        crate::kms::control::BusCommand::Input {
-                            generation,
-                            event,
-                            reply,
-                        } => {
-                            if reply.is_closed() {
-                                continue;
+                            Err(error) => {
+                                let _ = reply.send(Err(error));
                             }
-                            let result = controller.send_input(generation, event).await;
-                            let _ = reply.send(result);
                         }
-                        crate::kms::control::BusCommand::Release { generation, reply } => {
-                            if reply.is_closed() {
-                                continue;
+                    }
+                    crate::kms::control::BusCommand::Stop { reply } => {
+                        if reply.is_closed() {
+                            continue;
+                        }
+                        match controller.stop().await {
+                            Ok(()) => {
+                                bus_topics.kms = false;
+                                let frame = build_data_bus_with(
+                                    local_session,
+                                    our_id,
+                                    peer_id,
+                                    0x2a,
+                                    &bus_topics.sync_json(),
+                                );
+                                if !matches!(
+                                    tokio::time::timeout(
+                                        crate::kms::server::WRITE_TIMEOUT,
+                                        write_frame(&mut sock, &frame)
+                                    )
+                                    .await,
+                                    Ok(Ok(()))
+                                ) {
+                                    return;
+                                }
+                                let _ = reply.send(Ok(()));
                             }
-                            let result = controller.release_input(generation).await;
-                            let _ = reply.send(result);
-                        }
-                        crate::kms::control::BusCommand::Receive { generation, reply } => {
-                            if reply.is_closed() {
-                                continue;
+                            Err(error) => {
+                                let _ = reply.send(Err(error));
                             }
-                            let _ = reply.send(controller.receive(generation).await);
                         }
+                    }
+                    crate::kms::control::BusCommand::Status { reply } => {
+                        let _ = reply.send(controller.status());
+                    }
+                    crate::kms::control::BusCommand::Input {
+                        generation,
+                        event,
+                        reply,
+                    } => {
+                        if reply.is_closed() {
+                            continue;
+                        }
+                        let result = controller.send_input(generation, event).await;
+                        let _ = reply.send(result);
+                    }
+                    crate::kms::control::BusCommand::Release { generation, reply } => {
+                        if reply.is_closed() {
+                            continue;
+                        }
+                        let result = controller.release_input(generation).await;
+                        let _ = reply.send(result);
+                    }
+                    crate::kms::control::BusCommand::Receive { generation, reply } => {
+                        if reply.is_closed() {
+                            continue;
+                        }
+                        let _ = reply.send(controller.receive(generation).await);
                     }
                 }
             }
@@ -2408,23 +2445,21 @@ async fn run_session<F, Fut>(
                 }
             }
         }
-        if let (Some(state), Some((_, token))) = (lifecycle, attached_device.as_ref()) {
-            if state.take_disconnect_request(*token).await {
-                info!("panta[{}]: closing session on user request", peer);
-                return;
-            }
+        if let (Some(state), Some((_, token))) = (params.lifecycle, attached_device.as_ref())
+            && state.take_disconnect_request(*token).await
+        {
+            info!("panta[{}]: closing session on user request", peer);
+            return;
         }
-        if let Some(peer_id) = peer_device_id {
-            if local_session_confirmed
-                && last_heartbeat.elapsed() >= std::time::Duration::from_secs(5)
-            {
-                last_heartbeat = std::time::Instant::now();
-                let frame =
-                    build_data_bus_with(local_session, our_id, peer_id, 0x51, HEARTBEAT_JSON);
-                if let Err(error) = write_frame(&mut sock, &frame).await {
-                    warn!("panta[{}]: cannot send heartbeat: {}", peer, error);
-                    return;
-                }
+        if let Some(peer_id) = peer_device_id
+            && local_session_confirmed
+            && last_heartbeat.elapsed() >= std::time::Duration::from_secs(5)
+        {
+            last_heartbeat = std::time::Instant::now();
+            let frame = build_data_bus_with(local_session, our_id, peer_id, 0x51, HEARTBEAT_JSON);
+            if let Err(error) = write_frame(&mut sock, &frame).await {
+                warn!("panta[{}]: cannot send heartbeat: {}", peer, error);
+                return;
             }
         }
         // Idle for 700 ms = a chance to mirror local clipboard changes; a
@@ -2512,40 +2547,36 @@ async fn run_session<F, Fut>(
                         }
                     }
                 }
-                if clipboard_enabled && local_session_confirmed {
-                    if let (Some(peer_id), Some(text)) =
+                if clipboard_enabled
+                    && local_session_confirmed
+                    && let (Some(peer_id), Some(text)) =
                         (peer_device_id, read_clipboard_text_async().await)
+                    && text != last_clipboard
+                    && !text.is_empty()
+                {
+                    let session_id = std::env::var("OPLUS_CLIPBOARD_SESSION")
+                        .ok()
+                        .and_then(|value| {
+                            let value = value.trim();
+                            u16::from_str_radix(value.trim_start_matches("0x"), 16).ok()
+                        })
+                        .unwrap_or(local_session);
+                    // Clipboard/notification data use the unite session;
+                    // the separate oshare session is for file/share APIs.
+                    if let Some(frame) =
+                        clipboard_data_frame(clipboard_enabled, session_id, our_id, peer_id, &text)
                     {
-                        if text != last_clipboard && !text.is_empty() {
-                            let session_id = std::env::var("OPLUS_CLIPBOARD_SESSION")
-                                .ok()
-                                .and_then(|value| {
-                                    let value = value.trim();
-                                    u16::from_str_radix(value.trim_start_matches("0x"), 16).ok()
-                                })
-                                .unwrap_or(local_session);
-                            // Clipboard/notification data use the unite session;
-                            // the separate oshare session is for file/share APIs.
-                            if let Some(frame) = clipboard_data_frame(
-                                clipboard_enabled,
-                                session_id,
-                                our_id,
-                                peer_id,
-                                &text,
-                            ) {
-                                if let Err(error) = write_frame(&mut sock, &frame).await {
-                                    warn!("panta[{}]: cannot push clipboard: {}", peer, error);
-                                    return;
-                                }
-                                info!(
-                                    "panta[{}]: pushed clipboard on unite={} ({}B)",
-                                    peer,
-                                    session_id,
-                                    text.len()
-                                );
-                                last_clipboard = text;
-                            }
+                        if let Err(error) = write_frame(&mut sock, &frame).await {
+                            warn!("panta[{}]: cannot push clipboard: {}", peer, error);
+                            return;
                         }
+                        info!(
+                            "panta[{}]: pushed clipboard on unite={} ({}B)",
+                            peer,
+                            session_id,
+                            text.len()
+                        );
+                        last_clipboard = text;
                     }
                 }
                 continue;
@@ -2614,12 +2645,10 @@ async fn run_session<F, Fut>(
                         continue;
                     };
                     let expected = mac_client(&key, &request.client_rc2, request.client_fc);
-                    if expected != request.mac {
+                    if !mac_matches(&expected, &request.mac) {
                         warn!(
-                            "panta[{}]: auth MAC mismatch (got {}, expected {})",
-                            peer,
-                            hex(&request.mac),
-                            hex(&expected)
+                            "panta[{}]: auth MAC mismatch for device {}",
+                            peer, device_id
                         );
                         continue;
                     }
@@ -2652,52 +2681,50 @@ async fn run_session<F, Fut>(
                         continue;
                     };
                     let expected = mac_confirm(key, &server_rc2, client_fc);
-                    if expected == mac {
+                    if mac_matches(&expected, &mac) {
                         info!(
                             "panta[{}]: auth confirm verified, data channel authenticated",
                             peer
                         );
-                        if authenticated_device_id.is_none() {
-                            if let (Some(state), Some(device_id)) =
-                                (lifecycle, pending_auth_device_id)
-                            {
-                                authenticated_device_id = Some(device_id);
-                                authenticated_category = epi_type;
-                                let device_id = hex(&device_id);
-                                let token = state.attach_data_session(&device_id).await;
-                                if let Ok(local_addr) = sock.local_addr() {
-                                    if let Some(registration) = state.kms.register_bus(
-                                        &device_id,
-                                        peer.ip(),
-                                        local_addr.ip(),
-                                    ) {
-                                        kms_controller = Some(registration.into_controller(
-                                            device_id.clone(),
-                                            epi_name.clone(),
-                                            epi_type,
-                                            hostname.to_string(),
-                                            crate::net_utils::pdid(),
-                                        ));
-                                    }
-                                    cast_controller = state.cast.register_bus(
-                                        &device_id,
-                                        peer.ip(),
-                                        local_addr.ip(),
-                                    );
-                                    expand_cast_controller = state
-                                        .expand_cast
-                                        .register_bus(
-                                            &device_id,
-                                            peer.ip(),
-                                            local_addr.ip(),
-                                            &epi_name,
-                                            hostname,
-                                            &crate::net_utils::pdid(),
-                                        )
-                                        .map(|(c, _)| c);
+                        if authenticated_device_id.is_none()
+                            && let (Some(state), Some(device_id)) =
+                                (params.lifecycle, pending_auth_device_id)
+                        {
+                            authenticated_device_id = Some(device_id);
+                            authenticated_category = epi_type;
+                            let device_id = hex(&device_id);
+                            let token = state.attach_data_session(&device_id).await;
+                            if let Ok(local_addr) = sock.local_addr() {
+                                if let Some(registration) =
+                                    state
+                                        .kms
+                                        .register_bus(&device_id, peer.ip(), local_addr.ip())
+                                {
+                                    kms_controller = Some(registration.into_controller(
+                                        device_id.clone(),
+                                        epi_name.clone(),
+                                        epi_type,
+                                        params.hostname.to_string(),
+                                        crate::net_utils::pdid(),
+                                    ));
                                 }
-                                *attached_device = Some((device_id, token));
+                                cast_controller =
+                                    state
+                                        .cast
+                                        .register_bus(&device_id, peer.ip(), local_addr.ip());
+                                expand_cast_controller = state
+                                    .expand_cast
+                                    .register_bus(
+                                        &device_id,
+                                        peer.ip(),
+                                        local_addr.ip(),
+                                        &epi_name,
+                                        params.hostname,
+                                        &crate::net_utils::pdid(),
+                                    )
+                                    .map(|(c, _)| c);
                             }
+                            *attached_device = Some((device_id, token));
                         }
                         let list = build_service_list(&SERVICE_PROFILES);
                         if let Err(error) = write_frame(&mut sock, &list).await {
@@ -2857,290 +2884,276 @@ async fn run_session<F, Fut>(
                             };
                             match cipher.decrypt(&Nonce::from(iv), payload) {
                                 Ok(plain) => {
-                                    if !link_info_sent && is_data_bus_hello(&plain) {
-                                        if let Some(peer_id) = peer_device_id {
-                                            link_info_sent = true;
-                                            if let Err(error) = send_data_bus_handshake(
-                                                &mut sock,
-                                                local_session,
-                                                our_id,
-                                                peer_id,
-                                            )
-                                            .await
-                                            {
-                                                warn!(
-                                                    "panta[{}]: cannot complete DBR handshake: {}",
-                                                    peer, error
-                                                );
-                                                return;
-                                            }
-                                            info!(
-                                                "panta[{}]: replied to phone DBR HELLO with link info, \
-                                                 topic sync, and capability data",
-                                                peer
+                                    if !link_info_sent
+                                        && is_data_bus_hello(&plain)
+                                        && let Some(peer_id) = peer_device_id
+                                    {
+                                        link_info_sent = true;
+                                        if let Err(error) = send_data_bus_handshake(
+                                            &mut sock,
+                                            local_session,
+                                            our_id,
+                                            peer_id,
+                                        )
+                                        .await
+                                        {
+                                            warn!(
+                                                "panta[{}]: cannot complete DBR handshake: {}",
+                                                peer, error
                                             );
+                                            return;
                                         }
+                                        info!(
+                                            "panta[{}]: replied to phone DBR HELLO with link info, \
+                                                 topic sync, and capability data",
+                                            peer
+                                        );
                                     }
                                     if let Some((topic, key)) = kv_message(&plain) {
                                         if topic == "Oplus_MacConnect"
                                             && key == "screen_synergy"
                                             && peer_device_id == authenticated_device_id
-                                        {
-                                            if let Some(event) = tablet_share_request(
+                                            && let Some(event) = tablet_share_request(
                                                 &plain,
                                                 authenticated_device_id,
                                                 authenticated_category,
-                                            ) {
-                                                if let Some(broadcaster) = &event_broadcaster {
-                                                    broadcaster(&event);
-                                                }
-                                            }
+                                            )
+                                            && let Some(broadcaster) =
+                                                params.event_broadcaster.as_ref()
+                                        {
+                                            broadcaster(&event);
                                         }
                                         if topic == "Oplus_MacConnect"
                                             && key == "phone_start_mirror"
                                             && peer_device_id == authenticated_device_id
-                                        {
-                                            if let Some(event) = phone_cast_request(
+                                            && let Some(event) = phone_cast_request(
                                                 &plain,
                                                 authenticated_device_id,
                                                 authenticated_category,
-                                            ) {
-                                                if let Some(broadcaster) = &event_broadcaster {
-                                                    broadcaster(&event);
-                                                }
-                                            }
+                                            )
+                                            && let Some(broadcaster) =
+                                                params.event_broadcaster.as_ref()
+                                        {
+                                            broadcaster(&event);
                                         }
                                         info!("panta[{}]: kv {}.{}", peer, topic, key);
                                         if topic
                                             == "Oplus_HeySynergy_PcConnect_SyncNotification_Publisher"
                                             && key == "HeySynergy_Notification_Add"
-                                        {
-                                            if let Some((
+                                            && let Some((
                                                 notification_key,
                                                 label,
                                                 title,
                                                 content,
                                                 icon,
                                             )) = notification_fields(&plain)
-                                            {
-                                                info!(
-                                                    "panta[{}]: notification [{}] {} | {}",
-                                                    peer, label, title, content
+                                        {
+                                            info!(
+                                                "panta[{}]: notification [{}] {} | {}",
+                                                peer, label, title, content
+                                            );
+                                            if !title.is_empty() || !content.is_empty() {
+                                                show_desktop_notification(
+                                                    &notification_key,
+                                                    &label,
+                                                    &title,
+                                                    &content,
+                                                    icon.as_deref(),
                                                 );
-                                                if !title.is_empty() || !content.is_empty() {
-                                                    show_desktop_notification(
-                                                        &notification_key,
-                                                        &label,
-                                                        &title,
-                                                        &content,
-                                                        icon.as_deref(),
-                                                    );
-                                                }
-                                                if let Some(broadcaster) = &event_broadcaster {
-                                                    let now = std::time::SystemTime::now()
-                                                        .duration_since(std::time::UNIX_EPOCH)
-                                                        .unwrap_or_default()
-                                                        .as_secs();
-                                                    let notif_evt = serde_json::json!({
-                                                        "event": "notification_callback",
-                                                        "data": {
-                                                            "key": notification_key,
-                                                            "label": label,
-                                                            "title": title,
-                                                            "content": content,
-                                                            "icon": icon,
-                                                            "timestamp": now,
-                                                        }
-                                                    });
-                                                    broadcaster(&notif_evt.to_string());
-                                                }
+                                            }
+                                            if let Some(broadcaster) =
+                                                params.event_broadcaster.as_ref()
+                                            {
+                                                let now = std::time::SystemTime::now()
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                    .unwrap_or_default()
+                                                    .as_secs();
+                                                let notif_evt = serde_json::json!({
+                                                    "event": "notification_callback",
+                                                    "data": {
+                                                        "key": notification_key,
+                                                        "label": label,
+                                                        "title": title,
+                                                        "content": content,
+                                                        "icon": icon,
+                                                        "timestamp": now,
+                                                    }
+                                                });
+                                                broadcaster(&notif_evt.to_string());
                                             }
                                         }
                                         if topic
                                             == "Oplus_HeySynergy_PcConnect_SyncNotification_Publisher"
                                             && key == "HeySynergy_Notification_Delete"
-                                        {
-                                            if let Some(notification_key) = notification_control_key(
+                                            && let Some(notification_key) = notification_control_key(
                                                 &plain,
                                                 "HeySynergy_Notification_Delete",
-                                            ) {
-                                                #[cfg(any(unix, windows))]
-                                                close_desktop_notification(&notification_key);
-                                                if let Some(broadcaster) = &event_broadcaster {
-                                                    let del_evt = serde_json::json!({
-                                                        "event": "notification_deleted",
-                                                        "data": {
-                                                            "key": notification_key
-                                                        }
-                                                    });
-                                                    broadcaster(&del_evt.to_string());
-                                                }
-                                            }
-                                        }
-                                        if key == "clipboard_data" {
-                                            if let Some(text) = clipboard_text_from(
-                                                &String::from_utf8_lossy(&plain),
-                                            ) {
-                                                let preview = text
-                                                    .char_indices()
-                                                    .nth(120)
-                                                    .map_or(text.as_str(), |(index, _)| {
-                                                        &text[..index]
-                                                    });
-                                                info!(
-                                                    "panta[{}]: phone clipboard ({}B): {}",
-                                                    peer,
-                                                    text.len(),
-                                                    preview
-                                                );
-                                                if let Some(broadcaster) = &event_broadcaster {
-                                                    let clip_evt = serde_json::json!({
-                                                        "event": "clipboard_callback",
-                                                        "type": "text",
-                                                        "source": "remote",
-                                                        "content": text,
-                                                    });
-                                                    broadcaster(&clip_evt.to_string());
-                                                }
-                                                if write_clipboard_text_async(&text).await {
-                                                    last_clipboard = text;
-                                                }
-                                            }
-                                        }
-                                        if key == "switchStatus" || key == "clipboard_state_active"
+                                            )
                                         {
-                                            if let Some(enabled) = clipboard_enabled_from(&plain) {
-                                                clipboard_enabled = enabled;
-                                                info!(
-                                                    "panta[{}]: clipboard channel {}",
-                                                    peer,
-                                                    if enabled { "enabled" } else { "disabled" }
-                                                );
-                                            }
-                                        }
-                                        if key == "clipboard_state_active" {
-                                            if clipboard_enabled && local_session_confirmed {
-                                                if let (Some(peer_id), Some(text)) = (
-                                                    peer_device_id,
-                                                    read_clipboard_text_async().await,
-                                                ) {
-                                                    if let Some(frame) = clipboard_data_frame(
-                                                        clipboard_enabled,
-                                                        local_session,
-                                                        our_id,
-                                                        peer_id,
-                                                        &text,
-                                                    ) {
-                                                        if let Err(error) =
-                                                            write_frame(&mut sock, &frame).await
-                                                        {
-                                                            warn!(
-                                                                "panta[{}]: cannot send clipboard: {}",
-                                                                peer, error
-                                                            );
-                                                            return;
-                                                        }
-                                                        info!(
-                                                            "panta[{}]: sent platform clipboard ({}B)",
-                                                            peer,
-                                                            text.len()
-                                                        );
-                                                        last_clipboard = text;
+                                            #[cfg(any(unix, windows))]
+                                            close_desktop_notification(&notification_key);
+                                            if let Some(broadcaster) =
+                                                params.event_broadcaster.as_ref()
+                                            {
+                                                let del_evt = serde_json::json!({
+                                                    "event": "notification_deleted",
+                                                    "data": {
+                                                        "key": notification_key
                                                     }
-                                                }
+                                                });
+                                                broadcaster(&del_evt.to_string());
                                             }
                                         }
-                                        if key == "QueryPcVersion" {
-                                            if let Some(peer_id) = peer_device_id {
-                                                let payload =
-                                                    "{\"key\":\"PcVersion\",\"value\":\"17.20.3\"}";
-                                                let json =
-                                                    topic_data_json("Oplus_PcConnect", payload);
-                                                let reply = build_data_bus_with(
-                                                    local_session,
-                                                    our_id,
-                                                    peer_id,
-                                                    0x52,
-                                                    &json,
-                                                );
-                                                if let Err(error) =
-                                                    write_frame(&mut sock, &reply).await
-                                                {
-                                                    warn!(
-                                                        "panta[{}]: cannot reply PcVersion: {}",
-                                                        peer, error
-                                                    );
-                                                    return;
-                                                }
-                                                info!("panta[{}]: replied PcVersion", peer);
+                                        if key == "clipboard_data"
+                                            && let Some(text) = clipboard_text_from(
+                                                &String::from_utf8_lossy(&plain),
+                                            )
+                                        {
+                                            let preview = text
+                                                .char_indices()
+                                                .nth(120)
+                                                .map_or(text.as_str(), |(index, _)| &text[..index]);
+                                            info!(
+                                                "panta[{}]: phone clipboard ({}B): {}",
+                                                peer,
+                                                text.len(),
+                                                preview
+                                            );
+                                            if let Some(broadcaster) =
+                                                params.event_broadcaster.as_ref()
+                                            {
+                                                let clip_evt = serde_json::json!({
+                                                    "event": "clipboard_callback",
+                                                    "type": "text",
+                                                    "source": "remote",
+                                                    "content": text,
+                                                });
+                                                broadcaster(&clip_evt.to_string());
                                             }
+                                            if write_clipboard_text_async(&text).await {
+                                                last_clipboard = text;
+                                            }
+                                        }
+                                        if (key == "switchStatus"
+                                            || key == "clipboard_state_active")
+                                            && let Some(enabled) = clipboard_enabled_from(&plain)
+                                        {
+                                            clipboard_enabled = enabled;
+                                            info!(
+                                                "panta[{}]: clipboard channel {}",
+                                                peer,
+                                                if enabled { "enabled" } else { "disabled" }
+                                            );
+                                        }
+                                        if key == "clipboard_state_active"
+                                            && clipboard_enabled
+                                            && local_session_confirmed
+                                            && let (Some(peer_id), Some(text)) =
+                                                (peer_device_id, read_clipboard_text_async().await)
+                                            && let Some(frame) = clipboard_data_frame(
+                                                clipboard_enabled,
+                                                local_session,
+                                                our_id,
+                                                peer_id,
+                                                &text,
+                                            )
+                                        {
+                                            if let Err(error) = write_frame(&mut sock, &frame).await
+                                            {
+                                                warn!(
+                                                    "panta[{}]: cannot send clipboard: {}",
+                                                    peer, error
+                                                );
+                                                return;
+                                            }
+                                            info!(
+                                                "panta[{}]: sent platform clipboard ({}B)",
+                                                peer,
+                                                text.len()
+                                            );
+                                            last_clipboard = text;
+                                        }
+                                        if key == "QueryPcVersion"
+                                            && let Some(peer_id) = peer_device_id
+                                        {
+                                            let payload =
+                                                "{\"key\":\"PcVersion\",\"value\":\"17.20.3\"}";
+                                            let json = topic_data_json("Oplus_PcConnect", payload);
+                                            let reply = build_data_bus_with(
+                                                local_session,
+                                                our_id,
+                                                peer_id,
+                                                0x52,
+                                                &json,
+                                            );
+                                            if let Err(error) = write_frame(&mut sock, &reply).await
+                                            {
+                                                warn!(
+                                                    "panta[{}]: cannot reply PcVersion: {}",
+                                                    peer, error
+                                                );
+                                                return;
+                                            }
+                                            info!("panta[{}]: replied PcVersion", peer);
                                         }
                                         if (topic == "Oplus_ExpandCast" || topic.is_empty())
                                             && key == "ex_ability_sync"
-                                        {
-                                            if let Some((width, height)) =
+                                            && let Some((width, height)) =
                                                 expand_cast_tablet_resolution(&plain)
-                                            {
-                                                if let (Some(controller), Some(peer_id)) = (
-                                                    expand_cast_controller.as_mut(),
-                                                    authenticated_device_id,
-                                                ) {
-                                                    if let Ok(pc_auth_ready) = controller
-                                                        .on_tablet_device_info(width, height)
-                                                    {
-                                                        let frame = build_data_bus_with(
-                                                            local_session,
-                                                            our_id,
-                                                            peer_id,
-                                                            0x52,
-                                                            &pc_auth_ready,
-                                                        );
-                                                        let _ =
-                                                            write_frame(&mut sock, &frame).await;
+                                            && let (Some(controller), Some(peer_id)) = (
+                                                expand_cast_controller.as_mut(),
+                                                authenticated_device_id,
+                                            )
+                                            && let Ok(pc_auth_ready) =
+                                                controller.on_tablet_device_info(width, height)
+                                        {
+                                            let frame = build_data_bus_with(
+                                                local_session,
+                                                our_id,
+                                                peer_id,
+                                                0x52,
+                                                &pc_auth_ready,
+                                            );
+                                            let _ = write_frame(&mut sock, &frame).await;
 
-                                                        // Send track and audio mode required by ColorOS to dismiss the loading screen
-                                                        let track = crate::expand_cast::control::expand_cast_dbs_json(
-                                                            "pc_general_track",
-                                                            serde_json::json!({
-                                                                "CaptureChannelInitFail": 0,
-                                                                "DualGpuMismatch": 0,
-                                                                "extMode": controller.mode(),
-                                                                "version": "17.20.3"
-                                                            }),
-                                                        );
-                                                        let frame_track = build_data_bus_with(
-                                                            local_session,
-                                                            our_id,
-                                                            peer_id,
-                                                            0x52,
-                                                            &track,
-                                                        );
-                                                        let _ =
-                                                            write_frame(&mut sock, &frame_track)
-                                                                .await;
+                                            // Send track and audio mode required by ColorOS to dismiss the loading screen
+                                            let track =
+                                                crate::expand_cast::control::expand_cast_dbs_json(
+                                                    "pc_general_track",
+                                                    serde_json::json!({
+                                                        "CaptureChannelInitFail": 0,
+                                                        "DualGpuMismatch": 0,
+                                                        "extMode": controller.mode(),
+                                                        "version": "17.20.3"
+                                                    }),
+                                                );
+                                            let frame_track = build_data_bus_with(
+                                                local_session,
+                                                our_id,
+                                                peer_id,
+                                                0x52,
+                                                &track,
+                                            );
+                                            let _ = write_frame(&mut sock, &frame_track).await;
 
-                                                        let audio_mode = crate::expand_cast::control::expand_cast_dbs_json(
-                                                            "pc_audio_mode",
-                                                            serde_json::json!("audio_output_pc"),
-                                                        );
-                                                        let frame_audio = build_data_bus_with(
-                                                            local_session,
-                                                            our_id,
-                                                            peer_id,
-                                                            0x52,
-                                                            &audio_mode,
-                                                        );
-                                                        let _ =
-                                                            write_frame(&mut sock, &frame_audio)
-                                                                .await;
+                                            let audio_mode =
+                                                crate::expand_cast::control::expand_cast_dbs_json(
+                                                    "pc_audio_mode",
+                                                    serde_json::json!("audio_output_pc"),
+                                                );
+                                            let frame_audio = build_data_bus_with(
+                                                local_session,
+                                                our_id,
+                                                peer_id,
+                                                0x52,
+                                                &audio_mode,
+                                            );
+                                            let _ = write_frame(&mut sock, &frame_audio).await;
 
-                                                        info!(
-                                                            "panta[{}]: sent pc_auth_ready, pc_general_track, and pc_audio_mode for ExpandCast ({}x{})",
-                                                            peer, width, height
-                                                        );
-                                                    }
-                                                }
-                                            }
+                                            info!(
+                                                "panta[{}]: sent pc_auth_ready, pc_general_track, and pc_audio_mode for ExpandCast ({}x{})",
+                                                peer, width, height
+                                            );
                                         }
                                     }
                                     append_protocol_log(
@@ -3185,22 +3198,22 @@ async fn run_session<F, Fut>(
                 }
                 Some(0x00) if body.get(1) == Some(&0x04) => {
                     let sub = body.get(2).copied().unwrap_or(0);
-                    if sub == 0x01 {
-                        if let Some(request) = parse_service_connection_request(&body) {
-                            info!(
-                                "panta[{}]: service request initiator={:#06x} acceptor={:#06x} \
+                    if sub == 0x01
+                        && let Some(request) = parse_service_connection_request(&body)
+                    {
+                        info!(
+                            "panta[{}]: service request initiator={:#06x} acceptor={:#06x} \
                                  profile={:?} session/channel={:?}",
-                                peer,
-                                request.initiator_id,
-                                request.acceptor_id,
-                                request.profile,
-                                request
-                                    .infos
-                                    .iter()
-                                    .map(|(session, channel, _, _, _)| (*session, *channel))
-                                    .collect::<Vec<_>>()
-                            );
-                        }
+                            peer,
+                            request.initiator_id,
+                            request.acceptor_id,
+                            request.profile,
+                            request
+                                .infos
+                                .iter()
+                                .map(|(session, channel, _, _, _)| (*session, *channel))
+                                .collect::<Vec<_>>()
+                        );
                     }
                     // The phone repeats these frames; the official PC answers each
                     // subtype exactly once, so duplicates do not confuse its agent

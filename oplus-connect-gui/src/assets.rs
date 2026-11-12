@@ -11,13 +11,13 @@ pub struct LocalAssets {
 
 fn asset_directories() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            dirs.push(dir.join("../share/oplus-connect/assets"));
-            for parent in dir.ancestors().take(6) {
-                dirs.push(parent.join("assets"));
-                dirs.push(parent.join("oplus-connect-gui/assets"));
-            }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        dirs.push(dir.join("../share/oplus-connect/assets"));
+        for parent in dir.ancestors().take(6) {
+            dirs.push(parent.join("assets"));
+            dirs.push(parent.join("oplus-connect-gui/assets"));
         }
     }
     dirs.push(PathBuf::from("assets"));
@@ -72,6 +72,12 @@ impl LocalAssets {
     }
 }
 
+impl Default for LocalAssets {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AssetSource for LocalAssets {
     fn load(&self, path: &str) -> Result<Option<std::borrow::Cow<'static, [u8]>>> {
         if let Some(file_path) = self.find_file(path) {
@@ -88,14 +94,14 @@ impl AssetSource for LocalAssets {
         let mut seen = HashSet::new();
         let mut list = Vec::new();
 
-        if let Some(dir_path) = self.find_dir(path) {
-            if let Ok(entries) = fs::read_dir(dir_path) {
-                for entry in entries.flatten() {
-                    if let Ok(name) = entry.file_name().into_string() {
-                        let key = format!("{}/{}", path.trim_end_matches('/'), name);
-                        seen.insert(key.trim_start_matches('/').to_owned());
-                        list.push(SharedString::from(name));
-                    }
+        if let Some(dir_path) = self.find_dir(path)
+            && let Ok(entries) = fs::read_dir(dir_path)
+        {
+            for entry in entries.flatten() {
+                if let Ok(name) = entry.file_name().into_string() {
+                    let key = format!("{}/{}", path.trim_end_matches('/'), name);
+                    seen.insert(key.trim_start_matches('/').to_owned());
+                    list.push(SharedString::from(name));
                 }
             }
         }

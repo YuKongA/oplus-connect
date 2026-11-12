@@ -55,6 +55,7 @@ cargo run --release --manifest-path oplus-connect-gui/Cargo.toml
 | `OPLUS_EXPAND_CAST_BITRATE=<kbps>`              | 覆盖界面码率并关闭自适应，范围 500–50000 kbps                                      |
 | `OPLUS_EXPAND_CAST_PIPELINE_LATENCY=auto\|<ms>` | 覆盖 pipeline latency；默认 0，`auto` 恢复按元素自动协商                           |
 | `OPLUS_EXPAND_CAST_STATS`                       | 设置任意值时每 5 秒打印 WebRTC 统计，排查链路问题时使用                            |
+| `OPLUS_PROTOCOL_LOG_DIR`                        | 把协议抓包写入该目录（`0600`，拒绝符号链接）；含解密后的剪贴板/通知内容，默认关闭  |
 
 ## 项目结构
 

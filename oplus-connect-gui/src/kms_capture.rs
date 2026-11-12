@@ -472,7 +472,7 @@ fn is_current(devices: &[InputDevice], device: &Device, active: Option<Activatio
 /// then sample so a stuck host leaves an explanation in the log.
 fn note_dropped_input(dropped: &mut u64, order: &ActivationOrder) {
     *dropped += 1;
-    if *dropped == 1 || (*dropped % 1000 == 0) {
+    if *dropped == 1 || (*dropped).is_multiple_of(1000) {
         tracing::warn!(
             dropped,
             active = ?order.active.map(|active| active.id),
@@ -578,8 +578,8 @@ async fn capture_events(
         tokio::select! {
             biased;
             _ = heartbeat.tick() => {
-                if let Some(active) = order.active {
-                    if idle_release.is_some_and(|limit| last_input_at.elapsed() >= limit) {
+                if let Some(active) = order.active
+                    && idle_release.is_some_and(|limit| last_input_at.elapsed() >= limit) {
                         tracing::warn!(
                             activation = active.id,
                             idle_ms = last_input_at.elapsed().as_millis() as u64,
@@ -598,7 +598,6 @@ async fn capture_events(
                         emit(events, CaptureEvent::Deactivated)?;
                         continue;
                     }
-                }
                 tracing::debug!(
                     active = ?order.active.map(|active| active.id),
                     eis_started = ?order.eis_started,
@@ -610,8 +609,8 @@ async fn capture_events(
             changed = return_rx.changed() => {
                 changed.context("device return control disconnected")?;
                 let request = *return_rx.borrow_and_update();
-                if let Some(request) = request {
-                    if let Some(active) = order.return_activation(request) {
+                if let Some(request) = request
+                    && let Some(active) = order.return_activation(request) {
                         ensure!(request.pct_x.is_finite() && request.pct_y.is_finite(), "device return request contained invalid coordinates");
                         portal.release(session, ReleaseOptions::default()
                             .set_activation_id(active.id)
@@ -624,7 +623,6 @@ async fn capture_events(
                         // emit Leave before another matching portal/EIS pair can Enter.
                         emit(events, CaptureEvent::Deactivated)?;
                     }
-                }
             }
             signal = deactivated.next() => {
                 let signal = signal.context("Input capture deactivation stream ended")?;

@@ -6,9 +6,11 @@
 //! mint our own instead of needing an OPPO account.
 
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::DirBuilderExt;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 const KSC_LEN: usize = 22;
@@ -37,7 +39,11 @@ impl Ksc {
 
     fn load_or_create_at(path: &Path) -> io::Result<Self> {
         if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir)?;
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            builder.mode(0o700);
+            builder.create(dir)?;
         }
 
         match Self::load_existing(path) {
@@ -70,19 +76,42 @@ impl Ksc {
     }
 
     fn load_existing(path: &Path) -> io::Result<Self> {
-        let bytes = fs::read(path)?;
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let file = options.open(path)?;
+
+        #[cfg(unix)]
+        {
+            let metadata = file.metadata()?;
+            if !metadata.is_file()
+                || metadata.uid() != crate::ipc::runtime::effective_uid()
+                || metadata.mode() & 0o022 != 0
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "KSC file must be a regular file owned by the current user and not group/other writable",
+                ));
+            }
+        }
+
+        let mut bytes = Vec::with_capacity(KSC_LEN + 1);
+        (&file).take(KSC_LEN as u64 + 1).read_to_end(&mut bytes)?;
         if bytes.len() != KSC_LEN {
+            let observed = if bytes.len() > KSC_LEN {
+                format!("at least {}", KSC_LEN + 1)
+            } else {
+                bytes.len().to_string()
+            };
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "invalid KSC file length: expected {KSC_LEN} bytes, got {}",
-                    bytes.len()
-                ),
+                format!("invalid KSC file length: expected {KSC_LEN} bytes, got {observed}"),
             ));
         }
 
         #[cfg(unix)]
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
 
         Ok(Self {
             alias: bytes[..6].to_vec(),
@@ -144,6 +173,34 @@ mod tests {
         let error = Ksc::load_or_create_at(&path).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(fs::read(&path).unwrap(), [0x5a; KSC_LEN - 1]);
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_symlinked_or_foreign_key_store() {
+        use std::os::unix::fs::symlink;
+
+        let path = test_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let identity = Ksc::generate().unwrap();
+        let mut encoded = identity.alias.clone();
+        encoded.extend_from_slice(&identity.key);
+
+        let target = path.with_extension("target");
+        fs::write(&target, &encoded).unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(
+            Ksc::load_or_create_at(&path).is_err(),
+            "followed a symlinked key store"
+        );
+
+        // A group/other writable store can be swapped by another local user.
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, &encoded).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(Ksc::load_or_create_at(&path).is_err());
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }

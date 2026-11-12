@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// Neutral palette aligned with GPUI Kit's default theme. Kit owns component
 /// styling; the application only exposes the same neutral surfaces and text
 /// colors for its custom layout.
-#[allow(dead_code)]
 pub struct Theme;
 
 static THEME_IS_DARK: AtomicBool = AtomicBool::new(false);
@@ -225,11 +224,7 @@ impl Theme {
     }
 
     pub fn text_muted() -> Hsla {
-        if Self::is_dark() {
-            rgb(0x737373).into()
-        } else {
-            rgb(0x737373).into()
-        }
+        rgb(0x737373).into()
     }
 
     pub fn text_on_accent() -> Hsla {

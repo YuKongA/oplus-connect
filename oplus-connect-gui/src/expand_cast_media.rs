@@ -113,18 +113,18 @@ fn attach_touch_probe(pad: &gst::Pad, dispatch: Arc<TouchDispatch>) {
     let accepted = AtomicU32::new(0);
     let rejected = AtomicU32::new(0);
     pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
-        if let Some(buffer) = info.buffer() {
-            if let Ok(mapped) = buffer.map_readable() {
-                let frame = mapped.as_slice();
-                if let Some(event) = parse_touch_frame(frame) {
-                    if accepted.fetch_add(1, Ordering::Relaxed) < 8 {
-                        tracing::debug!(action = ?event.action, "Received ExpandCast touch frame");
-                    }
-                    dispatch.used.store(true, Ordering::Release);
-                    dispatch.send(event);
-                } else if rejected.fetch_add(1, Ordering::Relaxed) < 8 {
-                    tracing::debug!(len = frame.len(), "Ignoring non-touch SCTP message");
+        if let Some(buffer) = info.buffer()
+            && let Ok(mapped) = buffer.map_readable()
+        {
+            let frame = mapped.as_slice();
+            if let Some(event) = parse_touch_frame(frame) {
+                if accepted.fetch_add(1, Ordering::Relaxed) < 8 {
+                    tracing::debug!(action = ?event.action, "Received ExpandCast touch frame");
                 }
+                dispatch.used.store(true, Ordering::Release);
+                dispatch.send(event);
+            } else if rejected.fetch_add(1, Ordering::Relaxed) < 8 {
+                tracing::debug!(len = frame.len(), "Ignoring non-touch SCTP message");
             }
         }
         gst::PadProbeReturn::Ok
@@ -424,7 +424,7 @@ fn run_pipeline(
         let enc = gst::ElementFactory::make("vah264enc")
             .property("bitrate", bitrate_kbps)
             // One keyframe per second keeps recovery time short on Wi-Fi loss.
-            .property("key-int-max", config.fps.max(1) as u32)
+            .property("key-int-max", config.fps.max(1))
             // A single reference frame removes reorder delay and encode cost;
             // remote-desktop content does not benefit from a deeper GOP.
             .property("ref-frames", 1u32)
@@ -741,15 +741,15 @@ fn run_pipeline(
 
     let deadline = Instant::now() + Duration::from_secs(4);
     while pipeline.current_state() != gst::State::Playing {
-        if let Some(message) = bus.timed_pop(gst::ClockTime::from_mseconds(50)) {
-            if let gst::MessageView::Error(err) = message.view() {
-                let _ = pipeline.set_state(gst::State::Null);
-                anyhow::bail!(
-                    "capture pipeline error: {} ({})",
-                    err.error(),
-                    err.debug().unwrap_or_default()
-                );
-            }
+        if let Some(message) = bus.timed_pop(gst::ClockTime::from_mseconds(50))
+            && let gst::MessageView::Error(err) = message.view()
+        {
+            let _ = pipeline.set_state(gst::State::Null);
+            anyhow::bail!(
+                "capture pipeline error: {} ({})",
+                err.error(),
+                err.debug().unwrap_or_default()
+            );
         }
         if Instant::now() > deadline {
             let _ = pipeline.set_state(gst::State::Null);
@@ -998,14 +998,14 @@ fn wait_for_video_caps(
         if pad.current_caps().is_some() {
             return Ok(true);
         }
-        if let Some(message) = bus.timed_pop(gst::ClockTime::from_mseconds(50)) {
-            if let gst::MessageView::Error(err) = message.view() {
-                anyhow::bail!(
-                    "video negotiation error: {} ({})",
-                    err.error(),
-                    err.debug().unwrap_or_default()
-                );
-            }
+        if let Some(message) = bus.timed_pop(gst::ClockTime::from_mseconds(50))
+            && let gst::MessageView::Error(err) = message.view()
+        {
+            anyhow::bail!(
+                "video negotiation error: {} ({})",
+                err.error(),
+                err.debug().unwrap_or_default()
+            );
         }
         if let Some(error) = capture.and_then(PortalCapture::error) {
             anyhow::bail!("capture pipeline failed: {error}");
@@ -1264,21 +1264,20 @@ fn run_capture_pipeline(
     sink.set_callbacks(
         gst_app::AppSinkCallbacks::builder()
             .new_sample(move |sink| {
-                if let Ok(sample) = sink.pull_sample() {
-                    if let (Some(caps), Some(buffer)) = (sample.caps(), sample.buffer()) {
-                        if let Ok(copy) = buffer.copy_deep() {
-                            let mut copy = copy;
-                            // Timestamps belong to the capture pipeline's clock;
-                            // let appsrc stamp them in the encode pipeline.
-                            let copy_ref = copy.make_mut();
-                            copy_ref.set_pts(gst::ClockTime::NONE);
-                            copy_ref.set_dts(gst::ClockTime::NONE);
-                            let _ = tx_callback.try_send(CaptureItem {
-                                caps: caps.to_owned(),
-                                buffer: copy,
-                            });
-                        }
-                    }
+                if let Ok(sample) = sink.pull_sample()
+                    && let (Some(caps), Some(buffer)) = (sample.caps(), sample.buffer())
+                    && let Ok(copy) = buffer.copy_deep()
+                {
+                    let mut copy = copy;
+                    // Timestamps belong to the capture pipeline's clock;
+                    // let appsrc stamp them in the encode pipeline.
+                    let copy_ref = copy.make_mut();
+                    copy_ref.set_pts(gst::ClockTime::NONE);
+                    copy_ref.set_dts(gst::ClockTime::NONE);
+                    let _ = tx_callback.try_send(CaptureItem {
+                        caps: caps.to_owned(),
+                        buffer: copy,
+                    });
                 }
                 Ok(gst::FlowSuccess::Ok)
             })

@@ -35,28 +35,35 @@ pub const KEYCODE_APP_SWITCH: u8 = 187;
 /// Height of the cast window's three-button navigation bar below the picture.
 pub const NAV_BAR_HEIGHT: f32 = 44.0;
 
-fn frame(
+/// Header fields of a 24-byte reverse-control frame.
+struct FrameSpec {
     kind: u16,
     class: u8,
+    /// Press/release flag; ignored for touch frames.
     flag: u8,
+    /// `MotionEvent` action; only touch frames carry one.
     action: u8,
     code: u8,
     meta: u32,
     x: i32,
     y: i32,
-) -> [u8; 24] {
+}
+
+fn frame(spec: FrameSpec) -> [u8; 24] {
     let mut frame = [0u8; 24];
     frame[..4].copy_from_slice(&MAGIC);
-    frame[4..6].copy_from_slice(&kind.to_be_bytes());
-    frame[6] = class;
-    // Byte 7 is the press/release flag; byte 10 is the MotionEvent action,
-    // which only touch frames use.
-    frame[7] = flag;
-    frame[10] = if class == CLASS_TOUCH { action } else { 0 };
-    frame[11] = code;
-    frame[12..16].copy_from_slice(&meta.to_be_bytes());
-    frame[16..20].copy_from_slice(&x.to_be_bytes());
-    frame[20..24].copy_from_slice(&y.to_be_bytes());
+    frame[4..6].copy_from_slice(&spec.kind.to_be_bytes());
+    frame[6] = spec.class;
+    frame[7] = spec.flag;
+    frame[10] = if spec.class == CLASS_TOUCH {
+        spec.action
+    } else {
+        0
+    };
+    frame[11] = spec.code;
+    frame[12..16].copy_from_slice(&spec.meta.to_be_bytes());
+    frame[16..20].copy_from_slice(&spec.x.to_be_bytes());
+    frame[20..24].copy_from_slice(&spec.y.to_be_bytes());
     frame
 }
 
@@ -66,7 +73,17 @@ fn frame(
 /// `width u16`, `height u16`, `deviceId u32` from the last 8 payload bytes, so
 /// the payload must be 34 bytes; a 24-byte frame made it read x/y as the tail.
 pub fn touch(action: u8, x: i32, y: i32, width: u32, height: u32) -> Vec<u8> {
-    let mut out = frame(TYPE_TOUCH, CLASS_TOUCH, 0, action, 1, 0, x, y).to_vec();
+    let mut out = frame(FrameSpec {
+        kind: TYPE_TOUCH,
+        class: CLASS_TOUCH,
+        flag: 0,
+        action,
+        code: 1,
+        meta: 0,
+        x,
+        y,
+    })
+    .to_vec();
     out.extend_from_slice(&[0, 0]);
     out.extend_from_slice(&(width.min(u16::MAX as u32) as u16).to_be_bytes());
     out.extend_from_slice(&(height.min(u16::MAX as u32) as u16).to_be_bytes());
@@ -76,16 +93,16 @@ pub fn touch(action: u8, x: i32, y: i32, width: u32, height: u32) -> Vec<u8> {
 
 /// Key press (`pressed`) or release with the Android keycode and meta state.
 pub fn key(keycode: u8, meta: u32, pressed: bool) -> [u8; 24] {
-    frame(
-        TYPE_KEY,
-        CLASS_KEY,
-        u8::from(!pressed),
-        0,
-        keycode,
+    frame(FrameSpec {
+        kind: TYPE_KEY,
+        class: CLASS_KEY,
+        flag: u8::from(!pressed),
+        action: 0,
+        code: keycode,
         meta,
-        0,
-        0,
-    )
+        x: 0,
+        y: 0,
+    })
 }
 
 /// Wheel event: pointer position, its coordinate space, then the two scroll

@@ -274,12 +274,12 @@ pub fn spawn_receiver(config: ReceiverConfig) -> Result<MediaReceiver> {
                 &worker_status,
                 &config,
             );
-            if let Err(error) = result {
-                if !worker_stop.load(Ordering::Acquire) {
-                    let detail = format!("{error:#}");
-                    worker_status.fail(&detail);
-                    let _ = event_tx.try_send(MediaEvent::Error(detail));
-                }
+            if let Err(error) = result
+                && !worker_stop.load(Ordering::Acquire)
+            {
+                let detail = format!("{error:#}");
+                worker_status.fail(&detail);
+                let _ = event_tx.try_send(MediaEvent::Error(detail));
             }
             worker_status.input_ready.store(false, Ordering::Release);
             worker_status.running.store(false, Ordering::Release);
@@ -432,14 +432,13 @@ fn mline_summary(sdp: &str) -> String {
             }
             continue;
         }
-        if let Some(section) = current.as_mut() {
-            if line == "a=sendonly"
+        if let Some(section) = current.as_mut()
+            && (line == "a=sendonly"
                 || line == "a=recvonly"
                 || line == "a=inactive"
-                || line == "a=sendrecv"
-            {
-                section.push_str(&format!(" {}", &line[2..]));
-            }
+                || line == "a=sendrecv")
+        {
+            section.push_str(&format!(" {}", &line[2..]));
         }
     }
     if let Some(last) = current {
@@ -716,20 +715,20 @@ fn attach_video(
     {
         let scale_status = status.clone();
         scale_pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
-            if let Some(gst::PadProbeData::Event(event)) = info.data.as_ref() {
-                if let gst::EventView::Caps(event) = event.view() {
-                    tracing::debug!("cast video scaled caps {:?}", event.caps());
-                    if let Some(structure) = event.caps().structure(0) {
-                        if let Ok(width) = structure.get::<i32>("width") {
-                            scale_status
-                                .width
-                                .store(width.max(0) as u32, Ordering::Relaxed);
-                        }
-                        if let Ok(height) = structure.get::<i32>("height") {
-                            scale_status
-                                .height
-                                .store(height.max(0) as u32, Ordering::Relaxed);
-                        }
+            if let Some(gst::PadProbeData::Event(event)) = info.data.as_ref()
+                && let gst::EventView::Caps(event) = event.view()
+            {
+                tracing::debug!("cast video scaled caps {:?}", event.caps());
+                if let Some(structure) = event.caps().structure(0) {
+                    if let Ok(width) = structure.get::<i32>("width") {
+                        scale_status
+                            .width
+                            .store(width.max(0) as u32, Ordering::Relaxed);
+                    }
+                    if let Ok(height) = structure.get::<i32>("height") {
+                        scale_status
+                            .height
+                            .store(height.max(0) as u32, Ordering::Relaxed);
                     }
                 }
             }
@@ -801,41 +800,39 @@ fn attach_video(
                         .fetch_add(1, Ordering::Relaxed);
                 }
                 Some(gst::PadProbeData::Event(event)) => {
-                    if let gst::EventView::Caps(event) = event.view() {
-                        if let Some(structure) = event.caps().structure(0) {
-                            if let (Ok(width), Ok(height)) = (
-                                structure.get::<i32>("width"),
-                                structure.get::<i32>("height"),
-                            ) {
-                                if width > 0 && height > 0 {
-                                    let par = structure
-                                        .get::<gst::Fraction>("pixel-aspect-ratio")
-                                        .unwrap_or_else(|_| gst::Fraction::new(1, 1));
-                                    let (scaled_width, scaled_height) =
-                                        display_size(width as u32, height as u32, par);
-                                    if decoded_status.display_width.load(Ordering::Relaxed)
-                                        == scaled_width
-                                        && decoded_status.display_height.load(Ordering::Relaxed)
-                                            == scaled_height
-                                    {
-                                        return gst::PadProbeReturn::Ok;
-                                    }
-                                    decoded_status
-                                        .display_width
-                                        .store(scaled_width, Ordering::Relaxed);
-                                    decoded_status
-                                        .display_height
-                                        .store(scaled_height, Ordering::Relaxed);
-                                    let caps = gst::Caps::builder("video/x-raw")
-                                        .field("format", "BGRA")
-                                        .field("width", scaled_width as i32)
-                                        .field("height", scaled_height as i32)
-                                        .field("pixel-aspect-ratio", gst::Fraction::new(1, 1))
-                                        .build();
-                                    display_for_caps.set_property("caps", caps);
-                                }
-                            }
+                    if let gst::EventView::Caps(event) = event.view()
+                        && let Some(structure) = event.caps().structure(0)
+                        && let (Ok(width), Ok(height)) = (
+                            structure.get::<i32>("width"),
+                            structure.get::<i32>("height"),
+                        )
+                        && width > 0
+                        && height > 0
+                    {
+                        let par = structure
+                            .get::<gst::Fraction>("pixel-aspect-ratio")
+                            .unwrap_or_else(|_| gst::Fraction::new(1, 1));
+                        let (scaled_width, scaled_height) =
+                            display_size(width as u32, height as u32, par);
+                        if decoded_status.display_width.load(Ordering::Relaxed) == scaled_width
+                            && decoded_status.display_height.load(Ordering::Relaxed)
+                                == scaled_height
+                        {
+                            return gst::PadProbeReturn::Ok;
                         }
+                        decoded_status
+                            .display_width
+                            .store(scaled_width, Ordering::Relaxed);
+                        decoded_status
+                            .display_height
+                            .store(scaled_height, Ordering::Relaxed);
+                        let caps = gst::Caps::builder("video/x-raw")
+                            .field("format", "BGRA")
+                            .field("width", scaled_width as i32)
+                            .field("height", scaled_height as i32)
+                            .field("pixel-aspect-ratio", gst::Fraction::new(1, 1))
+                            .build();
+                        display_for_caps.set_property("caps", caps);
                     }
                 }
                 _ => {}

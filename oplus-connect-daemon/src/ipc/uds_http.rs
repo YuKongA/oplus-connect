@@ -135,6 +135,22 @@ impl UdsHttpServer {
             tokio::select! {
                 accepted = self.socket.listener.accept() => {
                     let (stream, _) = accepted?;
+                    while let Some(result) = clients.try_join_next() {
+                        if let Err(error) = result {
+                            warn!("HTTP client task failed: {}", error);
+                        }
+                    }
+                    if let Err(error) = crate::ipc::runtime::verify_peer(&stream) {
+                        warn!("Rejected IPC client: {}", error);
+                        continue;
+                    }
+                    if clients.len() >= MAX_CLIENTS {
+                        warn!(
+                            "Rejected IPC client: {} connections already open",
+                            clients.len()
+                        );
+                        continue;
+                    }
                     let state = self.state.clone();
                     clients.spawn(async move {
                         if let Err(error) = handle_client(stream, state).await {
@@ -151,6 +167,8 @@ impl UdsHttpServer {
         }
     }
 }
+
+const MAX_CLIENTS: usize = 64;
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -1026,35 +1044,8 @@ async fn handle_client(
             (200, serde_json::to_string(&response).unwrap())
         }
         ("POST", "/connect_device") | ("GET", "/connect_device") => {
-            let ip = query_param(path_and_query, "ip")
-                .map(str::to_string)
-                .or_else(|| {
-                    serde_json::from_str::<serde_json::Value>(body)
-                        .ok()
-                        .and_then(|value| {
-                            value
-                                .get("ip")
-                                .and_then(|ip| ip.as_str())
-                                .map(str::to_string)
-                        })
-                });
-            let device_id = query_param(path_and_query, "device_id")
-                .map(str::to_string)
-                .or_else(|| {
-                    serde_json::from_str::<serde_json::Value>(body)
-                        .ok()
-                        .and_then(|value| {
-                            value
-                                .get("device_id")
-                                .and_then(|id| id.as_str())
-                                .map(str::to_string)
-                        })
-                });
-            match (
-                ip.and_then(|ip| ip.parse::<std::net::IpAddr>().ok()),
-                device_id,
-            ) {
-                (Some(ip), Some(device_id)) if !device_id.is_empty() => {
+            match connect_device_params(path_and_query, body) {
+                (Some(ip), Some(device_id)) => {
                     let state = state.clone();
                     tokio::spawn(async move {
                         if let Err(error) =
@@ -1127,6 +1118,29 @@ fn parse_file_send_request(path_and_query: &str) -> Result<FileSendReq, String> 
     Ok(request)
 }
 
+/// Reads `ip`/`device_id`: query values are percent-decoded, the JSON body is verbatim.
+fn connect_device_params(
+    path_and_query: &str,
+    body: &str,
+) -> (Option<std::net::IpAddr>, Option<String>) {
+    let json = serde_json::from_str::<serde_json::Value>(body).ok();
+    let json_field = |name: &str| {
+        json.as_ref()
+            .and_then(|value| value.get(name))
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+    };
+    let ip = query_param(path_and_query, "ip")
+        .and_then(|value| percent_decode(value).ok())
+        .or_else(|| json_field("ip"))
+        .and_then(|value| value.parse::<std::net::IpAddr>().ok());
+    let device_id = query_param(path_and_query, "device_id")
+        .and_then(|value| percent_decode(value).ok())
+        .or_else(|| json_field("device_id"))
+        .filter(|value| !value.is_empty());
+    (ip, device_id)
+}
+
 fn query_param<'a>(path_and_query: &'a str, name: &str) -> Option<&'a str> {
     path_and_query
         .split_once('?')
@@ -1172,14 +1186,14 @@ fn hex_value(byte: u8) -> Option<u8> {
 }
 
 fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
-    if input.is_empty() || input.len() % 4 != 0 {
+    if input.is_empty() || !input.len().is_multiple_of(4) {
         return Err("Invalid base64 connection decision params".to_string());
     }
 
-    let chunks = input.as_bytes().chunks_exact(4);
+    let (chunks, _) = input.as_bytes().as_chunks::<4>();
     let mut output = Vec::with_capacity(input.len() / 4 * 3);
     let chunk_count = input.len() / 4;
-    for (index, chunk) in chunks.enumerate() {
+    for (index, chunk) in chunks.iter().enumerate() {
         let last = index + 1 == chunk_count;
         let padding = match (chunk[2] == b'=', chunk[3] == b'=') {
             (true, true) if last => 2,
@@ -1233,6 +1247,37 @@ fn invalid_base64() -> String {
 mod tests {
     use super::*;
     use base64::Engine;
+
+    #[test]
+    fn connect_device_params_decode_peer_encoded_values() {
+        let query = "/connect_device?ip=fe80%3A%3A1&device_id=A%26B%20C";
+        let (ip, device_id) = connect_device_params(query, "");
+        assert_eq!(ip, Some("fe80::1".parse().unwrap()));
+        assert_eq!(device_id.as_deref(), Some("A&B C"));
+
+        let query = "/connect_device?ip=192.168.1.5&device_id=C77C702EC021";
+        let (ip, device_id) = connect_device_params(query, "");
+        assert_eq!(ip, Some("192.168.1.5".parse().unwrap()));
+        assert_eq!(device_id.as_deref(), Some("C77C702EC021"));
+
+        let (ip, device_id) =
+            connect_device_params("/connect_device", r#"{"ip":"10.0.0.2","device_id":"AA"}"#);
+        assert_eq!(ip, Some("10.0.0.2".parse().unwrap()));
+        assert_eq!(device_id.as_deref(), Some("AA"));
+
+        assert_eq!(
+            connect_device_params("/connect_device?ip=nope&device_id=X", ""),
+            (None, Some("X".to_string()))
+        );
+        assert_eq!(
+            connect_device_params("/connect_device?ip=%zz&device_id=X", ""),
+            (None, Some("X".to_string()))
+        );
+        assert_eq!(
+            connect_device_params("/connect_device?ip=10.0.0.2&device_id=", ""),
+            (Some("10.0.0.2".parse().unwrap()), None)
+        );
+    }
 
     const OFFICIAL_FILE_PARAMS: &str =
         "eyJmaWxlcGF0aCI6IiUyRm9wcG8tZmlsZS10aGF0LWRvZXMtbm90LWV4aXN0IiwicmVzdW1lIjp0cnVlfQ==";

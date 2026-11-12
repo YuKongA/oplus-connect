@@ -43,6 +43,9 @@ ksni = { version = "0.3", features = ["blocking"] }
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [profile.release]
 opt-level = "s"
 lto = "thin"

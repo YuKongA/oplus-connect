@@ -13,6 +13,20 @@ use gpui_kit::component::WindowExt;
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::*;
 
+/// Dropdown the settings page renders for protocol selections.
+pub type SelectState = gpui_kit::component::select::SelectState<
+    gpui_kit::component::searchable_list::SearchableVec<&'static str>,
+>;
+
+/// Widgets the root view owns so the settings page can drive them.
+#[derive(Clone, Copy)]
+pub struct SettingsControls<'a> {
+    pub codec: Option<&'a Entity<SelectState>>,
+    pub kms_direction: Option<&'a Entity<SelectState>>,
+    pub expand_cast_fps: Option<&'a Entity<gpui_kit::component::input::InputState>>,
+    pub expand_cast_bitrate: Option<&'a Entity<gpui_kit::component::input::InputState>>,
+}
+
 pub struct MainContainer;
 
 impl MainContainer {
@@ -20,22 +34,7 @@ impl MainContainer {
         state: &AppState,
         kms: &crate::kms_session::KmsViewState,
         expand_cast: &crate::expand_cast_session::ExpandCastViewState,
-        codec: Option<
-            &Entity<
-                gpui_kit::component::select::SelectState<
-                    gpui_kit::component::searchable_list::SearchableVec<&'static str>,
-                >,
-            >,
-        >,
-        kms_direction: Option<
-            &Entity<
-                gpui_kit::component::select::SelectState<
-                    gpui_kit::component::searchable_list::SearchableVec<&'static str>,
-                >,
-            >,
-        >,
-        expand_cast_fps: Option<&Entity<gpui_kit::component::input::InputState>>,
-        expand_cast_bitrate: Option<&Entity<gpui_kit::component::input::InputState>>,
+        controls: SettingsControls<'_>,
         window: &mut Window,
         cx: &mut Context<crate::RootView>,
     ) -> impl IntoElement {
@@ -50,16 +49,9 @@ impl MainContainer {
                 device_detail_view::DeviceDetailView::render(state, kms, expand_cast, window, cx)
                     .into_any_element()
             }
-            NavTab::Settings => settings_view::SettingsView::render(
-                state,
-                codec,
-                kms_direction,
-                expand_cast_fps,
-                expand_cast_bitrate,
-                window,
-                cx,
-            )
-            .into_any_element(),
+            NavTab::Settings => {
+                settings_view::SettingsView::render(state, controls, window, cx).into_any_element()
+            }
         };
 
         div()

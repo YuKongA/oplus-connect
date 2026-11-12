@@ -135,10 +135,11 @@ pub fn private_interface_ips() -> Vec<Ipv4Addr> {
             let Some(address) = fields.next().and_then(|cidr| cidr.split('/').next()) else {
                 continue;
             };
-            if let Ok(ip) = address.parse::<Ipv4Addr>() {
-                if ip.is_private() && !ips.contains(&ip) {
-                    ips.push(ip);
-                }
+            if let Ok(ip) = address.parse::<Ipv4Addr>()
+                && ip.is_private()
+                && !ips.contains(&ip)
+            {
+                ips.push(ip);
             }
         }
         ips
@@ -241,13 +242,12 @@ fn parse_private_broadcast_ips(text: &str) -> Vec<Ipv4Addr> {
         if !address.is_private() {
             continue;
         }
-        let mut fields = fields;
         while let Some(field) = fields.next() {
             if field == "brd" {
-                if let Some(broadcast) = fields.next().and_then(|s| s.parse::<Ipv4Addr>().ok()) {
-                    if !broadcasts.contains(&broadcast) {
-                        broadcasts.push(broadcast);
-                    }
+                if let Some(broadcast) = fields.next().and_then(|s| s.parse::<Ipv4Addr>().ok())
+                    && !broadcasts.contains(&broadcast)
+                {
+                    broadcasts.push(broadcast);
                 }
                 break;
             }
