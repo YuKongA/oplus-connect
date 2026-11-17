@@ -29,6 +29,44 @@ OPLUS_CONNECT_SOURCE_URL="file://$PWD" makepkg -si
 
 上述命令构建本地仓库当前分支已提交的代码，不包含未提交更改；不设置 `OPLUS_CONNECT_SOURCE_URL` 时使用远端最新提交。构建会运行 GUI 测试。安装后从应用菜单启动，或运行 `oplus-connect`。VA-API 需要适配显卡的驱动；无可用 H.264 硬件编码器时可安装 `gst-plugins-ugly` 使用软件编码。
 
+使用 Nix flake 构建（需要启用 `nix-command` 与 `flakes`）：
+
+```bash
+nix run .#            # 构建并直接运行
+nix build .#          # 构建，产物位于 ./result/bin/oplus-connect
+nix develop           # 带全部构建依赖的开发环境
+nix profile install . # 安装到当前用户的 profile
+```
+
+flake 暴露 `packages.default`（GUI，已内嵌 daemon）、`apps.default`、`devShells.default`、`nixosModules.default` 和 `overlays.default`。
+
+NixOS 上通过模块声明式启用：
+
+```nix
+{
+  inputs.oplus-connect.url = "github:YuKongA/oplus-connect";
+
+  outputs =
+    { nixpkgs, oplus-connect, ... }:
+    {
+      nixosConfigurations.host = nixpkgs.lib.nixosSystem {
+        modules = [
+          oplus-connect.nixosModules.default
+          {
+            programs.oplus-connect.enable = true;
+            # 默认开放设备回连端口；不需要时关闭。
+            # programs.oplus-connect.openFirewall = false;
+          }
+        ];
+      };
+    };
+}
+```
+
+模块会安装软件包、开放设备发现与串流使用的 TCP/UDP 端口，并默认启用 PipeWire、`xdg.portal` 与 Vulkan 图形支持。GUI 在内嵌 daemon 中运行后端，因此不需要额外的系统服务。
+
+Nix 构建使用 nixpkgs 提供的 GStreamer，`gst-plugins-bad` 已启用 VA-API 插件。平板屏幕共享只使用 H.264 编码：优先 `vah264enc`，不可用时回退 `x264enc` 软件编码；手机投屏由手机编码（默认 H.265），电脑端用 `vah264dec`/`vah265dec` 硬解，缺少这些元素时会直接报错而不回退软件解码。部分驱动（例如 NVIDIA 的 NVDEC VA 驱动）需要设置 `GST_VA_ALL_DRIVERS=1` 才会注册 VA 元素，且仍可能缺少 `vah264enc`/`vapostproc`。屏幕共享还需要 PipeWire 及 `xdg-desktop-portal` 后端（NixOS 上启用 `xdg.portal.enable`），Vulkan 驱动由系统提供（NixOS 上启用 `hardware.graphics`）。
+
 直接从源码运行需要支持 Rust 工具链和 GStreamer，GUI 会自动启动内嵌 daemon：
 
 ```bash
@@ -64,6 +102,8 @@ oplus-connect-daemon/   # 设备协议、连接状态、剪贴板与通知后端
 oplus-connect-gui/      # GPUI Kit 桌面客户端
 docs/                   # 协议与调试文档
 PKGBUILD                # Arch Linux 软件包构建配方
+flake.nix               # Nix flake 打包与开发环境
+nix/                    # NixOS 模块
 oplus-connect.desktop   # 桌面入口
 LICENSE                 # MIT 许可证
 ```
