@@ -568,6 +568,7 @@ async fn send_sync_identity(
     sock: &mut tokio::net::TcpStream,
     command: u64,
     is_response: bool,
+    peer_key_type: u64,
 ) -> std::io::Result<()> {
     // Android decodes Sync.model_id as exactly three hexadecimal bytes.
     // The QR value "1" is not a valid wire representation; preserve its value as 000001.
@@ -578,12 +579,17 @@ async fn send_sync_identity(
         .unwrap_or(48999);
     let mut custom_data = Vec::new();
     crate::scp::codec::write_varint_field(&mut custom_data, 1, data_port as u64);
-    let ours = ScpSyncData::new(
+    let mut ours = ScpSyncData::new(
         crate::net_utils::hostname(),
         custom_data,
         6, // device type: PC
         model_id,
     );
+    // The phone validates its advertised Sync.key_type against our reply. A
+    // reply without field 2 decodes as key_type 0 and ColorOS answers
+    // `SCP error: key type not match`. Echo the peer value; treat a missing
+    // phone field as the first-time pairing type (1).
+    ours.key_type = negotiated_sync_key_type(peer_key_type);
     let body = ScpWrapData::new(crate::scp::proto::MSG_SYNC, ours.encode()).encode();
     let mut reply = ScpFrame::new(command, body);
     reply.is_response = is_response;
@@ -591,6 +597,10 @@ async fn send_sync_identity(
     sock.write_all(&reply.encode()).await?;
     info!("probe[{}]: sent SCP Sync identity", port);
     Ok(())
+}
+
+fn negotiated_sync_key_type(peer_key_type: u64) -> u64 {
+    if peer_key_type == 0 { 1 } else { peer_key_type }
 }
 
 /// Distinguish incomplete frames from invalid magic before buffering more data.
@@ -815,12 +825,14 @@ async fn handle_frame(
                 // values for this connection rather than reporting placeholders.
                 let device_name = sync.device_name.clone();
                 let device_type = crate::state::device_type_name(sync.device_type);
+                let peer_key_type = sync.key_type;
                 session.sync_identity = Some(sync);
                 send_sync_identity(
                     port,
                     sock,
                     frame.command().unwrap_or(CMD_ACTIVE_CONNECTION),
                     true,
+                    peer_key_type,
                 )
                 .await?;
 
@@ -1468,6 +1480,14 @@ mod tests {
         );
         assert_eq!(decode_scp_error(&payload[..payload.len() - 1]), None);
     }
+
+    #[test]
+    fn sync_reply_uses_phone_key_type() {
+        assert_eq!(negotiated_sync_key_type(1), 1);
+        assert_eq!(negotiated_sync_key_type(3), 3);
+        assert_eq!(negotiated_sync_key_type(0), 1);
+    }
+
     #[tokio::test]
     async fn user_approval_releases_server_init_for_phone_client() {
         let _test_guard = PEER_TEST_LOCK.lock().await;
