@@ -67,6 +67,10 @@ const PC_CLIENT_VERSION: &str = "17.20.3";
 /// Version tag observed in Windows `clipboard_data` captures; `pcAbility`
 /// advertises 1200 separately.
 const CLIPBOARD_DATA_VERSION: &str = "1000";
+/// `Synergy_CastUnlock_Mode` values. The observed Windows frame reports
+/// `every`; `auto` is the previous Linux value, kept for A/B rollback.
+const CAST_UNLOCK_AUTO: &str = "auto";
+const CAST_UNLOCK_EVERY: &str = "every";
 
 pub const MSG_EPI_OFFER: u8 = 0x01;
 pub const MSG_EPI_ANSWER: u8 = 0x02;
@@ -641,7 +645,11 @@ async fn send_data_bus_handshake(
     peer_id: [u8; 6],
 ) -> std::io::Result<()> {
     let our_hex = crate::net_utils::pdid();
-    let frames = data_bus_handshake_frames(&our_hex, pc_device_name());
+    let frames = data_bus_handshake_frames(
+        &our_hex,
+        pc_device_name(),
+        CapabilityOverrides::from_process_env(),
+    );
     for (route_head, json) in frames {
         let frame = build_data_bus_with(session_id, our_id, peer_id, route_head, &json);
         write_frame(sock, &frame).await?;
@@ -653,8 +661,11 @@ async fn send_data_bus_handshake(
     Ok(())
 }
 
-fn data_bus_handshake_frames(our_hex: &str, device_name: &str) -> [(u8, String); 11] {
-    let unlock_mode = pc_cast_unlock_mode();
+fn data_bus_handshake_frames(
+    our_hex: &str,
+    device_name: &str,
+    overrides: CapabilityOverrides,
+) -> [(u8, String); 11] {
     [
         (0x03, link_info_json(our_hex, device_name)),
         (0x2a, OFFICIAL_WINDOWS_TOPIC_SYNC_JSON.to_string()),
@@ -680,7 +691,10 @@ fn data_bus_handshake_frames(our_hex: &str, device_name: &str) -> [(u8, String);
             0x52,
             topic_data_json(
                 "Oplus_MacConnect",
-                &format!("{{\"key\":\"pcAbility\",\"value\":{}}}", pc_ability_json()),
+                &format!(
+                    "{{\"key\":\"pcAbility\",\"value\":{}}}",
+                    pc_ability_json_with(overrides)
+                ),
             ),
         ),
         // The official client announces the clipboard channel twice: once with
@@ -718,7 +732,7 @@ fn data_bus_handshake_frames(our_hex: &str, device_name: &str) -> [(u8, String);
             0x52,
             topic_data_json(
                 "Oplus_MacConnect",
-                &serde_json::json!({"key":"Synergy_CastUnlock_Mode","value":unlock_mode})
+                &serde_json::json!({"key":"Synergy_CastUnlock_Mode","value":overrides.cast_unlock_mode})
                     .to_string(),
             ),
         ),
@@ -1809,41 +1823,95 @@ pub fn topic_data_json(topic: &str, payload_json: &str) -> String {
 /// effects have not been isolated; the environment overrides allow controlled
 /// comparison or rollback to the previous value (1).
 pub fn pc_ability_json() -> String {
-    static NOTICES: std::sync::OnceLock<(u8, u8)> = std::sync::OnceLock::new();
-    let &(clipboard, cross_device) = NOTICES.get_or_init(|| {
-        (
-            pc_notice_override("OPLUS_PC_NOTICE_CLIPBOARD"),
-            pc_notice_override("OPLUS_PC_NOTICE_CROSS_DEVICE"),
-        )
-    });
-    pc_ability_json_with_notices(clipboard, cross_device)
+    pc_ability_json_with(CapabilityOverrides::from_process_env())
 }
 
-fn pc_cast_unlock_mode() -> &'static str {
-    static MODE: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
-    MODE.get_or_init(|| match std::env::var("OPLUS_PC_CAST_UNLOCK_MODE") {
-        Ok(value) if value == "auto" => "auto",
-        Ok(value) if value == "every" => "every",
-        Err(std::env::VarError::NotPresent) => "every",
-        _ => {
-            warn!("invalid OPLUS_PC_CAST_UNLOCK_MODE; expected auto or every, using every");
-            "every"
+// Resolve the shared handshake overrides once; pure parsers keep tests isolated
+// from the process environment and the OnceLock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CapabilityOverrides {
+    notice_clipboard: u8,
+    notice_cross_device: u8,
+    cast_unlock_mode: &'static str,
+}
+
+impl CapabilityOverrides {
+    const DEFAULTS: Self = Self {
+        notice_clipboard: 0,
+        notice_cross_device: 0,
+        cast_unlock_mode: CAST_UNLOCK_EVERY,
+    };
+
+    fn from_process_env() -> Self {
+        static RESOLVED: std::sync::OnceLock<CapabilityOverrides> = std::sync::OnceLock::new();
+        *RESOLVED.get_or_init(|| {
+            let resolved = Self {
+                notice_clipboard: parse_notice_flag(
+                    "OPLUS_PC_NOTICE_CLIPBOARD",
+                    env_value("OPLUS_PC_NOTICE_CLIPBOARD").as_deref(),
+                ),
+                notice_cross_device: parse_notice_flag(
+                    "OPLUS_PC_NOTICE_CROSS_DEVICE",
+                    env_value("OPLUS_PC_NOTICE_CROSS_DEVICE").as_deref(),
+                ),
+                cast_unlock_mode: parse_cast_unlock_mode(
+                    env_value("OPLUS_PC_CAST_UNLOCK_MODE").as_deref(),
+                ),
+            };
+            let default = Self::DEFAULTS;
+            if resolved != default {
+                info!(
+                    "capability overrides active: Notice_ClipBoard={} Notice_CrossDevice={} Synergy_CastUnlock_Mode={}",
+                    resolved.notice_clipboard,
+                    resolved.notice_cross_device,
+                    resolved.cast_unlock_mode,
+                );
+            }
+            resolved
+        })
+    }
+}
+
+/// Reads one override variable, treating an unset variable as "use the
+/// default" and a non-UTF-8 value as an invalid value.
+fn env_value(name: &str) -> Option<String> {
+    match std::env::var(name) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            warn!("invalid {name}; expected UTF-8, using the compiled default");
+            None
         }
-    })
+    }
 }
 
-fn pc_notice_override(name: &str) -> u8 {
-    match std::env::var(name).as_deref() {
-        Ok("1") => 1,
-        Ok("0") | Err(std::env::VarError::NotPresent) => 0,
-        Ok(_) | Err(std::env::VarError::NotUnicode(_)) => {
+/// Parses `OPLUS_PC_NOTICE_*`: only `0` and `1` are accepted; anything else
+/// (including a non-UTF-8 value) warns and falls back to the observed `0`.
+fn parse_notice_flag(name: &str, value: Option<&str>) -> u8 {
+    match value.map(str::trim) {
+        Some("1") => 1,
+        Some("0") | None => 0,
+        Some(_) => {
             warn!("invalid {name}; expected 0 or 1, using 0");
             0
         }
     }
 }
 
-fn pc_ability_json_with_notices(clipboard: u8, cross_device: u8) -> String {
+/// Parses `OPLUS_PC_CAST_UNLOCK_MODE`: only `auto` and `every` are accepted;
+/// anything else warns and falls back to the observed `every`.
+fn parse_cast_unlock_mode(value: Option<&str>) -> &'static str {
+    match value.map(str::trim) {
+        Some(CAST_UNLOCK_AUTO) => CAST_UNLOCK_AUTO,
+        Some(CAST_UNLOCK_EVERY) | None => CAST_UNLOCK_EVERY,
+        Some(_) => {
+            warn!("invalid OPLUS_PC_CAST_UNLOCK_MODE; expected auto or every, using every");
+            CAST_UNLOCK_EVERY
+        }
+    }
+}
+
+fn pc_ability_json_with(overrides: CapabilityOverrides) -> String {
     let value = serde_json::json!({
         "PCVersion": PC_CLIENT_VERSION,
         "CastAbility": 1000,
@@ -1851,11 +1919,11 @@ fn pc_ability_json_with_notices(clipboard: u8, cross_device: u8) -> String {
         "Synergy_CastUnlock_Version": 2000,
         "crossdeviceClipboardVersion": 1200,
         "ScreenShareAbility": 1000,
-        "Notice_ClipBoard": clipboard,
-        "Notice_CrossDevice": cross_device,
+        "Notice_ClipBoard": overrides.notice_clipboard,
+        "Notice_CrossDevice": overrides.notice_cross_device,
         "Notice_MaterialFlow": 0,
         "ScreenShareArrange": 0,
-        "Synergy_CastUnlock_Mode": pc_cast_unlock_mode(),
+        "Synergy_CastUnlock_Mode": overrides.cast_unlock_mode,
         "OSType": PC_OS_TYPE,
         "OSVersion": PC_OS_VERSION,
     });
@@ -4071,24 +4139,115 @@ mod tests {
                 .contains("MacClientVersion")
         );
 
-        let ability: serde_json::Value = serde_json::from_str(&pc_ability_json()).unwrap();
-        // Defaults follow the observed Windows frame (all three notice flags 0);
-        // the phone reported 1 on its side. Individual effects are not isolated.
+        // The compiled defaults follow the observed Windows frame (all three
+        // notice flags 0, `every`); the phone reported 1 on its side. Individual
+        // effects are not isolated. Asserted against the pure builder so the
+        // process environment cannot make this test order-dependent.
+        let ability: serde_json::Value =
+            serde_json::from_str(&pc_ability_json_with(CapabilityOverrides::DEFAULTS)).unwrap();
         assert_eq!(ability["Notice_ClipBoard"], 0);
         assert_eq!(ability["Notice_CrossDevice"], 0);
         assert_eq!(ability["Notice_MaterialFlow"], 0);
-        assert_eq!(ability["Synergy_CastUnlock_Mode"], "every");
+        assert_eq!(ability["Synergy_CastUnlock_Mode"], CAST_UNLOCK_EVERY);
         assert_eq!(ability["crossdeviceClipboardVersion"], 1200);
-        for (clipboard, cross_device) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
-            let value: serde_json::Value =
-                serde_json::from_str(&pc_ability_json_with_notices(clipboard, cross_device))
+        for clipboard in [0, 1] {
+            for cross_device in [0, 1] {
+                let value: serde_json::Value =
+                    serde_json::from_str(&pc_ability_json_with(CapabilityOverrides {
+                        notice_clipboard: clipboard,
+                        notice_cross_device: cross_device,
+                        ..CapabilityOverrides::DEFAULTS
+                    }))
                     .unwrap();
-            assert_eq!(value["Notice_ClipBoard"], clipboard);
-            assert_eq!(value["Notice_CrossDevice"], cross_device);
+                assert_eq!(value["Notice_ClipBoard"], clipboard);
+                assert_eq!(value["Notice_CrossDevice"], cross_device);
+            }
         }
         assert_eq!(ability["OSType"], PC_OS_TYPE);
         assert_eq!(ability["OSVersion"], PC_OS_VERSION);
         assert_eq!(pc_device_name(), PC_DEVICE_NAME);
+    }
+
+    #[test]
+    fn capability_override_parsers_accept_only_the_documented_values() {
+        // Unset and the observed values resolve to the observed defaults.
+        assert_eq!(parse_notice_flag("X", None), 0);
+        assert_eq!(parse_notice_flag("X", Some("0")), 0);
+        assert_eq!(parse_notice_flag("X", Some("1")), 1);
+        assert_eq!(parse_cast_unlock_mode(None), CAST_UNLOCK_EVERY);
+        assert_eq!(parse_cast_unlock_mode(Some("every")), CAST_UNLOCK_EVERY);
+        assert_eq!(parse_cast_unlock_mode(Some("auto")), CAST_UNLOCK_AUTO);
+        // Surrounding whitespace is ignored, matching configured_session().
+        assert_eq!(parse_notice_flag("X", Some(" 1 ")), 1);
+        assert_eq!(parse_cast_unlock_mode(Some(" auto ")), CAST_UNLOCK_AUTO);
+        // Everything else warns and falls back to the observed value rather
+        // than to the previous Linux value.
+        for rejected in ["", "true", "2", "01", "yes"] {
+            assert_eq!(parse_notice_flag("X", Some(rejected)), 0, "{rejected:?}");
+        }
+        for rejected in ["", "AUTO", "never", "0", "auto mode"] {
+            assert_eq!(
+                parse_cast_unlock_mode(Some(rejected)),
+                CAST_UNLOCK_EVERY,
+                "{rejected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn capability_overrides_change_only_the_documented_fields() {
+        let default: serde_json::Value =
+            serde_json::from_str(&pc_ability_json_with(CapabilityOverrides::DEFAULTS)).unwrap();
+        let rolled_back: serde_json::Value =
+            serde_json::from_str(&pc_ability_json_with(CapabilityOverrides {
+                notice_clipboard: 1,
+                notice_cross_device: 1,
+                cast_unlock_mode: CAST_UNLOCK_AUTO,
+            }))
+            .unwrap();
+        // A/B rollback must reproduce the previous Linux advertisement exactly,
+        // leaving every other negotiated field untouched.
+        assert_eq!(rolled_back["Notice_ClipBoard"], 1);
+        assert_eq!(rolled_back["Notice_CrossDevice"], 1);
+        assert_eq!(rolled_back["Synergy_CastUnlock_Mode"], CAST_UNLOCK_AUTO);
+        for field in [
+            "PCVersion",
+            "CastAbility",
+            "GameCastAbility",
+            "Synergy_CastUnlock_Version",
+            "crossdeviceClipboardVersion",
+            "ScreenShareAbility",
+            "Notice_MaterialFlow",
+            "ScreenShareArrange",
+            "OSType",
+            "OSVersion",
+        ] {
+            assert_eq!(
+                rolled_back[field], default[field],
+                "{field} must not change"
+            );
+        }
+
+        let frames = data_bus_handshake_frames(
+            "A71DBD9750FF",
+            "test-pc",
+            CapabilityOverrides {
+                notice_clipboard: 0,
+                notice_cross_device: 1,
+                cast_unlock_mode: CAST_UNLOCK_AUTO,
+            },
+        );
+        let last: serde_json::Value = serde_json::from_str(&frames[10].1).unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(last["dbs_msg_payload"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["value"], CAST_UNLOCK_AUTO);
+        let ability: serde_json::Value = serde_json::from_str(&frames[5].1).unwrap();
+        let ability: serde_json::Value =
+            serde_json::from_str(ability["dbs_msg_payload"].as_str().unwrap()).unwrap();
+        // The `pcAbility` value is embedded as a JSON object, not a string.
+        assert_eq!(ability["key"], "pcAbility");
+        assert_eq!(ability["value"]["Notice_CrossDevice"], 1);
+        assert_eq!(ability["value"]["Notice_ClipBoard"], 0);
     }
 
     #[test]
@@ -4461,7 +4620,8 @@ mod tests {
 
     #[test]
     fn handshake_contains_observed_clipboard_negotiation_in_order() {
-        let frames = data_bus_handshake_frames("A71DBD9750FF", "test-pc");
+        let frames =
+            data_bus_handshake_frames("A71DBD9750FF", "test-pc", CapabilityOverrides::DEFAULTS);
         assert_eq!(frames.len(), 11);
         assert_eq!(
             frames.iter().map(|(route, _)| *route).collect::<Vec<_>>(),
