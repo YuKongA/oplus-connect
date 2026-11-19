@@ -41,8 +41,9 @@ type HmacSha512 = Hmac<Sha512>;
 /// the phone sends `0x02` and neither side validates it).
 const PLATFORM_PC: u8 = 0x01;
 
-/// Profiles announced in the `0x0008` service list. The official client also
-/// advertises the oshare profile here, before registering its agent later.
+/// Profiles announced in the `0x0008` service list. The Windows sessions
+/// compared on Find X6 Pro advertised these four profiles; clipboard data in
+/// those sessions used the `Oplus_MacConnect` DataBus topic.
 pub const SERVICE_PROFILES: [&str; 4] = [
     "system:streamtransfer",
     "system:filetransfer",
@@ -59,7 +60,17 @@ pub const EPI_SERVICE_PROFILE_COUNT: u8 = 3;
 const PC_DEVICE_NAME: &str = "";
 const PC_OS_TYPE: &str = "windows";
 const PC_OS_VERSION: &str = "10.0.28000";
-const PC_NOTICE_MATERIAL_FLOW: u8 = 0;
+/// Version string the official client reports in `pcAbility.PCVersion` and the
+/// `MacClientVersion` topic message. Both were verified identical against
+/// v16.2.6 and v17.20.3 captures; keep them in sync.
+const PC_CLIENT_VERSION: &str = "17.20.3";
+/// Version tag observed in Windows `clipboard_data` captures; `pcAbility`
+/// advertises 1200 separately.
+const CLIPBOARD_DATA_VERSION: &str = "1000";
+/// `Synergy_CastUnlock_Mode` values. The observed Windows frame reports
+/// `every`; `auto` is the previous Linux value, kept for A/B rollback.
+const CAST_UNLOCK_AUTO: &str = "auto";
+const CAST_UNLOCK_EVERY: &str = "every";
 
 pub const MSG_EPI_OFFER: u8 = 0x01;
 pub const MSG_EPI_ANSWER: u8 = 0x02;
@@ -634,17 +645,41 @@ async fn send_data_bus_handshake(
     peer_id: [u8; 6],
 ) -> std::io::Result<()> {
     let our_hex = crate::net_utils::pdid();
-    let frames = [
-        (0x03, link_info_json(&our_hex, pc_device_name())),
+    let frames = data_bus_handshake_frames(
+        &our_hex,
+        pc_device_name(),
+        CapabilityOverrides::from_process_env(),
+    );
+    for (route_head, json) in frames {
+        let frame = build_data_bus_with(session_id, our_id, peer_id, route_head, &json);
+        write_frame(sock, &frame).await?;
+    }
+    for json in notification_startup_messages() {
+        let frame = build_data_bus_with(session_id, our_id, peer_id, 0x52, &json);
+        write_frame(sock, &frame).await?;
+    }
+    Ok(())
+}
+
+fn data_bus_handshake_frames(
+    our_hex: &str,
+    device_name: &str,
+    overrides: CapabilityOverrides,
+) -> [(u8, String); 11] {
+    [
+        (0x03, link_info_json(our_hex, device_name)),
         (0x2a, OFFICIAL_WINDOWS_TOPIC_SYNC_JSON.to_string()),
         (0x51, SCREEN_STATUS_JSON.to_string()),
         (
             0x52,
             topic_data_json(
                 "Oplus_MacConnect",
-                "{\"key\":\"MacClientVersion\",\"value\":\"17.20.3\"}",
+                &format!("{{\"key\":\"MacClientVersion\",\"value\":\"{PC_CLIENT_VERSION}\"}}"),
             ),
         ),
+        // This separate topic message predates the pcAbility flags. Its
+        // relationship to pcAbility.Notice_CrossDevice is not established by
+        // the available captures, so preserve it independently.
         (
             0x52,
             topic_data_json(
@@ -656,9 +691,15 @@ async fn send_data_bus_handshake(
             0x52,
             topic_data_json(
                 "Oplus_MacConnect",
-                &format!("{{\"key\":\"pcAbility\",\"value\":{}}}", pc_ability_json()),
+                &format!(
+                    "{{\"key\":\"pcAbility\",\"value\":{}}}",
+                    pc_ability_json_with(overrides)
+                ),
             ),
         ),
+        // The official client announces the clipboard channel twice: once with
+        // the 1200 capability tag and once with 1000. Preserve the observed
+        // order; the receiving device's duplicate-key semantics are unknown.
         (
             0x52,
             topic_data_json(
@@ -670,20 +711,32 @@ async fn send_data_bus_handshake(
             0x52,
             topic_data_json(
                 "Oplus_MacConnect",
+                "{\"key\":\"clipboard_state_first_time\",\"value\":\"{\\\"crossdeviceClipboardVersion\\\":\\\"1000\\\",\\\"source\\\":\\\"windows\\\",\\\"state\\\":1}\"}",
+            ),
+        ),
+        (
+            0x52,
+            topic_data_json(
+                "Oplus_MacConnect",
                 "{\"key\":\"clipboard_state_active\",\"type\":20,\"value\":\"{\\\"crossdeviceClipboardVersion\\\":\\\"1200\\\",\\\"state\\\":1,\\\"source\\\":\\\"windows\\\"}\"}",
             ),
         ),
-    ];
-
-    for (route_head, json) in frames {
-        let frame = build_data_bus_with(session_id, our_id, peer_id, route_head, &json);
-        write_frame(sock, &frame).await?;
-    }
-    for json in notification_startup_messages() {
-        let frame = build_data_bus_with(session_id, our_id, peer_id, 0x52, &json);
-        write_frame(sock, &frame).await?;
-    }
-    Ok(())
+        (
+            0x52,
+            topic_data_json(
+                "Oplus_MacConnect",
+                "{\"key\":\"Synergy_CastUnlock_Version\",\"value\":\"2000\"}",
+            ),
+        ),
+        (
+            0x52,
+            topic_data_json(
+                "Oplus_MacConnect",
+                &serde_json::json!({"key":"Synergy_CastUnlock_Mode","value":overrides.cast_unlock_mode})
+                    .to_string(),
+            ),
+        ),
+    ]
 }
 
 /// Link-info payload the official PC sends right after the agent exchange
@@ -951,12 +1004,88 @@ pub fn write_clipboard_text(text: &str) -> bool {
     true
 }
 
-/// Reads the platform clipboard without blocking the protocol runtime thread.
+/// Bound clipboard reads and keep at most one blocking backend call in flight.
+/// A timed-out spawn_blocking task continues running, so its permit must remain
+/// owned by the worker until the backend actually returns.
 pub async fn read_clipboard_text_async() -> Option<String> {
-    tokio::task::spawn_blocking(read_clipboard_text)
-        .await
-        .ok()
-        .flatten()
+    static READ_GATE: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    static READ_TIMEOUT_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let timeout_ms =
+        *READ_TIMEOUT_MS.get_or_init(|| match std::env::var("OPLUS_CLIPBOARD_READ_TIMEOUT_MS") {
+            Ok(value) => match value.parse::<u64>() {
+                Ok(ms) if (100..=30_000).contains(&ms) => ms,
+                _ => {
+                    warn!("invalid OPLUS_CLIPBOARD_READ_TIMEOUT_MS; expected 100–30000, using 500");
+                    500
+                }
+            },
+            Err(std::env::VarError::NotPresent) => 500,
+            Err(_) => {
+                warn!("invalid OPLUS_CLIPBOARD_READ_TIMEOUT_MS; expected UTF-8, using 500");
+                500
+            }
+        });
+    let gate = READ_GATE.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)));
+    read_clipboard_with_gate(
+        gate.clone(),
+        std::time::Duration::from_millis(timeout_ms),
+        read_clipboard_text,
+    )
+    .await
+}
+
+async fn read_clipboard_with_gate<F>(
+    gate: std::sync::Arc<tokio::sync::Semaphore>,
+    timeout: std::time::Duration,
+    read: F,
+) -> Option<String>
+where
+    F: FnOnce() -> Option<String> + Send + 'static,
+{
+    let permit = match gate.try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            clipboard_read_warning("previous backend read is still running");
+            return None;
+        }
+    };
+    let task = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        read()
+    });
+    match tokio::time::timeout(timeout, task).await {
+        Ok(Ok(text)) => text,
+        Ok(Err(error)) => {
+            clipboard_read_warning(&format!("backend read task failed: {error}"));
+            None
+        }
+        Err(_) => {
+            clipboard_read_warning(
+                "backend read timed out; waiting for the existing worker to finish",
+            );
+            None
+        }
+    }
+}
+
+// A blocked backend can keep the single-flight permit indefinitely; do not
+// start replacement workers (spawn_blocking cannot cancel a running call).
+// Emit a bounded warning without logging clipboard contents.
+fn clipboard_read_warning(reason: &str) {
+    static LAST_WARNING: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let previous = LAST_WARNING.load(Ordering::Relaxed);
+    if now.saturating_sub(previous) >= 30
+        && LAST_WARNING
+            .compare_exchange(previous, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        warn!("clipboard read unavailable: {reason}");
+    }
 }
 
 /// Writes the platform clipboard without blocking the protocol runtime thread.
@@ -968,6 +1097,11 @@ pub async fn write_clipboard_text_async(text: &str) -> bool {
 }
 
 /// `clipboard_data` payload (the inner `value` string).
+///
+/// Field set matches the observed Windows capture: every media
+/// field is present as `null`, `source` is `windows`, and
+/// `crossdeviceClipboardVersion` is **"1000"** (not the 1200 advertised in
+/// `pcAbility`).
 pub fn clipboard_data_value(text: &str) -> String {
     let timestamp = utc_timestamp();
     let data = serde_json::json!({
@@ -982,7 +1116,7 @@ pub fn clipboard_data_value(text: &str) -> String {
         // an unknown source is ignored, so we present ourselves as a Windows peer.
         "source": "windows",
         "timestamp": timestamp,
-        "crossdeviceClipboardVersion": "1200",
+        "crossdeviceClipboardVersion": CLIPBOARD_DATA_VERSION,
     });
     serde_json::json!({ "key": "clipboard_data", "value": data.to_string() }).to_string()
 }
@@ -1003,6 +1137,13 @@ fn clipboard_data_frame(
     })
 }
 
+/// ISO-8601 UTC timestamp with a `+00:00` offset, matching the official
+/// Windows client's `clipboard_data.timestamp`.
+///
+/// The capture shows the fraction length is **not** fixed (both
+/// `.294726+00:00` and `.589713700+00:00` were observed), i.e. the consumer
+/// parses it as a general ISO-8601 instant. We emit microsecond precision,
+/// which sits inside the observed range.
 fn utc_timestamp() -> String {
     let elapsed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1011,11 +1152,11 @@ fn utc_timestamp() -> String {
     let seconds = elapsed.as_secs() % 86_400;
     let (year, month, day) = civil_from_days(days);
     format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:09}+00:00",
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:06}+00:00",
         seconds / 3600,
         (seconds % 3600) / 60,
         seconds % 60,
-        elapsed.subsec_nanos(),
+        elapsed.subsec_micros(),
     )
 }
 
@@ -1048,10 +1189,12 @@ mod utc_timestamp_tests {
     #[test]
     fn timestamp_is_iso_8601_utc() {
         let timestamp = utc_timestamp();
-        assert_eq!(timestamp.len(), 35);
+        // Observed Windows shape: 2026-11-19T00:50:10.589713+00:00
+        assert_eq!(timestamp.len(), 32);
         assert_eq!(&timestamp[4..5], "-");
         assert_eq!(&timestamp[10..11], "T");
         assert!(timestamp.ends_with("+00:00"));
+        assert_eq!(&timestamp[19..20], ".");
     }
 }
 
@@ -1672,22 +1815,115 @@ pub fn topic_data_json(topic: &str, payload_json: &str) -> String {
     value.to_string()
 }
 
-/// Capability advertisement (`pcAbility`) matching the official PC's shape;
-/// `Notice_ClipBoard` / `Notice_CrossDevice` must be 1 for the phone to enable
-/// clipboard and notification sync.
+/// Capability advertisement (`pcAbility`) aligned with the Windows sessions
+/// compared against Find X6 Pro on 2026-11-19. OSVersion is local configuration,
+/// not necessarily the OS version reported in those captures.
+///
+/// The observed Windows frame has both notice flags set to 0. Their individual
+/// effects have not been isolated; the environment overrides allow controlled
+/// comparison or rollback to the previous value (1).
 pub fn pc_ability_json() -> String {
+    pc_ability_json_with(CapabilityOverrides::from_process_env())
+}
+
+// Resolve the shared handshake overrides once; pure parsers keep tests isolated
+// from the process environment and the OnceLock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CapabilityOverrides {
+    notice_clipboard: u8,
+    notice_cross_device: u8,
+    cast_unlock_mode: &'static str,
+}
+
+impl CapabilityOverrides {
+    const DEFAULTS: Self = Self {
+        notice_clipboard: 0,
+        notice_cross_device: 0,
+        cast_unlock_mode: CAST_UNLOCK_EVERY,
+    };
+
+    fn from_process_env() -> Self {
+        static RESOLVED: std::sync::OnceLock<CapabilityOverrides> = std::sync::OnceLock::new();
+        *RESOLVED.get_or_init(|| {
+            let resolved = Self {
+                notice_clipboard: parse_notice_flag(
+                    "OPLUS_PC_NOTICE_CLIPBOARD",
+                    env_value("OPLUS_PC_NOTICE_CLIPBOARD").as_deref(),
+                ),
+                notice_cross_device: parse_notice_flag(
+                    "OPLUS_PC_NOTICE_CROSS_DEVICE",
+                    env_value("OPLUS_PC_NOTICE_CROSS_DEVICE").as_deref(),
+                ),
+                cast_unlock_mode: parse_cast_unlock_mode(
+                    env_value("OPLUS_PC_CAST_UNLOCK_MODE").as_deref(),
+                ),
+            };
+            let default = Self::DEFAULTS;
+            if resolved != default {
+                info!(
+                    "capability overrides active: Notice_ClipBoard={} Notice_CrossDevice={} Synergy_CastUnlock_Mode={}",
+                    resolved.notice_clipboard,
+                    resolved.notice_cross_device,
+                    resolved.cast_unlock_mode,
+                );
+            }
+            resolved
+        })
+    }
+}
+
+/// Reads one override variable, treating an unset variable as "use the
+/// default" and a non-UTF-8 value as an invalid value.
+fn env_value(name: &str) -> Option<String> {
+    match std::env::var(name) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            warn!("invalid {name}; expected UTF-8, using the compiled default");
+            None
+        }
+    }
+}
+
+/// Parses `OPLUS_PC_NOTICE_*`: only `0` and `1` are accepted; anything else
+/// (including a non-UTF-8 value) warns and falls back to the observed `0`.
+fn parse_notice_flag(name: &str, value: Option<&str>) -> u8 {
+    match value.map(str::trim) {
+        Some("1") => 1,
+        Some("0") | None => 0,
+        Some(_) => {
+            warn!("invalid {name}; expected 0 or 1, using 0");
+            0
+        }
+    }
+}
+
+/// Parses `OPLUS_PC_CAST_UNLOCK_MODE`: only `auto` and `every` are accepted;
+/// anything else warns and falls back to the observed `every`.
+fn parse_cast_unlock_mode(value: Option<&str>) -> &'static str {
+    match value.map(str::trim) {
+        Some(CAST_UNLOCK_AUTO) => CAST_UNLOCK_AUTO,
+        Some(CAST_UNLOCK_EVERY) | None => CAST_UNLOCK_EVERY,
+        Some(_) => {
+            warn!("invalid OPLUS_PC_CAST_UNLOCK_MODE; expected auto or every, using every");
+            CAST_UNLOCK_EVERY
+        }
+    }
+}
+
+fn pc_ability_json_with(overrides: CapabilityOverrides) -> String {
     let value = serde_json::json!({
-        "PCVersion": "17.20.3",
+        "PCVersion": PC_CLIENT_VERSION,
         "CastAbility": 1000,
         "GameCastAbility": 1000,
         "Synergy_CastUnlock_Version": 2000,
         "crossdeviceClipboardVersion": 1200,
         "ScreenShareAbility": 1000,
-        "Notice_ClipBoard": 1,
-        "Notice_CrossDevice": 1,
-        "Notice_MaterialFlow": PC_NOTICE_MATERIAL_FLOW,
+        "Notice_ClipBoard": overrides.notice_clipboard,
+        "Notice_CrossDevice": overrides.notice_cross_device,
+        "Notice_MaterialFlow": 0,
         "ScreenShareArrange": 0,
-        "Synergy_CastUnlock_Mode": "auto",
+        "Synergy_CastUnlock_Mode": overrides.cast_unlock_mode,
         "OSType": PC_OS_TYPE,
         "OSVersion": PC_OS_VERSION,
     });
@@ -1789,6 +2025,24 @@ fn take_frame(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
     let body = buf[2..2 + len].to_vec();
     buf.drain(..2 + len);
     Some(body)
+}
+
+enum ClipboardPollResult {
+    Tick,
+    Read(std::io::Result<usize>),
+}
+
+// Both branches are cancellation-safe. Keep the interval outside this future:
+// replacing it after each read would starve polling during steady traffic.
+async fn read_or_clipboard_tick<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    tick: &mut tokio::time::Interval,
+    buf: &mut [u8],
+) -> ClipboardPollResult {
+    tokio::select! {
+        _ = tick.tick() => ClipboardPollResult::Tick,
+        result = reader.read(buf) => ClipboardPollResult::Read(result),
+    }
 }
 
 /// Runs the PC side of the data channel on an accepted connection.
@@ -1982,6 +2236,9 @@ async fn run_session<F, Fut>(
     let mut injected_2 = false;
     let allow_unconfirmed =
         std::env::var("OPLUS_CLIPBOARD_ALLOW_UNCONFIRMED").as_deref() == Ok("1");
+    // A persistent timer must not be reset by incoming network traffic.
+    let mut clipboard_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    clipboard_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         if let (Some(controller), Some(peer_id)) =
@@ -2462,8 +2719,7 @@ async fn run_session<F, Fut>(
                 return;
             }
         }
-        // Idle for 700 ms = a chance to mirror local clipboard changes; a
-        // cancelled read loses nothing, so the timeout is safe.
+        // Poll independently of socket traffic; reads are cancellation-safe.
         let read = match tokio::select! {
             _ = async {
                 match cast_controller.as_mut() {
@@ -2483,12 +2739,9 @@ async fn run_session<F, Fut>(
                     None => std::future::pending().await,
                 }
             }, if local_session_confirmed && link_info_sent => continue,
-            result = tokio::time::timeout(
-                std::time::Duration::from_millis(700),
-                sock.read(&mut chunk),
-            ) => result.map_err(|_| ()),
+            result = read_or_clipboard_tick(&mut sock, &mut clipboard_tick, &mut chunk) => result,
         } {
-            Err(_) => {
+            ClipboardPollResult::Tick => {
                 if let Some(peer_id) = peer_device_id {
                     if !injected
                         && inject_text.is_some()
@@ -2581,12 +2834,12 @@ async fn run_session<F, Fut>(
                 }
                 continue;
             }
-            Ok(Ok(0)) => {
+            ClipboardPollResult::Read(Ok(0)) => {
                 info!("panta[{}]: peer closed", peer);
                 return;
             }
-            Ok(Ok(n)) => n,
-            Ok(Err(error)) => {
+            ClipboardPollResult::Read(Ok(n)) => n,
+            ClipboardPollResult::Read(Err(error)) => {
                 warn!("panta[{}]: read failed: {}", peer, error);
                 return;
             }
@@ -3712,6 +3965,9 @@ mod tests {
 
     #[test]
     fn service_list_matches_the_official_capture() {
+        // Matches the captured Windows service list: four profiles and no
+        // app:clipboardservice; clipboard data in the compared sessions used
+        // the DataBus topic.
         let official = hex_to_vec(
             "00080102000000000473797374656d3a73747265616d7472616e736665723b73797374656d3a66696c657472616e736665723b6170703a756e6974652e6f706c75732e6f6e65743b6170703a6f73686172652e77696e2e6167656e743b",
         );
@@ -3739,6 +3995,7 @@ mod tests {
 
     #[test]
     fn profile_frames_match_the_official_capture() {
+        // Frame sizes match the captured Windows session (299 B registration).
         assert_eq!(profile_registration().len(), 299);
         assert_eq!(profile_selection().len(), 30);
         let bind = profile_bind();
@@ -3882,13 +4139,115 @@ mod tests {
                 .contains("MacClientVersion")
         );
 
-        let ability: serde_json::Value = serde_json::from_str(&pc_ability_json()).unwrap();
-        assert_eq!(ability["Notice_ClipBoard"], 1);
-        assert_eq!(ability["Notice_CrossDevice"], 1);
-        assert_eq!(ability["Notice_MaterialFlow"], PC_NOTICE_MATERIAL_FLOW);
+        // The compiled defaults follow the observed Windows frame (all three
+        // notice flags 0, `every`); the phone reported 1 on its side. Individual
+        // effects are not isolated. Asserted against the pure builder so the
+        // process environment cannot make this test order-dependent.
+        let ability: serde_json::Value =
+            serde_json::from_str(&pc_ability_json_with(CapabilityOverrides::DEFAULTS)).unwrap();
+        assert_eq!(ability["Notice_ClipBoard"], 0);
+        assert_eq!(ability["Notice_CrossDevice"], 0);
+        assert_eq!(ability["Notice_MaterialFlow"], 0);
+        assert_eq!(ability["Synergy_CastUnlock_Mode"], CAST_UNLOCK_EVERY);
+        assert_eq!(ability["crossdeviceClipboardVersion"], 1200);
+        for clipboard in [0, 1] {
+            for cross_device in [0, 1] {
+                let value: serde_json::Value =
+                    serde_json::from_str(&pc_ability_json_with(CapabilityOverrides {
+                        notice_clipboard: clipboard,
+                        notice_cross_device: cross_device,
+                        ..CapabilityOverrides::DEFAULTS
+                    }))
+                    .unwrap();
+                assert_eq!(value["Notice_ClipBoard"], clipboard);
+                assert_eq!(value["Notice_CrossDevice"], cross_device);
+            }
+        }
         assert_eq!(ability["OSType"], PC_OS_TYPE);
         assert_eq!(ability["OSVersion"], PC_OS_VERSION);
         assert_eq!(pc_device_name(), PC_DEVICE_NAME);
+    }
+
+    #[test]
+    fn capability_override_parsers_accept_only_the_documented_values() {
+        // Unset and the observed values resolve to the observed defaults.
+        assert_eq!(parse_notice_flag("X", None), 0);
+        assert_eq!(parse_notice_flag("X", Some("0")), 0);
+        assert_eq!(parse_notice_flag("X", Some("1")), 1);
+        assert_eq!(parse_cast_unlock_mode(None), CAST_UNLOCK_EVERY);
+        assert_eq!(parse_cast_unlock_mode(Some("every")), CAST_UNLOCK_EVERY);
+        assert_eq!(parse_cast_unlock_mode(Some("auto")), CAST_UNLOCK_AUTO);
+        // Surrounding whitespace is ignored, matching configured_session().
+        assert_eq!(parse_notice_flag("X", Some(" 1 ")), 1);
+        assert_eq!(parse_cast_unlock_mode(Some(" auto ")), CAST_UNLOCK_AUTO);
+        // Everything else warns and falls back to the observed value rather
+        // than to the previous Linux value.
+        for rejected in ["", "true", "2", "01", "yes"] {
+            assert_eq!(parse_notice_flag("X", Some(rejected)), 0, "{rejected:?}");
+        }
+        for rejected in ["", "AUTO", "never", "0", "auto mode"] {
+            assert_eq!(
+                parse_cast_unlock_mode(Some(rejected)),
+                CAST_UNLOCK_EVERY,
+                "{rejected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn capability_overrides_change_only_the_documented_fields() {
+        let default: serde_json::Value =
+            serde_json::from_str(&pc_ability_json_with(CapabilityOverrides::DEFAULTS)).unwrap();
+        let rolled_back: serde_json::Value =
+            serde_json::from_str(&pc_ability_json_with(CapabilityOverrides {
+                notice_clipboard: 1,
+                notice_cross_device: 1,
+                cast_unlock_mode: CAST_UNLOCK_AUTO,
+            }))
+            .unwrap();
+        // A/B rollback must reproduce the previous Linux advertisement exactly,
+        // leaving every other negotiated field untouched.
+        assert_eq!(rolled_back["Notice_ClipBoard"], 1);
+        assert_eq!(rolled_back["Notice_CrossDevice"], 1);
+        assert_eq!(rolled_back["Synergy_CastUnlock_Mode"], CAST_UNLOCK_AUTO);
+        for field in [
+            "PCVersion",
+            "CastAbility",
+            "GameCastAbility",
+            "Synergy_CastUnlock_Version",
+            "crossdeviceClipboardVersion",
+            "ScreenShareAbility",
+            "Notice_MaterialFlow",
+            "ScreenShareArrange",
+            "OSType",
+            "OSVersion",
+        ] {
+            assert_eq!(
+                rolled_back[field], default[field],
+                "{field} must not change"
+            );
+        }
+
+        let frames = data_bus_handshake_frames(
+            "A71DBD9750FF",
+            "test-pc",
+            CapabilityOverrides {
+                notice_clipboard: 0,
+                notice_cross_device: 1,
+                cast_unlock_mode: CAST_UNLOCK_AUTO,
+            },
+        );
+        let last: serde_json::Value = serde_json::from_str(&frames[10].1).unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(last["dbs_msg_payload"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["value"], CAST_UNLOCK_AUTO);
+        let ability: serde_json::Value = serde_json::from_str(&frames[5].1).unwrap();
+        let ability: serde_json::Value =
+            serde_json::from_str(ability["dbs_msg_payload"].as_str().unwrap()).unwrap();
+        // The `pcAbility` value is embedded as a JSON object, not a string.
+        assert_eq!(ability["key"], "pcAbility");
+        assert_eq!(ability["value"]["Notice_CrossDevice"], 1);
+        assert_eq!(ability["value"]["Notice_ClipBoard"], 0);
     }
 
     #[test]
@@ -4260,6 +4619,161 @@ mod tests {
     }
 
     #[test]
+    fn handshake_contains_observed_clipboard_negotiation_in_order() {
+        let frames =
+            data_bus_handshake_frames("A71DBD9750FF", "test-pc", CapabilityOverrides::DEFAULTS);
+        assert_eq!(frames.len(), 11);
+        assert_eq!(
+            frames.iter().map(|(route, _)| *route).collect::<Vec<_>>(),
+            vec![
+                0x03, 0x2a, 0x51, 0x52, 0x52, 0x52, 0x52, 0x52, 0x52, 0x52, 0x52
+            ]
+        );
+        let payloads: Vec<serde_json::Value> = frames[3..]
+            .iter()
+            .map(|(_, frame)| {
+                let envelope: serde_json::Value = serde_json::from_str(frame).unwrap();
+                assert_eq!(
+                    envelope["dbs_msg_topic"]["dbs_topic_name"],
+                    "Oplus_MacConnect"
+                );
+                serde_json::from_str(envelope["dbs_msg_payload"].as_str().unwrap()).unwrap()
+            })
+            .collect();
+        let keys: Vec<&str> = payloads
+            .iter()
+            .map(|p| p["key"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "MacClientVersion",
+                "Notice_CrossDevice",
+                "pcAbility",
+                "clipboard_state_first_time",
+                "clipboard_state_first_time",
+                "clipboard_state_active",
+                "Synergy_CastUnlock_Version",
+                "Synergy_CastUnlock_Mode"
+            ]
+        );
+        let states: Vec<serde_json::Value> = payloads[3..=4]
+            .iter()
+            .map(|p| serde_json::from_str(p["value"].as_str().unwrap()).unwrap())
+            .collect();
+        assert_eq!(
+            states[0],
+            serde_json::json!({"crossdeviceClipboardVersion":"1200","source":"windows","state":1})
+        );
+        assert_eq!(
+            states[1],
+            serde_json::json!({"crossdeviceClipboardVersion":"1000","source":"windows","state":1})
+        );
+        assert_eq!(payloads[3]["key"], "clipboard_state_first_time");
+        assert_eq!(payloads[5]["type"], 20);
+        let active: serde_json::Value =
+            serde_json::from_str(payloads[5]["value"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            active,
+            serde_json::json!({"crossdeviceClipboardVersion":"1200","state":1,"source":"windows"})
+        );
+        assert_eq!(payloads[6]["value"], "2000");
+        assert_eq!(payloads[7]["value"], "every");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn clipboard_timer_is_not_starved_by_continuous_socket_traffic() {
+        use tokio::io::AsyncWriteExt;
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        let traffic = tokio::spawn(async move {
+            loop {
+                if writer.write_all(b"x").await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        });
+        let mut timer = tokio::time::interval(std::time::Duration::from_millis(30));
+        timer.tick().await;
+        let mut buf = [0; 32];
+        tokio::time::timeout(std::time::Duration::from_millis(200), async {
+            loop {
+                match read_or_clipboard_tick(&mut reader, &mut timer, &mut buf).await {
+                    ClipboardPollResult::Tick => break,
+                    ClipboardPollResult::Read(result) => assert!(result.unwrap() > 0),
+                }
+            }
+        })
+        .await
+        .expect("timer must fire despite incoming traffic");
+        traffic.abort();
+    }
+
+    #[tokio::test]
+    async fn timed_out_clipboard_read_remains_single_flight_and_recovers() {
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let result = read_clipboard_with_gate(
+            gate.clone(),
+            std::time::Duration::from_millis(25),
+            move || {
+                release_rx.recv().unwrap();
+                Some("old".to_owned())
+            },
+        )
+        .await;
+        assert_eq!(result, None);
+        assert_eq!(gate.available_permits(), 0);
+        let attempted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = attempted.clone();
+        assert_eq!(
+            read_clipboard_with_gate(gate.clone(), std::time::Duration::from_secs(1), move || {
+                flag.store(true, Ordering::SeqCst);
+                Some("unexpected".to_owned())
+            })
+            .await,
+            None
+        );
+        assert!(!attempted.load(Ordering::SeqCst));
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while gate.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker should release its permit");
+        assert_eq!(
+            read_clipboard_with_gate(gate, std::time::Duration::from_secs(1), || Some(
+                "new".to_owned()
+            ))
+            .await
+            .as_deref(),
+            Some("new")
+        );
+    }
+
+    #[test]
+    fn clipboard_payloads_match_observed_windows_and_phone_shapes() {
+        let pc: serde_json::Value =
+            serde_json::from_str(&clipboard_data_value("test 文本")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(pc["value"].as_str().unwrap()).unwrap();
+        assert_eq!(value["crossdeviceClipboardVersion"], "1000");
+        assert_eq!(value["source"], "windows");
+        assert_eq!(value["data"]["text"]["content"], "test 文本");
+        assert_eq!(value["data"]["text"]["encoding"], "UTF-8");
+        assert!(value["data"]["files"].is_null());
+        assert!(value["timestamp"].as_str().unwrap().ends_with("+00:00"));
+
+        let phone = serde_json::json!({"key":"clipboard_data", "type":0,
+            "value": serde_json::json!({"crossdeviceClipboardVersion":"1000",
+                "data":{"text":{"content":"手机文本","encoding":"UTF-8"}},
+                "source":"phone"}).to_string()});
+        let frame = topic_data_json("Oplus_MacConnect", &phone.to_string());
+        assert_eq!(clipboard_text_from(&frame).as_deref(), Some("手机文本"));
+    }
+
+    #[test]
     fn disabled_clipboard_switches_block_every_data_session() {
         for (key, value) in [
             ("clipboard_state_active", serde_json::json!({"state": 0})),
@@ -4520,6 +5034,11 @@ mod tests {
         assert_eq!(
             agent_for_profile(&registration, "app:oshare.win.agent"),
             Some(LOCAL_OSHARE_AGENT)
+        );
+        assert_eq!(
+            agent_for_profile(&registration, "app:clipboardservice"),
+            None,
+            "the compared Windows sessions did not register a clipboard profile"
         );
     }
 

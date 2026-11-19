@@ -775,6 +775,16 @@ Oplus_HeySynergy_PcConnect_SyncNotification_Subscriber
 
 ## 8. 剪贴板
 
+### 2026-11-19 Find X6 Pro 对照
+
+用户提供的 Windows 对照报告（官方客户端 16.2.6 与 17.20.3，Find X6 Pro）记录了双向通过的 DBS 会话。报告指出 `pcAbility` 中 `Notice_ClipBoard` 和 `Notice_CrossDevice` 为 0、能力版本为 1200，而 PC 发送的 `clipboard_data` 中版本为字符串 `1000`。手机→PC 的 value 可不含 timestamp。Linux 端同时调整多个字段后，用户在 PGEM10_16.0.5.701 确认双向文本同步成功；因未逐字段 A/B，不能断言某个字段单独是根因。
+
+当前实现的基础握手发送 11 帧（另有 3 条通知启动消息），包括顺序为 1200、1000 的两条 `clipboard_state_first_time`。该顺序沿用对照报告；手机如何处理同 key 的重复帧尚未确认。上文 7.5 节的 8 条帧是 2026-10-31 的历史实验，并非当前握手帧数。
+
+`pcAbility` 的 `Notice_ClipBoard` 和 `Notice_CrossDevice` 默认为观察到的 0。可分别设置 `OPLUS_PC_NOTICE_CLIPBOARD=1` 和 `OPLUS_PC_NOTICE_CROSS_DEVICE=1` 回退各自的旧值，或逐项做 A/B 对照；仅接受 `0` 和 `1`（允许首尾空白）。单独的 `Notice_CrossDevice` topic 消息仍发送 `1`，它与 pcAbility 中同名字段的关系尚未由现有抓包证实，覆盖 pcAbility 标志不会改变该消息。`OPLUS_PC_CAST_UNLOCK_MODE=auto` 可将 pcAbility 和独立 topic 的解锁模式都设为旧模式（默认 `every`，只接受这两个值）。这些配置在进程首次使用时读取并缓存，修改后须重启；非法值告警并回退默认值。非默认组合生效时会打印一条 `capability overrides active` 提示，便于确认实际使用的协商值。它们影响共享的设备能力协商，应检查通知、投屏解锁及其他设备功能，不代表有已验证的替代配置。
+
+剪贴板读取超时默认为 500ms，可通过 `OPLUS_CLIPBOARD_READ_TIMEOUT_MS` 设置 100–30000ms；配置在进程首次读取时缓存，非法值告警并回退默认值。读取等待期间当前会话循环仍会暂停，超时不保证是总处理延迟的严格上界。阻塞的后台读取不可取消；超时后保留单个 worker 的许可，直到后端返回，期间限频告警并跳过后续读取，以防后台任务无限积累。若后端永久阻塞，剪贴板读取需等待后端恢复或重启进程；此保护不提供强制恢复。
+
 ### 8.1 官方成功路径
 
 官方 PC→手机成功时，手机日志顺序为：
