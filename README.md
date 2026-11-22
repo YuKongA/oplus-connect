@@ -20,66 +20,13 @@ OPLUS 互联是面向 OPPO / OnePlus 设备的 Linux 原生客户端
 
 ## 构建与运行
 
-在 Arch Linux x86_64 上，从已有的 Git 检出目录构建并安装 pacman 软件包：
-
 ```bash
-sudo pacman -S --needed base-devel git
-OPLUS_CONNECT_SOURCE_URL="file://$PWD" makepkg -si
+makepkg -si                                                       # Arch Linux
+nix run .#                                                        # Nix（提供 nixosModules.default）
+cargo run --release --manifest-path oplus-connect-gui/Cargo.toml  # 源码
 ```
 
-上述命令构建本地仓库当前分支已提交的代码，不包含未提交更改；不设置 `OPLUS_CONNECT_SOURCE_URL` 时使用远端最新提交。构建会运行 GUI 测试。安装后从应用菜单启动，或运行 `oplus-connect`。VA-API 需要适配显卡的驱动；无可用 H.264 硬件编码器时可安装 `gst-plugins-ugly` 使用软件编码。
-
-使用 Nix flake 构建（需要启用 `nix-command` 与 `flakes`）：
-
-```bash
-nix run .#            # 构建并直接运行
-nix build .#          # 构建，产物位于 ./result/bin/oplus-connect
-nix develop           # 带全部构建依赖的开发环境
-nix profile install . # 安装到当前用户的 profile
-```
-
-flake 暴露 `packages.default`（GUI，已内嵌 daemon）、`apps.default`、`devShells.default`、`nixosModules.default` 和 `overlays.default`。
-
-NixOS 上通过模块声明式启用：
-
-```nix
-{
-  inputs.oplus-connect.url = "github:YuKongA/oplus-connect";
-
-  outputs =
-    { nixpkgs, oplus-connect, ... }:
-    {
-      nixosConfigurations.host = nixpkgs.lib.nixosSystem {
-        modules = [
-          oplus-connect.nixosModules.default
-          {
-            programs.oplus-connect.enable = true;
-            # 默认开放设备回连端口；不需要时关闭。
-            # programs.oplus-connect.openFirewall = false;
-          }
-        ];
-      };
-    };
-}
-```
-
-模块会安装软件包、开放设备发现与串流使用的 TCP/UDP 端口，并默认启用 PipeWire、`xdg.portal` 与 Vulkan 图形支持。GUI 在内嵌 daemon 中运行后端，因此不需要额外的系统服务。
-
-Nix 构建使用 nixpkgs 提供的 GStreamer，`gst-plugins-bad` 已启用 VA-API 插件。平板屏幕共享只使用 H.264 编码：优先 `vah264enc`，不可用时回退 `x264enc` 软件编码；手机投屏由手机编码（默认 H.265），电脑端用 `vah264dec`/`vah265dec` 硬解，缺少这些元素时会直接报错而不回退软件解码。部分驱动（例如 NVIDIA 的 NVDEC VA 驱动）需要设置 `GST_VA_ALL_DRIVERS=1` 才会注册 VA 元素，且仍可能缺少 `vah264enc`/`vapostproc`。屏幕共享还需要 PipeWire 及 `xdg-desktop-portal` 后端（NixOS 上启用 `xdg.portal.enable`），Vulkan 驱动由系统提供（NixOS 上启用 `hardware.graphics`）。
-
-直接从源码运行需要支持 Rust 工具链和 GStreamer，GUI 会自动启动内嵌 daemon：
-
-```bash
-cargo run --release --manifest-path oplus-connect-gui/Cargo.toml
-```
-
-单独调试后端：`cargo run --manifest-path oplus-connect-daemon/Cargo.toml`。
-
-键鼠共享需要 Wayland InputCapture portal v2。屏幕共享及触摸反控基于 PipeWire、GStreamer WebRTC 和 RemoteDesktop portal；电脑端发起时在设备详情选择镜像或扩展，再在系统弹窗中授权屏幕与输入控制。
-
-键鼠共享卡死与手机/平板无关，属电脑端输入捕获链路（Wayland portal/EIS）停止投递事件：日志会停在 `kms sharing heartbeat` 的 `idle_ms` 持续增长、同时 `/kms/status` 仍为 connected。此时 `Ctrl+Alt+Escape` 也可能收不到按键，只能结束共享（设备侧断开或退出程序）来释放捕获。`OPLUS_CONNECT_LOG=debug` 启动并在终端保留输出可记录 EIS 启停、被丢弃的输入、跨回事件、会话结束原因和每 5 秒一次的共享心跳。
-
-「设置 → 平板屏幕共享」支持 1–144 fps、500–50000 kbps 和动态码率；默认 30 fps、6000 kbps，动态码率开启。实际效果取决于设备、编码性能和网络质量。
+需 VA-API 驱动、PipeWire 与 `xdg-desktop-portal`；启用防火墙时需放行局域网回连。
 
 ## 配置
 
@@ -110,7 +57,7 @@ LICENSE                 # MIT 许可证
 
 ## 开发
 
-GitHub Actions 在 Arch Linux 容器中检查格式、运行后端与 GUI 测试，并构建 pacman 软件包作为工作流产物。
+GitHub Actions 在 Arch Linux 容器中检查格式、运行后端与 GUI 测试并构建 pacman 软件包，同时执行 Nix flake 格式、模块与构建检查。
 
 ```bash
 # GUI 测试

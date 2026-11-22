@@ -9,9 +9,10 @@
 let
   cfg = config.programs.oplus-connect;
 
-  # Ports the embedded daemon binds: control/data sockets the device dials back
-  # on, plus the SDP announcement listener and its source port.
+  # Fixed ports the embedded daemon binds: discovery, control/Panta data,
+  # and ExpandCast ODMF signaling (7239).
   tcpPorts = [
+    7239
     10150
     10152
     10155
@@ -19,8 +20,8 @@ let
     46999
     47888
     47999
-    48999
     48888
+    48999
   ];
   udpPorts = [
     10150
@@ -42,9 +43,11 @@ in
       type = lib.types.bool;
       default = true;
       description = ''
-        Open the TCP and UDP ports used for device discovery and streaming.
-        Without them a firewall rejects the connection requests the device
-        sends back to this machine.
+        Open the fixed TCP and UDP ports used for device discovery, Panta
+        control/data channels, and ExpandCast signaling (TCP 7239).
+        Keyboard/mouse sharing, phone screen mirroring, and WebRTC media
+        also bind ephemeral ports on the LAN interface, so trust your LAN
+        interface or allow inbound LAN traffic if the firewall blocks them.
       '';
     };
   };

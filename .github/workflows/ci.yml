@@ -240,3 +240,27 @@ jobs:
             *.pkg.tar.zst
             SHA256SUMS
           if-no-files-found: error
+
+  nix:
+    name: Check & build (Nix flake)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v23
+
+      - name: Enable Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@v15
+
+      - name: Check Nix formatting
+        run: nix fmt -- --check flake.nix nix/nixos-module.nix
+
+      - name: Check and build Nix flake
+        run: nix flake check --print-build-logs
+
+      - name: Build Nix package
+        run: nix build .# --print-build-logs
