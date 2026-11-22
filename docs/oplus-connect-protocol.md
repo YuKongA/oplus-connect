@@ -262,6 +262,9 @@ SocketAccept
 连接并不因此断开，业务数据继续走 `46999` 等数据通道。判断“已连接”必须依据数据
 通道，不能依据 SCP socket 是否存活。
 
+手机主动发起时，PC 的 Sync 回复使用手机通告的 `key_type`。字段缺省按 `0` 解码；
+回复为 `0` 时保持原有编码，省略该字段，不改成 `1`。
+
 PC 主动发起时顺序相反：PC 拨手机 `10152`，发送 Hello/Sync，作为 UKEY2 initiator
 发送 ClientInit（next protocol 必须是 `AES_256_CBC-HMAC_SHA256`，手机 server 拒绝
 GCM-SIV），随后发送加密 SyncSecure（PC PDID + KSC）和 business `interact hello`。

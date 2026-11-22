@@ -585,11 +585,9 @@ async fn send_sync_identity(
         6, // device type: PC
         model_id,
     );
-    // The phone validates its advertised Sync.key_type against our reply. A
-    // reply without field 2 decodes as key_type 0 and ColorOS answers
-    // `SCP error: key type not match`. Echo the peer value; treat a missing
-    // phone field as the first-time pairing type (1).
-    ours.key_type = negotiated_sync_key_type(peer_key_type);
+    // Match the phone's Sync.key_type. A missing field decodes as zero,
+    // which the encoder leaves absent in the reply.
+    ours.key_type = peer_key_type;
     let body = ScpWrapData::new(crate::scp::proto::MSG_SYNC, ours.encode()).encode();
     let mut reply = ScpFrame::new(command, body);
     reply.is_response = is_response;
@@ -597,10 +595,6 @@ async fn send_sync_identity(
     sock.write_all(&reply.encode()).await?;
     info!("probe[{}]: sent SCP Sync identity", port);
     Ok(())
-}
-
-fn negotiated_sync_key_type(peer_key_type: u64) -> u64 {
-    if peer_key_type == 0 { 1 } else { peer_key_type }
 }
 
 /// Distinguish incomplete frames from invalid magic before buffering more data.
@@ -1481,11 +1475,41 @@ mod tests {
         assert_eq!(decode_scp_error(&payload[..payload.len() - 1]), None);
     }
 
-    #[test]
-    fn sync_reply_uses_phone_key_type() {
-        assert_eq!(negotiated_sync_key_type(1), 1);
-        assert_eq!(negotiated_sync_key_type(3), 3);
-        assert_eq!(negotiated_sync_key_type(0), 1);
+    #[tokio::test]
+    async fn sync_reply_uses_phone_key_type() {
+        use crate::scp::proto::MSG_SYNC;
+
+        let _guard = PEER_TEST_LOCK.lock().await;
+        // Explicit zero must be constructed by hand: the encoder omits it.
+        for (field, expected) in [
+            (&[0x10, 1][..], 1),
+            (&[0x10, 3], 3),
+            (&[0x10, 0], 0),
+            (&[], 0),
+        ] {
+            let (mut client, task, _, _) = start_control().await;
+            let mut data = ScpSyncData::new("phone", Vec::new(), 1, "000001").encode();
+            data.extend_from_slice(field);
+            let request = ScpFrame::new(
+                CMD_ACTIVE_CONNECTION,
+                ScpWrapData::new(MSG_SYNC, data).encode(),
+            );
+            client.write_all(&request.encode()).await.unwrap();
+
+            let reply = timeout(Duration::from_secs(1), read_frame(&mut client))
+                .await
+                .unwrap();
+            assert!(reply.is_response);
+            let wrap = ScpWrapData::decode(&reply.payload).unwrap();
+            assert_eq!(wrap.msg_type, MSG_SYNC);
+            assert_eq!(ScpSyncData::decode(&wrap.data).unwrap().key_type, expected);
+
+            drop(client);
+            timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap();
+        }
     }
 
     #[tokio::test]
