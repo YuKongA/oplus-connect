@@ -20,28 +20,13 @@ OPLUS 互联是面向 OPPO / OnePlus 设备的 Linux 原生客户端
 
 ## 构建与运行
 
-在 Arch Linux x86_64 上，从已有的 Git 检出目录构建并安装 pacman 软件包：
-
 ```bash
-sudo pacman -S --needed base-devel git
-OPLUS_CONNECT_SOURCE_URL="file://$PWD" makepkg -si
+makepkg -si                                                       # Arch Linux
+nix run .#                                                        # Nix（提供 nixosModules.default）
+cargo run --release --manifest-path oplus-connect-gui/Cargo.toml  # 源码
 ```
 
-上述命令构建本地仓库当前分支已提交的代码，不包含未提交更改；不设置 `OPLUS_CONNECT_SOURCE_URL` 时使用远端最新提交。构建会运行 GUI 测试。安装后从应用菜单启动，或运行 `oplus-connect`。VA-API 需要适配显卡的驱动；无可用 H.264 硬件编码器时可安装 `gst-plugins-ugly` 使用软件编码。
-
-直接从源码运行需要支持 Rust 工具链和 GStreamer，GUI 会自动启动内嵌 daemon：
-
-```bash
-cargo run --release --manifest-path oplus-connect-gui/Cargo.toml
-```
-
-单独调试后端：`cargo run --manifest-path oplus-connect-daemon/Cargo.toml`。
-
-键鼠共享需要 Wayland InputCapture portal v2。屏幕共享及触摸反控基于 PipeWire、GStreamer WebRTC 和 RemoteDesktop portal；电脑端发起时在设备详情选择镜像或扩展，再在系统弹窗中授权屏幕与输入控制。
-
-键鼠共享卡死与手机/平板无关，属电脑端输入捕获链路（Wayland portal/EIS）停止投递事件：日志会停在 `kms sharing heartbeat` 的 `idle_ms` 持续增长、同时 `/kms/status` 仍为 connected。此时 `Ctrl+Alt+Escape` 也可能收不到按键，只能结束共享（设备侧断开或退出程序）来释放捕获。`OPLUS_CONNECT_LOG=debug` 启动并在终端保留输出可记录 EIS 启停、被丢弃的输入、跨回事件、会话结束原因和每 5 秒一次的共享心跳。
-
-「设置 → 平板屏幕共享」支持 1–144 fps、500–50000 kbps 和动态码率；默认 30 fps、6000 kbps，动态码率开启。实际效果取决于设备、编码性能和网络质量。
+需 VA-API 驱动、PipeWire 与 `xdg-desktop-portal`；启用防火墙时需放行局域网回连。
 
 ## 配置
 
@@ -64,13 +49,15 @@ oplus-connect-daemon/   # 设备协议、连接状态、剪贴板与通知后端
 oplus-connect-gui/      # GPUI Kit 桌面客户端
 docs/                   # 协议与调试文档
 PKGBUILD                # Arch Linux 软件包构建配方
+flake.nix               # Nix flake 打包与开发环境
+nix/                    # NixOS 模块
 oplus-connect.desktop   # 桌面入口
 LICENSE                 # MIT 许可证
 ```
 
 ## 开发
 
-GitHub Actions 在 Arch Linux 容器中检查格式、运行后端与 GUI 测试，并构建 pacman 软件包作为工作流产物。
+GitHub Actions 在 Arch Linux 容器中检查格式、运行后端与 GUI 测试并构建 pacman 软件包，同时执行 Nix flake 格式、模块与构建检查。
 
 ```bash
 # GUI 测试

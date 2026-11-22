@@ -14,6 +14,10 @@ target/
 /*.pkg.tar.*
 /*.src.tar.*
 
+# Nix build results
+/result
+/result-*
+
 # Compiled libraries, debug symbols, and installer packages
 *.o
 *.obj
