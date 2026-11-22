@@ -49,14 +49,14 @@
         pkgs:
         with pkgs.gst_all_1;
         [
-          gstreamer
+          gstreamer.out
           gst-plugins-base
           gst-plugins-good
           gst-plugins-bad
           gst-plugins-ugly
         ]
         ++ (with pkgs; [
-          libnice
+          libnice.out
           pipewire
         ]);
 
