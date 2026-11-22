@@ -59,7 +59,7 @@ cargo run --release --manifest-path oplus-connect-gui/Cargo.toml
 | `OPLUS_PC_NOTICE_CLIPBOARD=0\|1`                | `pcAbility.Notice_ClipBoard`，默认 `0`，与对照的官方 Windows 客户端一致            |
 | `OPLUS_PC_NOTICE_CROSS_DEVICE=0\|1`             | `pcAbility.Notice_CrossDevice`，默认 `0`；独立的 `Notice_CrossDevice` 消息不受影响 |
 | `OPLUS_PC_CAST_UNLOCK_MODE=auto\|every`         | `Synergy_CastUnlock_Mode`，默认 `every`；`auto` 是旧的 Linux 值，仅用于回退对照    |
-| `OPLUS_CLIPBOARD_READ_TIMEOUT_MS`               | 单次剪贴板读取超时，范围 100–30000 ms，默认 500                                    |
+| `OPLUS_CLIPBOARD_READ_TIMEOUT_MS`               | 慢速剪贴板读取的告警阈值，不丢弃结果；范围 100–30000 ms，默认 500                 |
 
 ## 项目结构
 

@@ -20,7 +20,7 @@
 //! little-endian even though they travel big-endian.
 
 use std::future::Future;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use aes_gcm::{
     Aes128Gcm, Nonce,
@@ -992,110 +992,6 @@ pub fn business_key(
     Some((key, iv, aad))
 }
 
-pub fn read_clipboard_text() -> Option<String> {
-    crate::platform::clipboard::read_text()
-}
-
-pub fn write_clipboard_text(text: &str) -> bool {
-    if !crate::platform::clipboard::write_text(text) {
-        warn!("platform clipboard write failed ({}B)", text.len());
-        return false;
-    }
-    true
-}
-
-/// Bound clipboard reads and keep at most one blocking backend call in flight.
-/// A timed-out spawn_blocking task continues running, so its permit must remain
-/// owned by the worker until the backend actually returns.
-pub async fn read_clipboard_text_async() -> Option<String> {
-    static READ_GATE: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
-        std::sync::OnceLock::new();
-    static READ_TIMEOUT_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let timeout_ms =
-        *READ_TIMEOUT_MS.get_or_init(|| match std::env::var("OPLUS_CLIPBOARD_READ_TIMEOUT_MS") {
-            Ok(value) => match value.parse::<u64>() {
-                Ok(ms) if (100..=30_000).contains(&ms) => ms,
-                _ => {
-                    warn!("invalid OPLUS_CLIPBOARD_READ_TIMEOUT_MS; expected 100–30000, using 500");
-                    500
-                }
-            },
-            Err(std::env::VarError::NotPresent) => 500,
-            Err(_) => {
-                warn!("invalid OPLUS_CLIPBOARD_READ_TIMEOUT_MS; expected UTF-8, using 500");
-                500
-            }
-        });
-    let gate = READ_GATE.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)));
-    read_clipboard_with_gate(
-        gate.clone(),
-        std::time::Duration::from_millis(timeout_ms),
-        read_clipboard_text,
-    )
-    .await
-}
-
-async fn read_clipboard_with_gate<F>(
-    gate: std::sync::Arc<tokio::sync::Semaphore>,
-    timeout: std::time::Duration,
-    read: F,
-) -> Option<String>
-where
-    F: FnOnce() -> Option<String> + Send + 'static,
-{
-    let permit = match gate.try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            clipboard_read_warning("previous backend read is still running");
-            return None;
-        }
-    };
-    let task = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        read()
-    });
-    match tokio::time::timeout(timeout, task).await {
-        Ok(Ok(text)) => text,
-        Ok(Err(error)) => {
-            clipboard_read_warning(&format!("backend read task failed: {error}"));
-            None
-        }
-        Err(_) => {
-            clipboard_read_warning(
-                "backend read timed out; waiting for the existing worker to finish",
-            );
-            None
-        }
-    }
-}
-
-// A blocked backend can keep the single-flight permit indefinitely; do not
-// start replacement workers (spawn_blocking cannot cancel a running call).
-// Emit a bounded warning without logging clipboard contents.
-fn clipboard_read_warning(reason: &str) {
-    static LAST_WARNING: AtomicU64 = AtomicU64::new(0);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let previous = LAST_WARNING.load(Ordering::Relaxed);
-    if now.saturating_sub(previous) >= 30
-        && LAST_WARNING
-            .compare_exchange(previous, now, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-    {
-        warn!("clipboard read unavailable: {reason}");
-    }
-}
-
-/// Writes the platform clipboard without blocking the protocol runtime thread.
-pub async fn write_clipboard_text_async(text: &str) -> bool {
-    let text = text.to_owned();
-    tokio::task::spawn_blocking(move || write_clipboard_text(&text))
-        .await
-        .unwrap_or(false)
-}
-
 /// `clipboard_data` payload (the inner `value` string).
 ///
 /// Field set matches the observed Windows capture: every media
@@ -2029,18 +1925,23 @@ fn take_frame(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
 
 enum ClipboardPollResult {
     Tick,
+    Clipboard(Option<Arc<String>>),
     Read(std::io::Result<usize>),
 }
 
-// Both branches are cancellation-safe. Keep the interval outside this future:
-// replacing it after each read would starve polling during steady traffic.
+// Keep the interval and read request outside the select so socket traffic
+// neither resets the polling deadline nor discards a pending clipboard result.
 async fn read_or_clipboard_tick<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
     tick: &mut tokio::time::Interval,
+    pending: &mut Option<crate::platform::clipboard::PendingRead>,
     buf: &mut [u8],
 ) -> ClipboardPollResult {
     tokio::select! {
         _ = tick.tick() => ClipboardPollResult::Tick,
+        text = async { pending.as_mut().unwrap().finish().await }, if pending.is_some() => {
+            ClipboardPollResult::Clipboard(text)
+        }
         result = reader.read(buf) => ClipboardPollResult::Read(result),
     }
 }
@@ -2207,8 +2108,11 @@ async fn run_session<F, Fut>(
     let mut client_fc = 0u64;
     let mut server_rc2 = [0u8; 8];
 
-    // Remember the clipboard we last pushed so idle ticks only send changes.
-    let mut last_clipboard = read_clipboard_text_async().await.unwrap_or_default();
+    // Take a baseline without delaying the handshake.
+    let mut last_clipboard = None;
+    let mut pending_clipboard = crate::platform::clipboard::request_read();
+    let mut clipboard_baseline = pending_clipboard.is_some();
+    let mut clipboard_snapshot = false;
     // Mirrors the official renderer: clipboard data is only sent once the phone
     // has activated the channel (`clipboard_state_active` state=1) or reported
     // `switchStatus.Notice_ClipBoard == 1`.
@@ -2739,7 +2643,7 @@ async fn run_session<F, Fut>(
                     None => std::future::pending().await,
                 }
             }, if local_session_confirmed && link_info_sent => continue,
-            result = read_or_clipboard_tick(&mut sock, &mut clipboard_tick, &mut chunk) => result,
+            result = read_or_clipboard_tick(&mut sock, &mut clipboard_tick, &mut pending_clipboard, &mut chunk) => result,
         } {
             ClipboardPollResult::Tick => {
                 if let Some(peer_id) = peer_device_id {
@@ -2800,20 +2704,39 @@ async fn run_session<F, Fut>(
                         }
                     }
                 }
+                if clipboard_enabled && local_session_confirmed && pending_clipboard.is_none() {
+                    pending_clipboard = crate::platform::clipboard::request_read();
+                }
+                continue;
+            }
+            ClipboardPollResult::Clipboard(text) => {
+                pending_clipboard = None;
+                let baseline = std::mem::take(&mut clipboard_baseline);
+                if baseline {
+                    if text.is_some() {
+                        last_clipboard = text;
+                    }
+                    if clipboard_snapshot {
+                        pending_clipboard = crate::platform::clipboard::request_read();
+                    }
+                    continue;
+                }
                 if clipboard_enabled
                     && local_session_confirmed
-                    && let (Some(peer_id), Some(text)) =
-                        (peer_device_id, read_clipboard_text_async().await)
-                    && text != last_clipboard
-                    && !text.is_empty()
+                    && let (Some(peer_id), Some(text)) = (peer_device_id, text)
+                    && (clipboard_snapshot
+                        || (last_clipboard.as_ref() != Some(&text) && !text.is_empty()))
                 {
-                    let session_id = std::env::var("OPLUS_CLIPBOARD_SESSION")
-                        .ok()
-                        .and_then(|value| {
-                            let value = value.trim();
-                            u16::from_str_radix(value.trim_start_matches("0x"), 16).ok()
-                        })
-                        .unwrap_or(local_session);
+                    let session_id = if std::mem::take(&mut clipboard_snapshot) {
+                        local_session
+                    } else {
+                        std::env::var("OPLUS_CLIPBOARD_SESSION")
+                            .ok()
+                            .and_then(|value| {
+                                u16::from_str_radix(value.trim().trim_start_matches("0x"), 16).ok()
+                            })
+                            .unwrap_or(local_session)
+                    };
                     // Clipboard/notification data use the unite session;
                     // the separate oshare session is for file/share APIs.
                     if let Some(frame) =
@@ -2829,7 +2752,7 @@ async fn run_session<F, Fut>(
                             session_id,
                             text.len()
                         );
-                        last_clipboard = text;
+                        last_clipboard = Some(text);
                     }
                 }
                 continue;
@@ -3283,8 +3206,22 @@ async fn run_session<F, Fut>(
                                                 });
                                                 broadcaster(&clip_evt.to_string());
                                             }
-                                            if write_clipboard_text_async(&text).await {
-                                                last_clipboard = text;
+                                            // Do not send a read requested before this remote write.
+                                            pending_clipboard = None;
+                                            clipboard_baseline = false;
+                                            clipboard_snapshot = false;
+                                            let text = Arc::new(text);
+                                            if crate::platform::clipboard::write_text_async(
+                                                Arc::clone(&text),
+                                            )
+                                            .await
+                                            {
+                                                last_clipboard = Some(text);
+                                            } else {
+                                                warn!(
+                                                    "panta[{}]: platform clipboard write failed",
+                                                    peer
+                                                );
                                             }
                                         }
                                         if (key == "switchStatus"
@@ -3292,6 +3229,11 @@ async fn run_session<F, Fut>(
                                             && let Some(enabled) = clipboard_enabled_from(&plain)
                                         {
                                             clipboard_enabled = enabled;
+                                            if !enabled {
+                                                pending_clipboard = None;
+                                                clipboard_baseline = false;
+                                                clipboard_snapshot = false;
+                                            }
                                             info!(
                                                 "panta[{}]: clipboard channel {}",
                                                 peer,
@@ -3301,30 +3243,12 @@ async fn run_session<F, Fut>(
                                         if key == "clipboard_state_active"
                                             && clipboard_enabled
                                             && local_session_confirmed
-                                            && let (Some(peer_id), Some(text)) =
-                                                (peer_device_id, read_clipboard_text_async().await)
-                                            && let Some(frame) = clipboard_data_frame(
-                                                clipboard_enabled,
-                                                local_session,
-                                                our_id,
-                                                peer_id,
-                                                &text,
-                                            )
                                         {
-                                            if let Err(error) = write_frame(&mut sock, &frame).await
-                                            {
-                                                warn!(
-                                                    "panta[{}]: cannot send clipboard: {}",
-                                                    peer, error
-                                                );
-                                                return;
+                                            clipboard_snapshot = true;
+                                            if pending_clipboard.is_none() {
+                                                pending_clipboard =
+                                                    crate::platform::clipboard::request_read();
                                             }
-                                            info!(
-                                                "panta[{}]: sent platform clipboard ({}B)",
-                                                peer,
-                                                text.len()
-                                            );
-                                            last_clipboard = text;
                                         }
                                         if key == "QueryPcVersion"
                                             && let Some(peer_id) = peer_device_id
@@ -4696,61 +4620,20 @@ mod tests {
         let mut timer = tokio::time::interval(std::time::Duration::from_millis(30));
         timer.tick().await;
         let mut buf = [0; 32];
+        let mut pending = None;
         tokio::time::timeout(std::time::Duration::from_millis(200), async {
             loop {
-                match read_or_clipboard_tick(&mut reader, &mut timer, &mut buf).await {
+                match read_or_clipboard_tick(&mut reader, &mut timer, &mut pending, &mut buf).await
+                {
                     ClipboardPollResult::Tick => break,
                     ClipboardPollResult::Read(result) => assert!(result.unwrap() > 0),
+                    ClipboardPollResult::Clipboard(_) => unreachable!(),
                 }
             }
         })
         .await
         .expect("timer must fire despite incoming traffic");
         traffic.abort();
-    }
-
-    #[tokio::test]
-    async fn timed_out_clipboard_read_remains_single_flight_and_recovers() {
-        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let result = read_clipboard_with_gate(
-            gate.clone(),
-            std::time::Duration::from_millis(25),
-            move || {
-                release_rx.recv().unwrap();
-                Some("old".to_owned())
-            },
-        )
-        .await;
-        assert_eq!(result, None);
-        assert_eq!(gate.available_permits(), 0);
-        let attempted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = attempted.clone();
-        assert_eq!(
-            read_clipboard_with_gate(gate.clone(), std::time::Duration::from_secs(1), move || {
-                flag.store(true, Ordering::SeqCst);
-                Some("unexpected".to_owned())
-            })
-            .await,
-            None
-        );
-        assert!(!attempted.load(Ordering::SeqCst));
-        release_tx.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while gate.available_permits() == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("worker should release its permit");
-        assert_eq!(
-            read_clipboard_with_gate(gate, std::time::Duration::from_secs(1), || Some(
-                "new".to_owned()
-            ))
-            .await
-            .as_deref(),
-            Some("new")
-        );
     }
 
     #[test]

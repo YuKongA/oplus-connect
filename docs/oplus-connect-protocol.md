@@ -783,7 +783,7 @@ Oplus_HeySynergy_PcConnect_SyncNotification_Subscriber
 
 `pcAbility` 的 `Notice_ClipBoard` 和 `Notice_CrossDevice` 默认为观察到的 0。可分别设置 `OPLUS_PC_NOTICE_CLIPBOARD=1` 和 `OPLUS_PC_NOTICE_CROSS_DEVICE=1` 回退各自的旧值，或逐项做 A/B 对照；仅接受 `0` 和 `1`（允许首尾空白）。单独的 `Notice_CrossDevice` topic 消息仍发送 `1`，它与 pcAbility 中同名字段的关系尚未由现有抓包证实，覆盖 pcAbility 标志不会改变该消息。`OPLUS_PC_CAST_UNLOCK_MODE=auto` 可将 pcAbility 和独立 topic 的解锁模式都设为旧模式（默认 `every`，只接受这两个值）。这些配置在进程首次使用时读取并缓存，修改后须重启；非法值告警并回退默认值。非默认组合生效时会打印一条 `capability overrides active` 提示，便于确认实际使用的协商值。它们影响共享的设备能力协商，应检查通知、投屏解锁及其他设备功能，不代表有已验证的替代配置。
 
-剪贴板读取超时默认为 500ms，可通过 `OPLUS_CLIPBOARD_READ_TIMEOUT_MS` 设置 100–30000ms；配置在进程首次读取时缓存，非法值告警并回退默认值。读取等待期间当前会话循环仍会暂停，超时不保证是总处理延迟的严格上界。阻塞的后台读取不可取消；超时后保留单个 worker 的许可，直到后端返回，期间限频告警并跳过后续读取，以防后台任务无限积累。若后端永久阻塞，剪贴板读取需等待后端恢复或重启进程；此保护不提供强制恢复。
+`OPLUS_CLIPBOARD_READ_TIMEOUT_MS` 控制慢速读取的告警阈值（100–30000 ms，默认 500），不是取消期限。协议会话和前端轮询共享一次在途读取；读取期间协议仍处理网络消息，超出阈值也会接收最终结果。平台读写在线程中运行，不阻塞 Tokio 关闭。若平台后端永久卡住，剪贴板功能仍需等待后端恢复或重启进程；不会累积读取任务。
 
 ### 8.1 官方成功路径
 
