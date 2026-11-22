@@ -1023,7 +1023,10 @@ async fn handle_client(
             }
             match serde_json::from_str::<ClipSetReq>(body) {
                 Ok(req) => {
-                    let ok = crate::platform::clipboard::write_text(&req.content);
+                    let ok = crate::platform::clipboard::write_text_async(std::sync::Arc::new(
+                        req.content,
+                    ))
+                    .await;
                     if ok {
                         let response = ApiResponse::ok();
                         (200, serde_json::to_string(&response).unwrap())

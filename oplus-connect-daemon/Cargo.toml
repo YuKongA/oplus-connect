@@ -36,6 +36,9 @@ x25519-dalek = "3"
 base64 = "0.23"
 tempfile = "3"
 
+[dev-dependencies]
+tokio = { version = "1.40", features = ["test-util"] }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 notify-rust = "4"
