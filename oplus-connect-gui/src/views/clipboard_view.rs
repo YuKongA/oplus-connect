@@ -13,10 +13,10 @@ pub struct ClipboardView;
 impl ClipboardView {
     pub fn render(
         state: &AppState,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<crate::RootView>,
     ) -> impl IntoElement {
-        let filtered = state.filtered_clipboard_records();
+        let rows = state.clipboard_list_state(window.rem_size());
         let total_count = state.clipboard_history.len();
         let has_clearable_records = state
             .clipboard_history
@@ -81,32 +81,36 @@ impl ClipboardView {
                     .underline()
                     .selected_index(Self::filter_index(state.clipboard_filter))
                     .on_click(cx.listener(|this, index, _, cx| {
-                        this.state.clipboard_filter = Self::filter_from_index(*index);
-                        cx.notify();
+                        let filter = Self::filter_from_index(*index);
+                        if this.state.clipboard_filter != filter {
+                            this.state.clipboard_filter = filter;
+                            cx.notify();
+                        }
                     }))
                     .child(Tab::new().label("全部"))
                     .child(Tab::new().label("收藏"))
                     .child(Tab::new().label("电脑端"))
                     .child(Tab::new().label("移动端")),
             )
-            .child(
-                div()
-                    .id("clipboard-scroll-list")
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
-                    .gap(px(10.0))
-                    .pr(px(6.0))
-                    .children(if filtered.is_empty() {
-                        vec![Self::render_empty_state().into_any_element()]
-                    } else {
-                        filtered
-                            .into_iter()
-                            .map(|record| Self::render_card(record, state, cx).into_any_element())
-                            .collect()
+            .child(if rows.item_count() == 0 {
+                Self::render_empty_state().into_any_element()
+            } else {
+                list(
+                    rows,
+                    cx.processor(|this, index, _, cx| {
+                        let row = this.state.clipboard_row(index);
+                        div()
+                            .w_full()
+                            .pb(px(10.0))
+                            .child(Self::render_card(row, &this.state, cx))
+                            .into_any_element()
                     }),
-            )
+                )
+                .flex_1()
+                .min_h_0()
+                .pr(px(6.0))
+                .into_any_element()
+            })
     }
 
     fn confirm_clear(window: &mut Window, cx: &mut Context<crate::RootView>) {
@@ -158,23 +162,21 @@ impl ClipboardView {
         let id_for_fav = record.id.clone();
         let id_for_del = record.id.clone();
         let id_for_copy = record.id.clone();
-        let content_for_copy = record.content.clone();
-        let is_recently_copied = state.last_copied_id.as_deref() == Some(&record.id);
+        let is_recently_copied = state.last_copied_id.as_ref() == Some(&record.id);
 
         let (source_label, source_color, source_bg) = match &record.source {
-            ClipboardSource::Local => ("本机电脑", Theme::brand_blue(), Theme::brand_blue_subtle()),
+            ClipboardSource::Local => (
+                SharedString::new_static("本机电脑"),
+                Theme::brand_blue(),
+                Theme::brand_blue_subtle(),
+            ),
             ClipboardSource::Remote(dev) => {
-                (dev.as_str(), Theme::primary(), Theme::primary_subtle())
+                (dev.clone(), Theme::primary(), Theme::primary_subtle())
             }
         };
 
-        let card_id: SharedString = format!("clip-card-{}", record.id).into();
-        let copy_btn_id: SharedString = format!("clip-copy-{}", record.id).into();
-        let fav_btn_id: SharedString = format!("clip-fav-{}", record.id).into();
-        let del_btn_id: SharedString = format!("clip-del-{}", record.id).into();
-
         div()
-            .id(card_id)
+            .id(record.id.clone())
             .p(px(12.0))
             .rounded_lg()
             .flex_shrink_0()
@@ -212,7 +214,7 @@ impl ClipboardView {
                                     .text_xs()
                                     .font_weight(FontWeight::MEDIUM)
                                     .text_color(source_color)
-                                    .child(source_label.to_string()),
+                                    .child(source_label),
                             )
                             .child(
                                 div()
@@ -226,7 +228,7 @@ impl ClipboardView {
                                     .flex_shrink_0()
                                     .text_xs()
                                     .text_color(Theme::text_muted())
-                                    .child(format!("{} 字符", record.content.chars().count())),
+                                    .child(format!("{} 字符", record.char_count)),
                             ),
                     )
                     .child(
@@ -236,7 +238,7 @@ impl ClipboardView {
                             .flex_shrink_0()
                             .gap(px(6.0))
                             .child(
-                                Button::new(copy_btn_id)
+                                Button::new("copy")
                                     .ghost()
                                     .compact()
                                     .size(px(28.0))
@@ -253,8 +255,16 @@ impl ClipboardView {
                                     )
                                     .accessibility_label("复制剪贴板内容")
                                     .on_click(cx.listener(move |this, _, _, cx| {
+                                        let Some(row) = this
+                                            .state
+                                            .clipboard_history
+                                            .iter()
+                                            .find(|r| r.id == id_for_copy)
+                                        else {
+                                            return;
+                                        };
                                         cx.write_to_clipboard(ClipboardItem::new_string(
-                                            content_for_copy.clone(),
+                                            row.content.to_string(),
                                         ));
                                         this.state.last_copied_id = Some(id_for_copy.clone());
                                         this.state.set_toast("已复制");
@@ -262,7 +272,7 @@ impl ClipboardView {
                                     })),
                             )
                             .child(
-                                Button::new(fav_btn_id)
+                                Button::new("favorite")
                                     .ghost()
                                     .compact()
                                     .selected(is_favorite)
@@ -300,7 +310,7 @@ impl ClipboardView {
                                     })),
                             )
                             .child(
-                                Button::new(del_btn_id)
+                                Button::new("delete")
                                     .ghost()
                                     .compact()
                                     .size(px(28.0))

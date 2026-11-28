@@ -2,7 +2,7 @@
 //! handed to the GPUI cast window, which sizes itself from the phone's own
 //! resolution.
 use crate::cast_media::{
-    MediaEvent, MediaReceiver, ReceiverConfig, SignalingMessage, VideoFrame, probe_config,
+    FrameSender, MediaEvent, MediaReceiver, ReceiverConfig, SignalingMessage, probe_config,
     spawn_receiver,
 };
 use crate::client::CastRequestRejected;
@@ -87,7 +87,7 @@ impl Drop for CastSessionHandle {
 pub fn start(
     device_id: String,
     events: mpsc::Sender<CastEvent>,
-    frames: mpsc::Sender<VideoFrame>,
+    frames: FrameSender,
 ) -> (CastSessionHandle, InputSender) {
     let (cancel, cancel_rx) = watch::channel(false);
     let (done_tx, done) = watch::channel(false);
@@ -129,7 +129,7 @@ async fn cancelled(cancel: &mut watch::Receiver<bool>) {
 async fn run_session(
     device_id: &str,
     events: &mpsc::Sender<CastEvent>,
-    frames: &mpsc::Sender<VideoFrame>,
+    frames: &FrameSender,
     inputs: mpsc::Receiver<Vec<u8>>,
     config: ReceiverConfig,
     mut cancel: watch::Receiver<bool>,
@@ -188,7 +188,6 @@ struct Peer {
 
 enum PeerEvent {
     Displaying(u64, u32, u32),
-    Frame(u64, VideoFrame),
     InputReady(u64, bool),
     Ended(u64, Result<()>),
 }
@@ -201,7 +200,7 @@ async fn stop_peer(peer: Peer) {
 async fn pump_session(
     device_id: &str,
     events: &mpsc::Sender<CastEvent>,
-    frames: &mpsc::Sender<VideoFrame>,
+    frames: &FrameSender,
     mut inputs: mpsc::Receiver<Vec<u8>>,
     config: ReceiverConfig,
     client: &DaemonClient,
@@ -210,7 +209,6 @@ async fn pump_session(
     let (peer_tx, mut peer_rx) = mpsc::channel(16);
     let mut peers: HashMap<u64, Peer> = HashMap::new();
     let mut input_peer = None;
-    let mut video_peer = None;
     let startup_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut has_frame = false;
     let mut poll = tokio::time::interval(Duration::from_millis(250));
@@ -220,11 +218,12 @@ async fn pump_session(
         tokio::select! {
             _ = cancelled(cancel) => break Ok(()),
             _ = tokio::time::sleep_until(startup_deadline), if !has_frame => {
+                if frames.video_peer().is_some() { has_frame = true; continue; }
                 break Err(anyhow!("等待手机连接或画面超时，请在手机确认投屏授权后重试"));
             },
             input = inputs.recv() => {
                 let Some(input) = input else { break Ok(()); };
-                let target = input_peer.or_else(|| video_peer.filter(|id|
+                let target = input_peer.or_else(|| frames.video_peer().filter(|id|
                     peers.get(id).is_some_and(|peer| peer.input_ready)));
                 if let Some(id) = target {
                     let Some(peer) = peers.get(&id).filter(|peer| peer.input_ready) else {
@@ -247,13 +246,6 @@ async fn pump_session(
                             break Err(anyhow!("键鼠反控通道已关闭"));
                         }
                     }
-                    Some(PeerEvent::Frame(id, frame)) if peers.contains_key(&id) => {
-                        has_frame = true;
-                        // A bounded mailbox drops new frames when repaint falls
-                        // behind instead of accumulating latency.
-                        let displayed = *video_peer.get_or_insert(id);
-                        if displayed == id { let _ = frames.try_send(frame); }
-                    }
                     Some(PeerEvent::Ended(id, result)) if peers.contains_key(&id) => {
                         // A token can disappear between status and receive. In
                         // that case discard its worker, never replay on a new ID.
@@ -265,8 +257,8 @@ async fn pump_session(
                             if let Ok(status) = status
                                 && status.status.as_ref().is_some_and(|s| !s.connection_ids.contains(&id)) {
                                     if input_peer == Some(id) { break result; }
-                                    if video_peer == Some(id) { video_peer = None; }
                                     if let Some(peer) = peers.remove(&id) { stop_peer(peer).await; }
+                                    frames.remove_peer(id);
                                     continue;
                                 }
                         }
@@ -287,8 +279,10 @@ async fn pump_session(
                 if input_peer.is_some_and(|id| stale.contains(&id)) {
                     break Err(anyhow!("键鼠反控连接已关闭"));
                 }
-                for id in stale { if let Some(peer) = peers.remove(&id) { stop_peer(peer).await; } }
-                if video_peer.is_some_and(|id| !peers.contains_key(&id)) { video_peer = None; }
+                for id in stale {
+                    if let Some(peer) = peers.remove(&id) { stop_peer(peer).await; }
+                    frames.remove_peer(id);
+                }
                 for id in status.connection_ids {
                     if id == 0 || peers.contains_key(&id) { continue; }
                     let (peer_cancel, peer_cancel_rx) = watch::channel(false);
@@ -296,10 +290,11 @@ async fn pump_session(
                     let device_id = device_id.to_owned();
                     let (peer_input_tx, peer_inputs) = mpsc::channel(INPUT_CAPACITY);
                     let peer_config = config.clone();
+                    let peer_frames = frames.clone();
                     let task = tokio::spawn(async move {
                         let mut terminal_cancel = peer_cancel_rx.clone();
                         let result =
-                            run_peer(&device_id, id, &peer_events, peer_inputs, peer_config, peer_cancel_rx)
+                            run_peer(&device_id, id, &peer_events, peer_inputs, peer_config, peer_frames, peer_cancel_rx)
                                 .await;
                         tokio::select! {
                             _ = cancelled(&mut terminal_cancel) => {},
@@ -310,6 +305,8 @@ async fn pump_session(
                 }
             }
         }
+        let video_peer = frames.video_peer();
+        has_frame |= video_peer.is_some();
         let event = if let Some((width, height)) = video_peer
             .and_then(|id| peers.get(&id))
             .and_then(|peer| peer.dimensions)
@@ -345,10 +342,12 @@ async fn run_peer(
     events: &mpsc::Sender<PeerEvent>,
     inputs: mpsc::Receiver<Vec<u8>>,
     config: ReceiverConfig,
+    frames: FrameSender,
     mut cancel: watch::Receiver<bool>,
 ) -> Result<()> {
     let h265 = config.h265_enabled;
-    let mut receiver = tokio::task::spawn_blocking(move || spawn_receiver(config)).await??;
+    let mut receiver =
+        tokio::task::spawn_blocking(move || spawn_receiver(config, id, frames)).await??;
     let result = tokio::select! {
         biased;
         _ = cancelled(&mut cancel) => Ok(()),
@@ -417,9 +416,6 @@ async fn pump_peer(
             last_received = status.frames_received;
             last_decoded = status.frames_decoded;
             last_presented = status.frames_presented;
-        }
-        if let Some(frame) = receiver.take_frame() {
-            let _ = events.try_send(PeerEvent::Frame(id, frame));
         }
         if status.frames_decoded > 0 && status.width > 0 && status.height > 0 {
             let dimensions = (status.width, status.height);

@@ -114,6 +114,9 @@ fn packed_bgra(plane: &[u8], stride: i32, width: u32, height: u32) -> Result<Vec
     if plane.len() < required {
         bail!("BGRA plane is smaller than its negotiated layout");
     }
+    if stride == row_bytes {
+        return Ok(plane[..required].to_vec());
+    }
     let mut data = Vec::with_capacity(
         row_bytes
             .checked_mul(height)
@@ -133,6 +136,81 @@ pub struct VideoFrame {
     pub data: Vec<u8>,
 }
 
+// All video peers in one session share one UI mailbox. The first peer to
+// publish owns it until that peer is stopped and joined by the session.
+#[derive(Default)]
+struct FrameSlot {
+    peer: Option<u64>,
+    pending: Option<VideoFrame>,
+}
+
+#[derive(Clone)]
+pub struct FrameSender {
+    slot: Arc<Mutex<FrameSlot>>,
+    wake: mpsc::Sender<()>,
+}
+
+#[derive(Clone)]
+struct PeerFrames {
+    id: u64,
+    sender: FrameSender,
+}
+
+pub struct FrameReceiver {
+    slot: Arc<Mutex<FrameSlot>>,
+    wake: mpsc::Receiver<()>,
+}
+
+pub fn frame_channel() -> (FrameSender, FrameReceiver) {
+    let slot = Arc::new(Mutex::new(FrameSlot::default()));
+    let (tx, rx) = mpsc::channel(1);
+    (
+        FrameSender {
+            slot: slot.clone(),
+            wake: tx,
+        },
+        FrameReceiver { slot, wake: rx },
+    )
+}
+
+impl FrameSender {
+    fn publish(&self, peer: u64, frame: VideoFrame) {
+        let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        if *slot.peer.get_or_insert(peer) == peer && slot.pending.replace(frame).is_none() {
+            // A full channel already has the required wake (e.g. on peer switch).
+            let _ = self.wake.try_send(());
+        }
+    }
+
+    pub fn video_peer(&self) -> Option<u64> {
+        self.slot.lock().unwrap_or_else(|e| e.into_inner()).peer
+    }
+
+    pub fn remove_peer(&self, peer: u64) {
+        let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.peer == Some(peer) {
+            *slot = FrameSlot::default();
+        }
+    }
+}
+
+impl FrameReceiver {
+    pub async fn recv(&mut self) -> Option<VideoFrame> {
+        while self.wake.recv().await.is_some() {
+            if let Some(frame) = self
+                .slot
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pending
+                .take()
+            {
+                return Some(frame);
+            }
+        }
+        None
+    }
+}
+
 #[derive(Default)]
 struct SharedStatus {
     running: AtomicBool,
@@ -140,7 +218,6 @@ struct SharedStatus {
     frames_received: AtomicU64,
     frames_decoded: AtomicU64,
     frames_presented: AtomicU64,
-    latest_frame: Mutex<Option<VideoFrame>>,
     display_width: AtomicU32,
     display_height: AtomicU32,
     input_ready: AtomicBool,
@@ -244,7 +321,11 @@ pub fn probe_config(config: &ReceiverConfig) -> Result<()> {
     Ok(())
 }
 
-pub fn spawn_receiver(config: ReceiverConfig) -> Result<MediaReceiver> {
+pub fn spawn_receiver(
+    config: ReceiverConfig,
+    peer: u64,
+    frames: FrameSender,
+) -> Result<MediaReceiver> {
     probe_config(&config)?;
     if [
         config.incoming_capacity,
@@ -273,6 +354,10 @@ pub fn spawn_receiver(config: ReceiverConfig) -> Result<MediaReceiver> {
                 &worker_stop,
                 &worker_status,
                 &config,
+                PeerFrames {
+                    id: peer,
+                    sender: frames,
+                },
             );
             if let Err(error) = result
                 && !worker_stop.load(Ordering::Acquire)
@@ -326,15 +411,6 @@ impl MediaReceiver {
         message.extend_from_slice(frame);
         permit.send(message);
         Ok(())
-    }
-
-    /// Latest decoded frame, or `None` when the previous one was already taken.
-    pub fn take_frame(&self) -> Option<VideoFrame> {
-        self.status
-            .latest_frame
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take()
     }
 
     /// Join from a background thread, never from a GUI event handler.
@@ -665,6 +741,7 @@ fn attach_video(
     pad: &gst::Pad,
     caps: &gst::Caps,
     status: &Arc<SharedStatus>,
+    frames: PeerFrames,
 ) -> Result<()> {
     if pad.direction() != gst::PadDirection::Src {
         return Ok(());
@@ -774,10 +851,7 @@ fn attach_video(
                     frame_status.fail(format!("mapping decoded video: {error:#}"));
                     gst::FlowError::Error
                 })?;
-                *frame_status
-                    .latest_frame
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner()) = Some(frame);
+                frames.sender.publish(frames.id, frame);
                 frame_status
                     .frames_presented
                     .fetch_add(1, Ordering::Relaxed);
@@ -876,6 +950,7 @@ fn run_pipeline(
     stop: &Arc<AtomicBool>,
     status: &Arc<SharedStatus>,
     config: &ReceiverConfig,
+    frames: PeerFrames,
 ) -> Result<()> {
     let mids: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let ice_pending: Arc<Mutex<VecDeque<SignalingMessage>>> = Arc::new(Mutex::new(VecDeque::new()));
@@ -942,6 +1017,7 @@ fn run_pipeline(
         // Attach on the first CAPS event, when the media type is known.
         let pipeline = weak.clone();
         let status = pad_status.clone();
+        let frames = frames.clone();
         pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |pad, info| {
             let Some(gst::PadProbeData::Event(event)) = info.data.as_ref() else {
                 return gst::PadProbeReturn::Ok;
@@ -960,7 +1036,7 @@ fn run_pipeline(
                 let result = if media == "audio" {
                     attach_audio(&pipeline, pad)
                 } else {
-                    attach_video(&pipeline, pad, &caps, &status)
+                    attach_video(&pipeline, pad, &caps, &status, frames.clone())
                 };
                 if let Err(error) = result {
                     status.fail(format!("{error:#}"));
@@ -1190,6 +1266,61 @@ mod tests {
             (768, 576)
         );
         assert_eq!(display_size(1, 1, square), (2, 2));
+    }
+
+    #[test]
+    fn contiguous_bgra_copies_only_the_negotiated_pixels() {
+        let plane = [1, 2, 3, 4, 5, 6, 7, 8, 99];
+        assert_eq!(packed_bgra(&plane, 4, 1, 2).unwrap(), plane[..8]);
+        assert!(packed_bgra(&plane[..7], 4, 1, 2).is_err());
+        assert!(packed_bgra(&plane, 4, 0, 2).is_err());
+    }
+
+    fn frame(value: u8) -> super::VideoFrame {
+        super::VideoFrame {
+            width: 1,
+            height: 1,
+            data: vec![value; 4],
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_consumer_receives_latest_allocation_and_one_wake_per_burst() {
+        let (tx, mut rx) = super::frame_channel();
+        for value in 0..64 {
+            tx.publish(7, frame(value));
+        }
+        let latest = frame(64);
+        let pixels = latest.data.as_ptr();
+        tx.publish(7, latest);
+        assert_eq!(rx.wake.len(), 1);
+        let received = rx.recv().await.unwrap();
+        assert_eq!(received.data.as_ptr(), pixels);
+        assert_eq!(received.data, [64; 4]);
+        assert!(rx.wake.is_empty());
+        tx.publish(7, frame(65));
+        drop(tx);
+        assert_eq!(rx.recv().await.unwrap().data, [65; 4]);
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn only_selected_peer_publishes_and_pending_wake_survives_switch() {
+        let (tx, mut rx) = super::frame_channel();
+        tx.publish(1, frame(1));
+        tx.publish(2, frame(2));
+        tx.remove_peer(2);
+        assert_eq!(tx.video_peer(), Some(1));
+        assert_eq!(rx.recv().await.unwrap().data, [1; 4]);
+        tx.publish(1, frame(3));
+        tx.remove_peer(1);
+        assert_eq!(tx.video_peer(), None);
+        tx.publish(2, frame(4));
+        assert_eq!(rx.recv().await.unwrap().data, [4; 4]);
+        tx.publish(2, frame(5));
+        tx.remove_peer(2);
+        drop(tx);
+        assert!(rx.recv().await.is_none());
     }
 
     #[test]

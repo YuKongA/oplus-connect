@@ -9,7 +9,6 @@ pub mod window_frame;
 use crate::models::NavTab;
 use crate::state::AppState;
 use crate::theme::Theme;
-use gpui_kit::component::WindowExt;
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::*;
 
@@ -21,10 +20,12 @@ pub type SelectState = gpui_kit::component::select::SelectState<
 /// Widgets the root view owns so the settings page can drive them.
 #[derive(Clone, Copy)]
 pub struct SettingsControls<'a> {
-    pub codec: Option<&'a Entity<SelectState>>,
-    pub kms_direction: Option<&'a Entity<SelectState>>,
-    pub expand_cast_fps: Option<&'a Entity<gpui_kit::component::input::InputState>>,
-    pub expand_cast_bitrate: Option<&'a Entity<gpui_kit::component::input::InputState>>,
+    pub codec: &'a Entity<SelectState>,
+    pub kms_direction: &'a Entity<SelectState>,
+    pub expand_cast_fps: &'a Entity<gpui_kit::component::input::InputState>,
+    pub expand_cast_bitrate: &'a Entity<gpui_kit::component::input::InputState>,
+    pub adaptive: bool,
+    pub validation: [Option<&'static str>; 2],
 }
 
 pub struct MainContainer;
@@ -34,7 +35,7 @@ impl MainContainer {
         state: &AppState,
         kms: &crate::kms_session::KmsViewState,
         expand_cast: &crate::expand_cast_session::ExpandCastViewState,
-        controls: SettingsControls<'_>,
+        controls: Option<SettingsControls<'_>>,
         window: &mut Window,
         cx: &mut Context<crate::RootView>,
     ) -> impl IntoElement {
@@ -49,9 +50,13 @@ impl MainContainer {
                 device_detail_view::DeviceDetailView::render(state, kms, expand_cast, window, cx)
                     .into_any_element()
             }
-            NavTab::Settings => {
-                settings_view::SettingsView::render(state, controls, window, cx).into_any_element()
-            }
+            NavTab::Settings => settings_view::SettingsView::render(
+                state,
+                controls.expect("settings controls"),
+                window,
+                cx,
+            )
+            .into_any_element(),
         };
 
         div()
@@ -85,18 +90,6 @@ impl MainContainer {
                             ),
                         ),
                 ),
-            )
-            .child(
-                canvas(
-                    |_, _, _| (),
-                    |bounds, _, window, cx| {
-                        if window.has_active_dialog(cx) {
-                            window.paint_quad(fill(bounds, Theme::bg_modal_backdrop()));
-                        }
-                    },
-                )
-                .absolute()
-                .inset_0(),
             )
     }
 }

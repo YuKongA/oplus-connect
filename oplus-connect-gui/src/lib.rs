@@ -16,6 +16,7 @@ pub mod kms_settings;
 pub mod models;
 mod output_geometry;
 mod persisted;
+mod settings;
 pub mod state;
 pub mod theme;
 pub mod tray;
@@ -100,37 +101,24 @@ pub fn open_main_window(
 
 pub struct RootView {
     pub state: AppState,
+    approval_modal: views::confirm_modal::ConfirmModal,
     pub kms: kms_session::KmsViewState,
     kms_session: Option<kms_session::KmsSessionHandle>,
     pub expand_cast: expand_cast_session::ExpandCastViewState,
     expand_cast_session: Option<expand_cast_session::ExpandCastSessionHandle>,
     share_started_at: Option<Instant>,
     poll_guard: PollGuard,
+    known_device_writer: persisted::KnownDeviceWriter,
+    _known_devices_quit: Subscription,
     cast_session: Option<cast_session::CastSessionHandle>,
     cast_window: Option<WindowHandle<views::cast_window::CastWindow>>,
     cast_frame_size: (u32, u32),
     cast_input: Option<cast_session::InputSender>,
     // Dropping the subscription would stop observing closes.
     _cast_window_closed: Option<Subscription>,
-    codec_select: Option<
-        Entity<
-            gpui_kit::component::select::SelectState<
-                gpui_kit::component::searchable_list::SearchableVec<&'static str>,
-            >,
-        >,
-    >,
-    _codec_events: Option<Subscription>,
-    kms_direction_select: Option<
-        Entity<
-            gpui_kit::component::select::SelectState<
-                gpui_kit::component::searchable_list::SearchableVec<&'static str>,
-            >,
-        >,
-    >,
-    _kms_direction_events: Option<Subscription>,
-    expand_cast_fps_input: Option<Entity<gpui_kit::component::input::InputState>>,
-    expand_cast_bitrate_input: Option<Entity<gpui_kit::component::input::InputState>>,
-    _expand_cast_input_events: Vec<Subscription>,
+    settings_window: Option<settings::SettingsWindow>,
+    settings_writer: settings::SettingsWriter,
+    _settings_quit: Subscription,
 }
 
 // Poll faster until /status proves the daemon is serving.
@@ -179,63 +167,10 @@ fn current_device_snapshot(
 fn device_missing(devices: &[DeviceInfo], device_id: &str) -> bool {
     !devices
         .iter()
-        .any(|device| device.device_id == device_id && device.is_connected)
+        .any(|device| device.device_id.eq_ignore_ascii_case(device_id) && device.is_connected)
 }
 
 impl RootView {
-    fn save_expand_cast_settings(
-        &mut self,
-        settings: persisted::ExpandCastSettings,
-        cx: &mut Context<Self>,
-    ) {
-        if settings == self.state.expand_cast_settings {
-            self.state.expand_cast_settings_feedback = None;
-        } else {
-            match persisted::save_expand_cast_settings(settings) {
-                Ok(()) => {
-                    self.state.expand_cast_settings = settings;
-                    self.state.expand_cast_settings_feedback = None;
-                }
-                Err(error) => {
-                    self.state.expand_cast_settings_feedback =
-                        Some(format!("保存失败，设置未应用：{error}"));
-                }
-            }
-        }
-        cx.notify();
-    }
-
-    fn update_expand_cast_number(&mut self, value: &str, fps: bool, cx: &mut Context<Self>) {
-        let (min, max, label) = if fps {
-            (persisted::FPS_MIN, persisted::FPS_MAX, "帧率")
-        } else {
-            (persisted::BITRATE_MIN, persisted::BITRATE_MAX, "码率")
-        };
-        let Some(value) = value
-            .parse::<u32>()
-            .ok()
-            .filter(|value| (min..=max).contains(value))
-        else {
-            self.state.expand_cast_settings_feedback =
-                Some(format!("{label}必须为 {min}–{max} 的整数，未保存"));
-            cx.notify();
-            return;
-        };
-        let mut settings = self.state.expand_cast_settings;
-        if fps {
-            settings.fps = value;
-        } else {
-            settings.bitrate_kbps = value;
-        }
-        self.save_expand_cast_settings(settings, cx);
-    }
-
-    fn update_expand_cast_adaptive(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        let mut settings = self.state.expand_cast_settings;
-        settings.adaptive_bitrate = enabled;
-        self.save_expand_cast_settings(settings, cx);
-    }
-
     pub fn new(cx: &mut Context<Self>) -> Self {
         let (tx, mut rx) = mpsc::channel::<AppEvent>(64);
 
@@ -258,7 +193,6 @@ impl RootView {
         }
 
         let mut state = AppState::new();
-        state.known_devices = persisted::load_known_devices();
         let (cast_audio, cast_input, cast_h265) = persisted::load_cast_settings();
         state.cast_audio = cast_audio;
         state.cast_input = cast_input;
@@ -268,27 +202,35 @@ impl RootView {
         cast_settings::set_input(cast_input);
         cast_settings::set_h265(cast_h265);
         kms_settings::set_direction(persisted::load_kms_direction());
+        let settings_writer = settings::SettingsWriter::new(cx);
         state.daemon_starting = true;
         let mut view = Self {
             state,
+            approval_modal: Default::default(),
             kms: kms_session::KmsViewState::default(),
             kms_session: None,
             expand_cast: expand_cast_session::ExpandCastViewState::default(),
             expand_cast_session: None,
             share_started_at: None,
             poll_guard: PollGuard::default(),
+            known_device_writer: persisted::KnownDeviceWriter::new(),
+            _known_devices_quit: cx.on_app_quit(|view, cx| {
+                view.flush_known_devices(cx);
+                view.known_device_writer.finish();
+                async {}
+            }),
             cast_session: None,
             cast_window: None,
             cast_frame_size: (0, 0),
             cast_input: None,
             _cast_window_closed: None,
-            codec_select: None,
-            _codec_events: None,
-            kms_direction_select: None,
-            _kms_direction_events: None,
-            expand_cast_fps_input: None,
-            expand_cast_bitrate_input: None,
-            _expand_cast_input_events: Vec::new(),
+            settings_window: None,
+            settings_writer,
+            _settings_quit: cx.on_app_quit(|view, cx| {
+                view.close_settings_controls(cx);
+                view.settings_writer.finish();
+                async {}
+            }),
         };
         // The cast window carries the app's own close button, so closing it
         // must end the cast instead of leaving a session with no picture.
@@ -299,6 +241,13 @@ impl RootView {
             let weak = weak.clone();
             app.defer(move |app| {
                 let _ = weak.update(app, |view, cx| {
+                    if view
+                        .settings_window
+                        .as_ref()
+                        .is_some_and(|s| s.id == window_id)
+                    {
+                        view.close_settings_controls(cx);
+                    }
                     if view.cast_window.map(|handle| handle.window_id()) == Some(window_id) {
                         view.cast_window = None;
                         view.stop_cast_session();
@@ -308,31 +257,44 @@ impl RootView {
             });
         }));
 
+        let cache = TOKIO_RT.spawn_blocking(persisted::load_known_devices);
         cx.spawn(async move |this, app| {
-            while let Some(event) = rx.recv().await {
-                let _ = this.update_in(app, |view, window, cx| {
-                    let was_pending = view.state.connection_request.is_some();
-                    if view.handle_app_event(event, cx) {
-                        if was_pending && view.state.connection_request.is_none() {
-                            window.close_dialog(cx);
-                        }
-                        if !was_pending && let Some(request) = view.state.connection_request.clone()
-                        {
-                            views::confirm_modal::ConfirmModal::open(request, window, cx);
-                        }
-                        if view.state.known_devices_dirty {
-                            view.state.known_devices_dirty = false;
-                            persisted::save_known_devices(&view.state.known_devices);
-                        }
-                        cx.notify();
+            // Producers subscribe immediately; replay their queued events only
+            // after restoring the offline cache so it cannot overwrite a live peer.
+            match cache.await {
+                Ok(devices) if !devices.is_empty() => {
+                    if this
+                        .update(app, |view, cx| {
+                            view.state.known_devices = devices;
+                            cx.notify();
+                        })
+                        .is_err()
+                    {
+                        return;
                     }
-                });
+                }
+                Ok(_) => {}
+                Err(error) => warn!("Device cache loader failed: {error}"),
+            }
+            while let Some(event) = rx.recv().await {
+                if this
+                    .update(app, |view, cx| {
+                        let changed = view.handle_app_event(event, cx);
+                        view.flush_known_devices(cx);
+                        if changed {
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
             }
         })
         .detach();
 
         Self::start_daemon_poller(tx.clone());
-        Self::start_event_stream_listener(tx.clone());
+        Self::start_event_stream_listener(tx);
 
         view
     }
@@ -556,7 +518,7 @@ impl RootView {
             detail: "检查视频解码与显示环境…".into(),
         };
         let (tx, mut rx) = mpsc::channel(16);
-        let (frame_tx, mut frame_rx) = mpsc::channel(1);
+        let (frame_tx, mut frame_rx) = cast_media::frame_channel();
         let (session, input) = cast_session::start(device_id, tx, frame_tx);
         self.cast_input = Some(input);
         self.cast_session = Some(session);
@@ -603,17 +565,13 @@ impl RootView {
             return;
         }
         let (width, height) = (frame.width, frame.height);
-        // The frame moves into the view; keep it here until a window accepts it.
-        let mut pending = Some(frame);
         let resized = self.cast_frame_size != (width, height);
         if let Some(handle) = self.cast_window {
             let updated = handle.update(cx, |view, window, cx| {
                 if resized {
                     window.resize(self.cast_window_size(width, height));
                 }
-                if let Some(frame) = pending.take() {
-                    view.set_frame(frame, cx);
-                }
+                view.set_frame(frame, window, cx);
             });
             if updated.is_ok() {
                 self.cast_window = Some(handle);
@@ -626,7 +584,6 @@ impl RootView {
             self.stop_cast_session();
             return;
         }
-        let Some(frame) = pending.take() else { return };
         let options = self.cast_window_options(width, height, cx);
         let input = self.cast_input.clone();
         let cast = match cx.open_window(options, |_window, cx| {
@@ -639,7 +596,7 @@ impl RootView {
             }
         };
         if cast
-            .update(cx, |view, _window, cx| view.set_frame(frame, cx))
+            .update(cx, |view, window, cx| view.set_frame(frame, window, cx))
             .is_err()
         {
             return;
@@ -695,7 +652,7 @@ impl RootView {
     pub fn set_cast_audio(&mut self, enabled: bool) {
         self.state.cast_audio = enabled;
         cast_settings::set_audio(enabled);
-        persisted::save_cast_settings(enabled, self.state.cast_input, self.state.cast_h265);
+        self.save_cast_preferences();
     }
 
     pub fn set_cast_input(&mut self, enabled: bool, cx: &mut Context<Self>) {
@@ -704,13 +661,13 @@ impl RootView {
         }
         self.state.cast_input = enabled;
         cast_settings::set_input(enabled);
-        persisted::save_cast_settings(self.state.cast_audio, enabled, self.state.cast_h265);
+        self.save_cast_preferences();
     }
 
     pub fn set_cast_h265(&mut self, enabled: bool) {
         self.state.cast_h265 = enabled;
         cast_settings::set_h265(enabled);
-        persisted::save_cast_settings(self.state.cast_audio, self.state.cast_input, enabled);
+        self.save_cast_preferences();
     }
 
     pub fn stop_cast(&mut self, cx: &mut Context<Self>) {
@@ -735,8 +692,24 @@ impl RootView {
                 let devices_requested_at = Instant::now();
                 let status = client.get_status().await.map_err(|e| e.to_string());
                 let reachable = status.is_ok();
-                let devices = client.get_devices().await.map_err(|e| e.to_string());
-                let remote = client.get_remote_device().await.map_err(|e| e.to_string());
+                let mut devices = client.get_devices().await.map_err(|e| e.to_string());
+                let mut remote = client.get_remote_device().await.map_err(|e| e.to_string());
+                if devices.as_ref().is_ok_and(|list| !list.is_empty())
+                    || matches!(remote, Ok(Some(_)))
+                {
+                    let Ok(local) =
+                        tokio::task::spawn_blocking(state::LocalDeviceInfo::discover).await
+                    else {
+                        warn!("Device identity lookup failed");
+                        continue;
+                    };
+                    if let Ok(list) = &mut devices {
+                        list.retain_mut(|d| local.sanitize_device(d));
+                    }
+                    if let Ok(details) = &mut remote {
+                        local.sanitize_remote(details);
+                    }
+                }
 
                 if tx
                     .send(AppEvent::DaemonPolled {
@@ -761,9 +734,27 @@ impl RootView {
         });
     }
 
+    async fn requested_device(id: &str, device_type: &str) -> Option<DeviceInfo> {
+        let mut peer = DaemonClient::new()
+            .get_devices()
+            .await
+            .ok()?
+            .into_iter()
+            .find(|d| {
+                d.is_connected
+                    && d.device_type == device_type
+                    && d.device_id.eq_ignore_ascii_case(id)
+            })?;
+        let local = tokio::task::spawn_blocking(state::LocalDeviceInfo::discover)
+            .await
+            .ok()?;
+        local.sanitize_device(&mut peer).then_some(peer)
+    }
+
     fn start_event_stream_listener(tx: mpsc::Sender<AppEvent>) {
         TOKIO_RT.spawn(async move {
             let mut warned = false;
+            let mut icons = icons::NotificationIcons::default();
             loop {
                 if tx.is_closed() {
                     return;
@@ -782,7 +773,12 @@ impl RootView {
                         let reader = BufReader::new(stream);
                         let mut lines = reader.lines();
 
-                        while let Ok(Some(line)) = lines.next_line().await {
+                        loop {
+                            let line = tokio::select! {
+                                _ = tx.closed() => return,
+                                line = lines.next_line() => line,
+                            };
+                            let Ok(Some(line)) = line else { break };
                             let trimmed = line.trim();
                             if trimmed.is_empty() {
                                 continue;
@@ -804,15 +800,8 @@ impl RootView {
                                     else {
                                         continue;
                                     };
-                                    let Ok(devices) = DaemonClient::new().get_devices().await
+                                    let Some(device) = Self::requested_device(id, "tablet").await
                                     else {
-                                        continue;
-                                    };
-                                    let Some(device) = devices.into_iter().find(|device| {
-                                        device.device_id.eq_ignore_ascii_case(id)
-                                            && device.is_connected
-                                            && device.device_type == "tablet"
-                                    }) else {
                                         continue;
                                     };
                                     AppEvent::TabletShareRequest {
@@ -829,18 +818,41 @@ impl RootView {
                                     else {
                                         continue;
                                     };
-                                    let Ok(devices) = DaemonClient::new().get_devices().await
+                                    let Some(device) = Self::requested_device(id, "phone").await
                                     else {
                                         continue;
                                     };
-                                    let Some(device) = devices.into_iter().find(|device| {
-                                        device.device_id.eq_ignore_ascii_case(id)
-                                            && device.is_connected
-                                            && device.device_type == "phone"
-                                    }) else {
+                                    AppEvent::PhoneCastRequest { device }
+                                } else if val.get("event").and_then(|event| event.as_str())
+                                    == Some("notification_callback")
+                                {
+                                    let Some(data) = val.get("data") else {
                                         continue;
                                     };
-                                    AppEvent::PhoneCastRequest { device }
+                                    let icon = data["icon"].as_str().and_then(|encoded| {
+                                        let image = icons.decode(encoded);
+                                        if image.is_none() {
+                                            warn!(
+                                                "Invalid notification icon ({} bytes base64)",
+                                                encoded.len()
+                                            );
+                                        }
+                                        image
+                                    });
+                                    // Decode before enqueue, on the ordered background stream:
+                                    // neither source buffers nor late icon jobs reach the UI.
+                                    AppEvent::Notification(NotificationRecord {
+                                        id: uuid::Uuid::new_v4().to_string().into(),
+                                        key: data["key"].as_str().unwrap_or_default().into(),
+                                        label: data["label"].as_str().unwrap_or_default().into(),
+                                        title: data["title"].as_str().unwrap_or_default().into(),
+                                        content: data["content"]
+                                            .as_str()
+                                            .unwrap_or_default()
+                                            .into(),
+                                        icon,
+                                        timestamp: chrono::Local::now(),
+                                    })
                                 } else {
                                     AppEvent::IpcMessage(val)
                                 };
@@ -848,6 +860,10 @@ impl RootView {
                                     return;
                                 }
                             }
+                        }
+                        // Expirations can be lost across a stream outage.
+                        if tx.send(AppEvent::EventStreamDisconnected).await.is_err() {
+                            return;
                         }
                     }
                     Err(err) => {
@@ -857,6 +873,14 @@ impl RootView {
                 tokio::time::sleep(Duration::from_secs(3)).await;
             }
         });
+    }
+
+    fn flush_known_devices(&mut self, _cx: &mut Context<Self>) {
+        if self.state.known_devices_dirty
+            && self.known_device_writer.submit(&self.state.known_devices)
+        {
+            self.state.known_devices_dirty = false;
+        }
     }
 
     pub fn forget_device(&mut self, device_id: String, cx: &mut Context<Self>) {
@@ -876,7 +900,8 @@ impl RootView {
             self.state.connected_device = None;
             self.state.remote_details = None;
         }
-        persisted::save_known_devices(&self.state.known_devices);
+        self.state.known_devices_dirty = true;
+        self.flush_known_devices(cx);
         self.state.set_toast("已删除该设备");
         cx.notify();
     }
@@ -939,66 +964,33 @@ impl RootView {
                     changed = true;
                 }
 
-                if let Some(dev_list) =
-                    current_device_snapshot(devices, devices_requested_at, share_started_at)
-                {
+                let snapshot =
+                    current_device_snapshot(devices, devices_requested_at, share_started_at);
+                let complete = snapshot.is_some();
+                if current_poll {
+                    changed |= self.state.reconcile_devices(snapshot, remote);
+                }
+                // Only a complete list proves absence. The newer remote response
+                // may already have reconnected a peer that was missing from it.
+                if complete {
                     if self.expand_cast.active()
-                        && device_missing(&dev_list, &self.expand_cast.device_id)
+                        && device_missing(&self.state.known_devices, &self.expand_cast.device_id)
                     {
                         self.stop_expand_cast(cx);
                         changed = true;
                     }
-                    if self.kms.active() && device_missing(&dev_list, &self.kms.device_id) {
+                    if self.kms.active()
+                        && device_missing(&self.state.known_devices, &self.kms.device_id)
+                    {
                         self.stop_kms(cx);
                         changed = true;
                     }
                     if self.state.cast.active()
-                        && !dev_list
-                            .iter()
-                            .any(|device| device.device_id == self.state.cast.device_id)
+                        && device_missing(&self.state.known_devices, &self.state.cast.device_id)
                     {
                         self.stop_cast(cx);
                         changed = true;
                     }
-                    self.state.sync_known_devices(&dev_list);
-                    let first = dev_list.into_iter().next();
-                    if self.state.connected_device.as_ref().map(|d| &d.device_id)
-                        != first.as_ref().map(|d| &d.device_id)
-                    {
-                        self.state.connected_device = first;
-                        changed = true;
-                    }
-                }
-
-                match remote {
-                    Ok(Some(rm)) => {
-                        let is_new = self.state.remote_details.as_ref().map(|r| &r.device_id)
-                            != Some(&rm.device_id);
-                        let dev = DeviceInfo {
-                            device_id: rm.device_id.clone(),
-                            device_name: rm.device_name.clone(),
-                            device_model: rm.device_model.clone(),
-                            device_type: rm.device_type.clone(),
-                            brand: rm.brand.clone(),
-                            os_version: rm.os_version.clone(),
-                            battery: rm.battery_level,
-                            is_charging: rm.battery_charging,
-                            connect_type: rm.connect_type.clone(),
-                            ip_address: Some(rm.device_address.clone()),
-                            is_connected: true,
-                            last_seen: chrono::Local::now().timestamp(),
-                        };
-                        let known_changed = self.state.remember_connected_device(&dev);
-                        self.state.connected_device = Some(dev);
-                        self.state.remote_details = Some(rm);
-                        changed |= is_new || known_changed;
-                    }
-                    Ok(None) => {
-                        if self.state.remote_details.take().is_some() {
-                            changed = true;
-                        }
-                    }
-                    Err(_) => {}
                 }
 
                 if self.state.connected_device.is_some() {
@@ -1017,9 +1009,9 @@ impl RootView {
             }
             AppEvent::PhoneCastRequest { device } => {
                 let device_id = device.device_id.clone();
-                self.state.remember_connected_device(&device);
+                let known_changed = self.state.remember_connected_device(device);
                 if self.state.cast.active() && self.state.cast.device_id == device_id {
-                    return false;
+                    return known_changed;
                 }
                 if self.state.cast.active() || self.kms.active() || self.expand_cast.active() {
                     self.state
@@ -1032,7 +1024,7 @@ impl RootView {
             }
             AppEvent::TabletShareRequest { device, mode } => {
                 let device_id = device.device_id.clone();
-                self.state.remember_connected_device(&device);
+                let known_changed = self.state.remember_connected_device(device);
                 let duplicate = if mode == 0 {
                     self.kms.active() && self.kms.device_id == device_id
                 } else {
@@ -1041,7 +1033,7 @@ impl RootView {
                         && self.expand_cast.mode == Some(mode)
                 };
                 if duplicate {
-                    return false;
+                    return known_changed;
                 }
                 if self.kms.active() || self.expand_cast.active() || self.state.cast.active() {
                     self.state
@@ -1060,6 +1052,13 @@ impl RootView {
                     });
                     self.start_expand_cast_with_mode(device_id, Some(mode), cx);
                 }
+                true
+            }
+            AppEvent::Notification(record) => {
+                if let Some(icon) = &record.icon {
+                    icon.attach(cx);
+                }
+                self.state.add_notification_record(record);
                 true
             }
             AppEvent::IpcMessage(val) => {
@@ -1101,8 +1100,7 @@ impl RootView {
                             .to_string(),
                     };
                     info!("Incoming connection approval request: {:?}", req);
-                    self.state.connection_request = Some(req);
-                    return true;
+                    return self.state.receive_approval(req);
                 }
 
                 let event_type = val
@@ -1116,52 +1114,9 @@ impl RootView {
                                 .get("source")
                                 .and_then(|s| s.as_str())
                                 .unwrap_or("remote");
-                            let dev_name = self
+                            return self
                                 .state
-                                .connected_device
-                                .as_ref()
-                                .map(|d| d.device_name.clone())
-                                .unwrap_or_else(|| "移动设备".to_string());
-                            let source = if source_type == "local" {
-                                ClipboardSource::Local
-                            } else {
-                                ClipboardSource::Remote(dev_name)
-                            };
-                            self.state.add_clipboard_record(content.to_string(), source);
-                            return true;
-                        }
-                    }
-                    "notification_callback" => {
-                        if let Some(data) = val.get("data") {
-                            let record = NotificationRecord {
-                                id: uuid::Uuid::new_v4().to_string(),
-                                key: data["key"].as_str().unwrap_or_default().to_string(),
-                                label: data["label"].as_str().unwrap_or_default().to_string(),
-                                title: data["title"].as_str().unwrap_or_default().to_string(),
-                                content: data["content"].as_str().unwrap_or_default().to_string(),
-                                icon: match data["icon"].as_str() {
-                                    Some(encoded) => {
-                                        let icon = crate::icons::decode_notification_icon(encoded);
-                                        if icon.is_none() {
-                                            warn!(
-                                                "Notification icon could not be decoded ({} bytes base64)",
-                                                encoded.len()
-                                            );
-                                        }
-                                        icon
-                                    }
-                                    None => None,
-                                },
-                                icon_base64: data["icon"]
-                                    .as_str()
-                                    .filter(|encoded| {
-                                        encoded.len() <= crate::icons::MAX_ENCODED_ICON_LEN
-                                    })
-                                    .map(|s| s.to_string()),
-                                timestamp: chrono::Local::now(),
-                            };
-                            self.state.add_notification_record(record);
-                            return true;
+                                .add_clipboard_record(content, source_type == "local");
                         }
                     }
                     "notification_deleted" => {
@@ -1185,14 +1140,11 @@ impl RootView {
                         return true;
                     }
                     "connect_request_expired" => {
-                        let expired_id = val["data"]["connection_id"].as_str().unwrap_or_default();
-                        let matches = self
-                            .state
-                            .connection_request
-                            .as_ref()
-                            .is_some_and(|request| request.connection_id == expired_id);
-                        if matches {
-                            self.state.connection_request = None;
+                        let address = val["data"]["device_address"].as_str();
+                        let id = val["data"]["connection_id"].as_str();
+                        if let (Some(address), Some(id)) = (address, id)
+                            && self.state.expire_approval(address, id)
+                        {
                             self.state.set_toast("请求已失效");
                             return true;
                         }
@@ -1254,10 +1206,7 @@ impl RootView {
                     false
                 }
             }
-            AppEvent::ConnectionRequestResolved => {
-                self.state.connection_request = None;
-                true
-            }
+            AppEvent::EventStreamDisconnected => self.state.connection_request.take().is_some(),
             AppEvent::CastChanged { generation, event } => {
                 if generation != self.state.cast.generation || !self.state.cast.active() {
                     return false;
@@ -1317,115 +1266,28 @@ impl Render for RootView {
         if let Some(message) = self.state.toast_message.take() {
             window.push_notification(message, cx);
         }
-        if self.codec_select.is_none() {
-            let items =
-                gpui_kit::component::searchable_list::SearchableVec::new(vec!["H.264", "H.265"]);
-            let selected = gpui_kit::component::IndexPath::new(usize::from(self.state.cast_h265));
-            let state = cx.new(|cx| {
-                gpui_kit::component::select::SelectState::new(items, Some(selected), window, cx)
-            });
-            self._codec_events = Some(cx.subscribe(
-                &state,
-                |view,
-                 _state,
-                 event: &gpui_kit::component::select::SelectEvent<
-                    gpui_kit::component::searchable_list::SearchableVec<&'static str>,
-                >,
-                 cx| {
-                    let gpui_kit::component::select::SelectEvent::Confirm(value) = event;
-                    match value.as_deref() {
-                        Some("H.265") => view.set_cast_h265(true),
-                        Some("H.264") => view.set_cast_h265(false),
-                        _ => return,
-                    }
-                    cx.notify();
-                },
-            ));
-            self.codec_select = Some(state);
-        }
-        if self.kms_direction_select.is_none() {
-            let labels = vec!["向左", "向右"];
-            let index = labels
-                .iter()
-                .position(|label| *label == kms_settings::direction().label())
-                .unwrap_or(0);
-            let state = cx.new(|cx| {
-                gpui_kit::component::select::SelectState::new(
-                    gpui_kit::component::searchable_list::SearchableVec::new(labels),
-                    Some(gpui_kit::component::IndexPath::new(index)),
-                    window,
-                    cx,
-                )
-            });
-            self._kms_direction_events = Some(cx.subscribe(
-                &state,
-                |view,
-                 _,
-                 event: &gpui_kit::component::select::SelectEvent<
-                    gpui_kit::component::searchable_list::SearchableVec<&'static str>,
-                >,
-                 cx| {
-                    let gpui_kit::component::select::SelectEvent::Confirm(value) = event;
-                    let Some(direction) = value
-                        .as_deref()
-                        .and_then(kms_settings::ExitDirection::from_label)
-                    else {
-                        return;
-                    };
-                    match persisted::save_kms_direction(direction) {
-                        Ok(()) => {
-                            kms_settings::set_direction(direction);
-                            view.state.set_toast("共享方向已保存，下次启动键鼠共享生效");
-                        }
-                        Err(error) => view.state.set_toast(format!("保存共享方向失败：{error}")),
-                    }
-                    cx.notify();
-                },
-            ));
-            self.kms_direction_select = Some(state);
-        }
-        if self.expand_cast_fps_input.is_none() {
-            let value = self.state.expand_cast_settings.fps.to_string();
-            let input = cx.new(|cx| {
-                gpui_kit::component::input::InputState::new(window, cx).default_value(value)
-            });
-            self._expand_cast_input_events
-                .push(cx.subscribe(&input, |view, state, event, cx| {
-                    if matches!(event, gpui_kit::component::input::InputEvent::Change) {
-                        let value = state.read(cx).value().to_string();
-                        view.update_expand_cast_number(&value, true, cx);
-                    }
-                }));
-            self.expand_cast_fps_input = Some(input);
-        }
-        if self.expand_cast_bitrate_input.is_none() {
-            let value = self.state.expand_cast_settings.bitrate_kbps.to_string();
-            let input = cx.new(|cx| {
-                gpui_kit::component::input::InputState::new(window, cx).default_value(value)
-            });
-            self._expand_cast_input_events
-                .push(cx.subscribe(&input, |view, state, event, cx| {
-                    if matches!(event, gpui_kit::component::input::InputEvent::Change) {
-                        let value = state.read(cx).value().to_string();
-                        view.update_expand_cast_number(&value, false, cx);
-                    }
-                }));
-            self.expand_cast_bitrate_input = Some(input);
-        }
-        let controls = views::SettingsControls {
-            codec: self.codec_select.as_ref(),
-            kms_direction: self.kms_direction_select.as_ref(),
-            expand_cast_fps: self.expand_cast_fps_input.as_ref(),
-            expand_cast_bitrate: self.expand_cast_bitrate_input.as_ref(),
-        };
-        views::MainContainer::render(
-            &self.state,
-            &self.kms,
-            &self.expand_cast,
-            controls,
-            window,
-            cx,
-        )
+        self.prepare_settings_controls(window, cx);
+        let approval =
+            self.approval_modal
+                .render(self.state.connection_request.as_ref(), window, cx);
+        let controls = self.settings_window.as_ref().map(|s| {
+            s.controls(
+                self.settings_writer
+                    .desired_tablet(self.state.expand_cast_settings)
+                    .adaptive_bitrate,
+            )
+        });
+        div()
+            .size_full()
+            .child(views::MainContainer::render(
+                &self.state,
+                &self.kms,
+                &self.expand_cast,
+                controls,
+                window,
+                cx,
+            ))
+            .children(approval)
     }
 }
 
@@ -1481,7 +1343,7 @@ mod polling_tests {
         let before = start - Duration::from_millis(1);
         let after = start + Duration::from_millis(1);
         let mut state = AppState::new();
-        state.remember_connected_device(&tablet("tablet-1", true));
+        state.remember_connected_device(tablet("tablet-1", true));
 
         // The request began before the share but its empty response arrived later.
         let stale = current_device_snapshot(Ok(vec![]), before, Some(start));
@@ -1494,7 +1356,7 @@ mod polling_tests {
             current_device_snapshot(Ok(vec![tablet("tablet-1", true)]), after, Some(start))
                 .unwrap();
         assert!(!device_missing(&connected, "tablet-1"));
-        state.sync_known_devices(&connected);
+        state.reconcile_devices(Some(connected), Ok(None));
         assert!(state.known_devices[0].is_connected);
 
         // A fresh snapshot is authoritative, including an explicitly offline
@@ -1505,7 +1367,7 @@ mod polling_tests {
         assert!(device_missing(&offline, "tablet-1"));
         let missing = current_device_snapshot(Ok(vec![]), after, Some(start)).unwrap();
         assert!(device_missing(&missing, "tablet-1"));
-        state.sync_known_devices(&missing);
+        state.reconcile_devices(Some(missing.clone()), Ok(None));
         assert!(!state.known_devices[0].is_connected);
 
         // A later share must not accept a snapshot from the preceding one.

@@ -2,8 +2,8 @@ use crate::models::*;
 use crate::state::AppState;
 use crate::theme::Theme;
 use gpui_kit::assets::IconName;
-use gpui_kit::component::Icon;
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::{Disableable, Icon};
 use gpui_kit::*;
 
 pub struct NotificationView;
@@ -11,10 +11,10 @@ pub struct NotificationView;
 impl NotificationView {
     pub fn render(
         state: &AppState,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<crate::RootView>,
     ) -> impl IntoElement {
-        let filtered = state.filtered_notification_records();
+        let rows = state.notification_list_state(window.rem_size());
         let total_count = state.notification_history.len();
 
         div()
@@ -62,30 +62,32 @@ impl NotificationView {
                                     .text_color(Theme::text_secondary()),
                             )
                             .accessibility_label("清空所有通知")
+                            .disabled(total_count == 0)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.state.clear_notifications();
                                 cx.notify();
                             })),
                     ),
             )
-            .child(
-                div()
-                    .id("notification-scroll-list")
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
-                    .gap(px(10.0))
-                    .pr(px(6.0))
-                    .children(if filtered.is_empty() {
-                        vec![Self::render_empty_state().into_any_element()]
-                    } else {
-                        filtered
-                            .into_iter()
-                            .map(|item| Self::render_card(item, cx).into_any_element())
-                            .collect()
+            .child(if rows.item_count() == 0 {
+                Self::render_empty_state().into_any_element()
+            } else {
+                list(
+                    rows,
+                    cx.processor(|this, index, _, cx| {
+                        let row = this.state.notification_row(index);
+                        div()
+                            .w_full()
+                            .pb(px(10.0))
+                            .child(Self::render_card(row, cx))
+                            .into_any_element()
                     }),
-            )
+                )
+                .flex_1()
+                .min_h_0()
+                .pr(px(6.0))
+                .into_any_element()
+            })
     }
 
     fn render_card(
@@ -93,19 +95,15 @@ impl NotificationView {
         cx: &mut Context<crate::RootView>,
     ) -> impl IntoElement {
         let id_for_del = item.id.clone();
-        let content_for_copy = format!("{}\n{}", item.title, item.content);
+        let id_for_copy = item.id.clone();
         let app_label = if item.label.is_empty() {
-            "手机应用"
+            SharedString::new_static("手机应用")
         } else {
-            &item.label
+            item.label.clone()
         };
 
-        let card_id: SharedString = format!("notif-card-{}", item.id).into();
-        let copy_btn_id: SharedString = format!("notif-copy-{}", item.id).into();
-        let del_btn_id: SharedString = format!("notif-del-{}", item.id).into();
-
         div()
-            .id(card_id)
+            .id(item.key.clone())
             .p(px(12.0))
             .rounded_lg()
             .bg(Theme::bg_card())
@@ -130,14 +128,14 @@ impl NotificationView {
                             .items_center()
                             .gap(px(10.0))
                             .min_w_0()
-                            .child(match item.icon.clone() {
-                                Some(icon) => img(icon)
+                            .child(match &item.icon {
+                                Some(icon) => img(icon.image().clone())
                                     .size(px(20.0))
                                     .rounded(px(4.0))
                                     .flex_shrink_0()
                                     .into_any_element(),
                                 None => Icon::new(IconName::Bell)
-                                    .size(px(18.0))
+                                    .size(px(20.0))
                                     .text_color(Theme::text_muted())
                                     .flex_shrink_0()
                                     .into_any_element(),
@@ -149,7 +147,7 @@ impl NotificationView {
                                     .text_sm()
                                     .font_weight(FontWeight::MEDIUM)
                                     .text_color(Theme::text_primary())
-                                    .child(app_label.to_string()),
+                                    .child(app_label),
                             )
                             .child(
                                 div()
@@ -166,7 +164,7 @@ impl NotificationView {
                             .gap(px(6.0))
                             .flex_shrink_0()
                             .child(
-                                Button::new(copy_btn_id)
+                                Button::new("copy")
                                     .ghost()
                                     .compact()
                                     .size(px(28.0))
@@ -179,15 +177,24 @@ impl NotificationView {
                                     )
                                     .accessibility_label("复制通知内容")
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        cx.write_to_clipboard(ClipboardItem::new_string(
-                                            content_for_copy.clone(),
-                                        ));
+                                        let Some(row) = this
+                                            .state
+                                            .notification_history
+                                            .iter()
+                                            .find(|r| r.id == id_for_copy)
+                                        else {
+                                            return;
+                                        };
+                                        cx.write_to_clipboard(ClipboardItem::new_string(format!(
+                                            "{}\n{}",
+                                            row.title, row.content
+                                        )));
                                         this.state.set_toast("已复制");
                                         cx.notify();
                                     })),
                             )
                             .child(
-                                Button::new(del_btn_id)
+                                Button::new("delete")
                                     .ghost()
                                     .compact()
                                     .size(px(28.0))
@@ -217,7 +224,7 @@ impl NotificationView {
                             .font_weight(FontWeight::BOLD)
                             .text_color(Theme::text_primary())
                             .child(if item.title.is_empty() {
-                                "新通知".to_string()
+                                SharedString::new_static("新通知")
                             } else {
                                 item.title.clone()
                             }),

@@ -22,13 +22,14 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.10", features = ["v4"] }
 anyhow = "1.0"
 base64 = "0.23"
+sha2 = "0.10"
 oplus-connect-daemon = { path = "../oplus-connect-daemon" }
 gstreamer = { version = "0.25", features = ["v1_24"] }
 gstreamer-sdp = { version = "0.25", features = ["v1_24"] }
 gstreamer-webrtc = { version = "0.25", features = ["v1_24"] }
 gstreamer-app = { version = "0.25", features = ["v1_24"] }
 gstreamer-video = { version = "0.25", features = ["v1_24"] }
-image = { version = "0.25", default-features = false }
+image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 smallvec = "1"
 ashpd = { version = "0.14", default-features = false, features = [
     "input_capture",

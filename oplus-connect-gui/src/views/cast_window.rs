@@ -6,7 +6,7 @@ use gpui_kit::component::TitleBar as KitTitleBar;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::*;
 use smallvec::SmallVec;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 // Drain each wheel notch gradually to preserve the phone's continuous scrolling.
 #[derive(Default)]
@@ -16,6 +16,40 @@ struct WheelState {
     y: i32,
     width: u32,
     height: u32,
+    task: Option<Task<()>>,
+}
+
+impl WheelState {
+    fn accumulate(&mut self, lines: f32, point: (i32, i32), size: (u32, u32)) {
+        self.budget = (self.budget + lines / 3.0).clamp(-6.0, 6.0);
+        (self.x, self.y) = point;
+        (self.width, self.height) = size;
+    }
+
+    fn has_step(&self) -> bool {
+        self.budget.abs() >= 1.0
+    }
+
+    fn take_step(&mut self) -> Option<Vec<u8>> {
+        if !self.has_step() {
+            return None;
+        }
+        let delta = self.budget.signum();
+        self.budget -= delta;
+        Some(cast_input::scroll(
+            0,
+            delta as i32,
+            self.x,
+            self.y,
+            self.width,
+            self.height,
+        ))
+    }
+
+    fn release(&mut self) {
+        // Dropping the GPUI task cancels its timer before input is released.
+        *self = Self::default();
+    }
 }
 
 // Navigation glyphs as 16-unit SVGs; GPUI paints the data as an alpha mask
@@ -35,49 +69,13 @@ pub struct CastWindow {
     last_pointer: Option<(u8, i32, i32, std::time::Instant)>,
     // Immediate hover cancels the phone's fling.
     release_at: Option<std::time::Instant>,
-    wheel: Arc<Mutex<WheelState>>,
-    wheel_task: Option<Task<()>>,
+    wheel: WheelState,
     keyboard: cast_input::KeyboardState,
     subscriptions: Vec<Subscription>,
 }
 
 impl CastWindow {
     pub fn new(input: Option<InputSender>, cx: &mut Context<Self>) -> Self {
-        let wheel = Arc::new(Mutex::new(WheelState::default()));
-        let wheel_task = input.clone().map(|sender| {
-            let shared = wheel.clone();
-            let executor = cx.background_executor().clone();
-            cx.background_executor().spawn(async move {
-                loop {
-                    executor.timer(std::time::Duration::from_millis(16)).await;
-                    if sender.is_closed() {
-                        break;
-                    }
-                    let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
-                    let delta = if state.budget >= 1.0 {
-                        1
-                    } else if state.budget <= -1.0 {
-                        -1
-                    } else {
-                        continue;
-                    };
-                    state.budget -= delta as f32;
-                    if sender
-                        .send(cast_input::scroll(
-                            0,
-                            delta,
-                            state.x,
-                            state.y,
-                            state.width,
-                            state.height,
-                        ))
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            })
-        });
         Self {
             frame: None,
             size: (720, 1560),
@@ -87,8 +85,7 @@ impl CastWindow {
             pressed: false,
             last_pointer: None,
             release_at: None,
-            wheel,
-            wheel_task,
+            wheel: WheelState::default(),
             keyboard: cast_input::KeyboardState::default(),
             subscriptions: Vec::new(),
         }
@@ -102,7 +99,7 @@ impl CastWindow {
     }
 
     pub fn release_input(&mut self) {
-        self.wheel.lock().unwrap_or_else(|e| e.into_inner()).budget = 0.0;
+        self.wheel.release();
         if self.pressed {
             self.pressed = false;
             if let Some((_, x, y, _)) = self.last_pointer {
@@ -116,6 +113,40 @@ impl CastWindow {
             }
         });
         self.last_pointer = None;
+    }
+
+    fn queue_scroll(&mut self, lines: f32, point: (i32, i32), cx: &mut Context<Self>) {
+        let Some(input) = self.input.as_ref().filter(|input| !input.is_closed()) else {
+            return;
+        };
+        self.wheel.accumulate(lines, point, self.size);
+        if !self.wheel.has_step() {
+            self.wheel.task.take();
+            return;
+        }
+        if self.wheel.task.is_some() {
+            return;
+        }
+        let input = input.clone();
+        let executor = cx.background_executor().clone();
+        self.wheel.task = Some(cx.spawn(async move |this, app| {
+            loop {
+                executor.timer(std::time::Duration::from_millis(16)).await;
+                let draining = this.update(app, |view, _| {
+                    if let Some(packet) = view.wheel.take_step()
+                        && input.send(packet).is_ok()
+                        && view.wheel.has_step()
+                    {
+                        return true;
+                    }
+                    view.wheel.task.take();
+                    false
+                });
+                if !matches!(draining, Ok(true)) {
+                    break;
+                }
+            }
+        }));
     }
 
     fn key_changed(&mut self, event: &Keystroke, pressed: bool) {
@@ -256,22 +287,26 @@ impl CastWindow {
     }
 
     /// Transfer the frame buffer without a second per-frame copy.
-    pub fn set_frame(&mut self, frame: VideoFrame, cx: &mut Context<Self>) {
+    pub fn set_frame(&mut self, frame: VideoFrame, window: &mut Window, cx: &mut Context<Self>) {
         let Some(buffer) = image::ImageBuffer::from_raw(frame.width, frame.height, frame.data)
         else {
             return;
         };
         self.size = (frame.width, frame.height);
-        self.frame = Some(Arc::new(RenderImage::new(SmallVec::from_const([
-            image::Frame::new(buffer),
-        ]))));
+        let image = Arc::new(RenderImage::new(SmallVec::from_const([image::Frame::new(
+            buffer,
+        )])));
+        if let Some(old) = self.frame.replace(image)
+            && let Err(error) = window.drop_image(old)
+        {
+            tracing::warn!(%error, "could not evict previous cast image");
+        }
         cx.notify();
     }
 }
 
 impl Drop for CastWindow {
     fn drop(&mut self) {
-        self.wheel_task.take();
         self.release_input();
     }
 }
@@ -295,11 +330,7 @@ impl Render for CastWindow {
             .items_center()
             .gap(px(8.0))
             .min_w_0()
-            .child(
-                img(crate::assets::asset_path("logo.png"))
-                    .size(px(18.0))
-                    .rounded(px(3.0)),
-            )
+            .child(img("logo.png").size(px(18.0)).rounded(px(3.0)))
             .child(
                 div()
                     .text_sm()
@@ -378,7 +409,7 @@ impl Render for CastWindow {
                             cx.notify();
                         }),
                     )
-                    .on_scroll(cx.listener(|this, event: &ScrollEvent, window, _cx| {
+                    .on_scroll(cx.listener(|this, event: &ScrollEvent, window, cx| {
                         if !this.input_enabled {
                             return;
                         }
@@ -387,16 +418,11 @@ impl Render for CastWindow {
                             ScrollDelta::Lines(lines) => lines.y,
                             ScrollDelta::Pixels(pixels) => f32::from(pixels.y) / 40.0,
                         };
-                        if lines == 0.0 {
+                        if !lines.is_finite() || lines == 0.0 {
                             return;
                         }
-                        let (x, y) = this.phone_point(event.position, window);
-                        let mut state = this.wheel.lock().unwrap_or_else(|e| e.into_inner());
-                        state.budget = (state.budget + lines / 3.0).clamp(-6.0, 6.0);
-                        state.x = x;
-                        state.y = y;
-                        state.width = this.size.0;
-                        state.height = this.size.1;
+                        let point = this.phone_point(event.position, window);
+                        this.queue_scroll(lines, point, cx);
                     }))
                     .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, _cx| {
                         this.key_changed(&event.keystroke, true);
@@ -429,5 +455,58 @@ impl Render for CastWindow {
                     })),
             )
             .child(self.nav_bar(cx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Task, WheelState, cast_input};
+
+    #[test]
+    fn fractional_scroll_waits_for_a_whole_step_and_uses_latest_coordinates() {
+        let mut wheel = WheelState::default();
+        wheel.accumulate(1.5, (0, 0), (20, 30));
+        assert!(wheel.take_step().is_none());
+        wheel.accumulate(3.0, (3, 4), (40, 50));
+        assert_eq!(
+            wheel.take_step(),
+            Some(cast_input::scroll(0, 1, 3, 4, 40, 50))
+        );
+        assert!(!wheel.has_step());
+        assert_eq!(wheel.budget, 0.5);
+        wheel.accumulate(-4.5, (2, 3), (50, 40));
+        assert_eq!(
+            wheel.take_step(),
+            Some(cast_input::scroll(0, -1, 2, 3, 50, 40))
+        );
+        assert_eq!(wheel.budget, 0.0);
+    }
+
+    #[test]
+    fn releasing_wheel_disarms_timer_and_discards_pending_fraction() {
+        let mut wheel = WheelState::default();
+        wheel.accumulate(4.5, (2, 3), (10, 20));
+        wheel.task = Some(Task::ready(()));
+        wheel.release();
+        assert!(wheel.task.is_none());
+        assert!(wheel.take_step().is_none());
+        wheel.accumulate(1.5, (1, 1), (10, 20));
+        assert!(!wheel.has_step());
+    }
+
+    #[test]
+    fn wheel_bursts_clamp_both_directions_and_stop_when_drained() {
+        let mut wheel = WheelState::default();
+        for sign in [-1, 1] {
+            wheel.accumulate(sign as f32 * 120.0, (0, 0), (10, 20));
+            for _ in 0..6 {
+                assert_eq!(
+                    wheel.take_step(),
+                    Some(cast_input::scroll(0, sign, 0, 0, 10, 20))
+                );
+            }
+            assert!(!wheel.has_step());
+            assert!(wheel.take_step().is_none());
+        }
     }
 }

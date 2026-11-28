@@ -68,14 +68,13 @@ impl DeviceDetailView {
         cx: &mut Context<crate::RootView>,
     ) -> impl IntoElement {
         let mut list = div().flex().flex_col().gap(px(16.0));
-        for (index, device) in state.known_devices.iter().enumerate() {
+        for device in &state.known_devices {
             list = list.child(Self::render_device_card(
                 device,
                 state,
                 kms,
                 expand_cast,
                 cx,
-                index,
             ));
         }
         list
@@ -87,7 +86,6 @@ impl DeviceDetailView {
         kms: &KmsViewState,
         expand_cast: &ExpandCastViewState,
         cx: &mut Context<crate::RootView>,
-        index: usize,
     ) -> impl IntoElement {
         let is_connected = device.is_connected;
         let ip_display = device
@@ -118,6 +116,7 @@ impl DeviceDetailView {
         };
 
         let mut card = div()
+            .id(SharedString::from(device.device_id.clone()))
             .p(px(16.0))
             .rounded_xl()
             .bg(Theme::bg_card())
@@ -137,7 +136,7 @@ impl DeviceDetailView {
                     .child(
                         // The device artwork keeps its transparent margins; cover
                         // crops them so the phone fills the square thumbnail.
-                        img(crate::assets::asset_path("phone.png"))
+                        img("phone.png")
                             .size(px(48.0))
                             .object_fit(ObjectFit::Cover)
                             .flex_shrink_0(),
@@ -200,7 +199,7 @@ impl DeviceDetailView {
                 };
                 let cast_id = device_id.clone();
                 actions = actions.child(
-                    Button::new(("btn-cast", index))
+                    Button::new("btn-cast")
                         .primary()
                         .disabled(
                             (state.cast.active() && !casting)
@@ -221,14 +220,8 @@ impl DeviceDetailView {
             }
 
             if device.kms_capable() {
-                actions = actions.child(Self::render_kms_action(
-                    device,
-                    state,
-                    kms,
-                    expand_cast,
-                    cx,
-                    index,
-                ));
+                actions =
+                    actions.child(Self::render_kms_action(device, state, kms, expand_cast, cx));
             }
 
             if device.device_type == "tablet" {
@@ -244,7 +237,7 @@ impl DeviceDetailView {
                         _ => "共享启动中",
                     };
                     actions = actions.child(
-                        Button::new(("btn-expand-cast-stop", index))
+                        Button::new("btn-expand-cast-stop")
                             .primary()
                             .disabled(expand_cast.phase == ExpandCastPhase::Stopping)
                             .label(ext_label)
@@ -258,7 +251,7 @@ impl DeviceDetailView {
                     let mirror_id = device_id.clone();
                     actions = actions
                         .child(
-                            Button::new(("btn-expand-cast-virtual", index))
+                            Button::new("btn-expand-cast-virtual")
                                 .primary()
                                 .disabled(disabled)
                                 .label("屏幕扩展")
@@ -267,7 +260,7 @@ impl DeviceDetailView {
                                 })),
                         )
                         .child(
-                            Button::new(("btn-expand-cast-mirror", index))
+                            Button::new("btn-expand-cast-mirror")
                                 .primary()
                                 .disabled(disabled)
                                 .label("屏幕镜像")
@@ -278,7 +271,7 @@ impl DeviceDetailView {
                 }
             }
             actions = actions.child(
-                Button::new(("btn-disconnect", index))
+                Button::new("btn-disconnect")
                     .secondary()
                     .label("断开")
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -312,7 +305,7 @@ impl DeviceDetailView {
             );
             card = card.child(actions);
         } else {
-            card = card.child(Self::render_disconnected_actions(device, state, cx, index));
+            card = card.child(Self::render_disconnected_actions(device, state, cx));
         }
 
         div().flex().flex_col().gap(px(8.0)).child(card)
@@ -324,7 +317,6 @@ impl DeviceDetailView {
         kms: &KmsViewState,
         expand_cast: &ExpandCastViewState,
         cx: &mut Context<crate::RootView>,
-        index: usize,
     ) -> impl IntoElement {
         let sharing = kms.device_id == device.device_id && kms.active();
         let label = if sharing {
@@ -337,7 +329,7 @@ impl DeviceDetailView {
             "键鼠共享"
         };
         let kms_id = device.device_id.clone();
-        Button::new(("btn-kms", index))
+        Button::new("btn-kms")
             .primary()
             .disabled(
                 (kms.active() && !sharing)
@@ -359,7 +351,6 @@ impl DeviceDetailView {
         device: &DeviceInfo,
         state: &AppState,
         cx: &mut Context<crate::RootView>,
-        index: usize,
     ) -> impl IntoElement {
         let pending = state.connect_pending;
         let address = device
@@ -368,7 +359,7 @@ impl DeviceDetailView {
             .filter(|address| !address.trim().is_empty());
 
         let forget_id = device.device_id.clone();
-        let forget = Button::new(("btn-forget", index))
+        let forget = Button::new("btn-forget")
             .secondary()
             .label("删除")
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -397,7 +388,7 @@ impl DeviceDetailView {
                 .items_center()
                 .gap(px(8.0))
                 .child(
-                    Button::new(("btn-reverse-connect", index))
+                    Button::new("btn-reverse-connect")
                         .primary()
                         .disabled(pending)
                         .label(if pending {

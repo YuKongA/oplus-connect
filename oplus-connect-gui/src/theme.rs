@@ -111,14 +111,6 @@ impl Theme {
         }
     }
 
-    pub fn bg_modal_backdrop() -> Hsla {
-        if Self::is_dark() {
-            rgba(0x000000b0).into()
-        } else {
-            rgba(0x00000066).into()
-        }
-    }
-
     pub fn bg_modal() -> Hsla {
         if Self::is_dark() {
             rgb(0x0a0a0a).into()

@@ -21,6 +21,8 @@ impl SettingsView {
             kms_direction,
             expand_cast_fps,
             expand_cast_bitrate,
+            adaptive,
+            validation,
         } = controls;
         div()
             .id("settings-view-scroll")
@@ -102,12 +104,12 @@ impl SettingsView {
                         "请优先使用 H.265",
                         // Fixed trigger width so this row lines up with the
                         // switch column; the popup matches it exactly.
-                        div().w(px(160.0)).children(codec.map(|state| {
-                            Select::new(state)
+                        div().w(px(160.0)).child(
+                            Select::new(codec)
                                 .w_full()
                                 .menu_width(px(160.0))
-                                .menu_max_h(rems(9.0))
-                        })),
+                                .menu_max_h(rems(9.0)),
+                        ),
                     )),
             )
             .child(
@@ -117,26 +119,31 @@ impl SettingsView {
                     .title("平板屏幕共享")
                     .child(Self::control_row(
                         "帧率（FPS）",
-                        "输入 1–144 的整数",
-                        div().w(px(160.0)).children(expand_cast_fps.map(Input::new)),
+                        "输入 1–144 的整数，按回车或移开焦点保存",
+                        div().w(px(160.0)).child(Input::new(expand_cast_fps)),
                     ))
                     .child(Self::control_row(
                         "初始码率（kbps）",
-                        "输入 500–50000 的整数",
-                        div()
-                            .w(px(160.0))
-                            .children(expand_cast_bitrate.map(Input::new)),
+                        "输入 500–50000 的整数，按回车或移开焦点保存",
+                        div().w(px(160.0)).child(Input::new(expand_cast_bitrate)),
                     ))
                     .child(Self::switch_row(
                         "动态码率",
                         "开启后码率会随共享状况变化",
                         Switch::new("toggle-expand-cast-adaptive")
-                            .checked(state.expand_cast_settings.adaptive_bitrate)
+                            .checked(adaptive)
                             .accessibility_label("动态码率")
                             .on_change(cx.listener(|this, next, _, cx| {
                                 this.update_expand_cast_adaptive(*next, cx);
                             })),
                     ))
+                    .children(validation.into_iter().flatten().map(|message| {
+                        div()
+                            .w_full()
+                            .text_xs()
+                            .text_color(Theme::text_secondary())
+                            .child(message)
+                    }))
                     .children(state.expand_cast_settings_feedback.as_ref().map(|message| {
                         div()
                             .w_full()
@@ -153,12 +160,12 @@ impl SettingsView {
                     .child(Self::control_row(
                         "光标移出方向",
                         "从所选方向移出屏幕进入设备",
-                        div().w(px(160.0)).children(kms_direction.map(|state| {
-                            Select::new(state)
+                        div().w(px(160.0)).child(
+                            Select::new(kms_direction)
                                 .w_full()
                                 .menu_width(px(160.0))
-                                .menu_max_h(rems(9.0))
-                        })),
+                                .menu_max_h(rems(9.0)),
+                        ),
                     )),
             )
             .child(

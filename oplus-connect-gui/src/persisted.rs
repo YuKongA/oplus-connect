@@ -5,6 +5,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, mpsc};
 
 use crate::state::DeviceInfo;
 
@@ -47,9 +48,68 @@ pub fn load_known_devices() -> Vec<DeviceInfo> {
     }
 }
 
-pub fn save_known_devices(devices: &[DeviceInfo]) {
-    if let Err(error) = save_vec_at(&path(), devices) {
-        tracing::warn!("Cannot persist known devices: {}", error);
+/// One writer owns the file. While an atomic replacement is in progress, only
+/// the latest waiting snapshot matters (including an empty list after forget).
+pub(crate) struct KnownDeviceWriter {
+    pending: Arc<Mutex<Option<Vec<DeviceInfo>>>>,
+    wake: Option<mpsc::SyncSender<()>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl KnownDeviceWriter {
+    pub(crate) fn new() -> Self {
+        Self::start(|devices| {
+            if let Err(error) = save_vec_at(&path(), devices) {
+                tracing::warn!("Cannot persist known devices: {error}");
+            }
+        })
+    }
+
+    fn start(mut save: impl FnMut(&[DeviceInfo]) + Send + 'static) -> Self {
+        let pending = Arc::new(Mutex::new(None::<Vec<DeviceInfo>>));
+        let slot = Arc::clone(&pending);
+        let (wake, rx) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            while rx.recv().is_ok() {
+                let snapshot = slot.lock().unwrap().take();
+                if let Some(devices) = snapshot {
+                    save(&devices);
+                }
+            }
+        });
+        Self {
+            pending,
+            wake: Some(wake),
+            worker: Some(worker),
+        }
+    }
+
+    pub(crate) fn submit(&self, devices: &[DeviceInfo]) -> bool {
+        let Some(wake) = &self.wake else { return false };
+        let snapshot = devices.to_vec();
+        *self.pending.lock().unwrap() = Some(snapshot);
+        match wake.try_send(()) {
+            Ok(()) | Err(mpsc::TrySendError::Full(())) => true,
+            Err(mpsc::TrySendError::Disconnected(())) => {
+                tracing::warn!("Known device writer stopped");
+                false
+            }
+        }
+    }
+
+    pub(crate) fn finish(&mut self) {
+        self.wake.take();
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            tracing::error!("Known device writer failed during shutdown");
+        }
+    }
+}
+
+impl Drop for KnownDeviceWriter {
+    fn drop(&mut self) {
+        self.finish();
     }
 }
 
@@ -87,14 +147,10 @@ pub fn load_cast_settings() -> (bool, bool, bool) {
     }
 }
 
-pub fn save_cast_settings(audio: bool, input: bool, h265: bool) {
+pub fn save_cast_settings(audio: bool, input: bool, h265: bool) -> io::Result<()> {
     let settings = CastSettings { audio, input, h265 };
-    let result = serde_json::to_vec_pretty(&settings)
-        .map_err(io::Error::other)
-        .and_then(|bytes| save_bytes(&cast_settings_path(), &bytes));
-    if let Err(error) = result {
-        tracing::warn!("Cannot persist cast settings: {}", error);
-    }
+    let bytes = serde_json::to_vec_pretty(&settings).map_err(io::Error::other)?;
+    save_bytes(&cast_settings_path(), &bytes)
 }
 
 pub const FPS_MIN: u32 = 1;
@@ -187,8 +243,8 @@ pub fn save_kms_direction(exit_direction: crate::kms_settings::ExitDirection) ->
 }
 
 fn normalize(devices: &mut Vec<DeviceInfo>) {
-    let local = oplus_connect_daemon::net_utils::pdid();
-    devices.retain(|device| !device.device_id.eq_ignore_ascii_case(&local));
+    let local = crate::state::LocalDeviceInfo::discover();
+    devices.retain_mut(|device| local.sanitize_device(device));
     for device in devices {
         device.is_connected = false;
         device.battery = 0;
@@ -386,6 +442,33 @@ mod tests {
             is_connected: true,
             last_seen: 1793521038,
         }
+    }
+
+    #[test]
+    fn device_writer_coalesces_and_drains_final_forget_on_quit() {
+        let path = temp_path();
+        let worker_path = path.clone();
+        let (started, first_write) = mpsc::channel();
+        let (resume, wait) = mpsc::channel();
+        let mut first = true;
+        let mut writer = KnownDeviceWriter::start(move |devices| {
+            if first {
+                first = false;
+                started.send(()).unwrap();
+                wait.recv().unwrap();
+            } else {
+                assert!(devices.is_empty(), "intermediate snapshots should coalesce");
+            }
+            save_vec_at(&worker_path, devices).unwrap();
+        });
+        assert!(writer.submit(&[device("A", "old")]));
+        first_write.recv().unwrap();
+        assert!(writer.submit(&[device("A", "renamed")]));
+        assert!(writer.submit(&[]));
+        resume.send(()).unwrap();
+        writer.finish();
+        assert_eq!(load_vec_at(&path).unwrap(), Some(vec![]));
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

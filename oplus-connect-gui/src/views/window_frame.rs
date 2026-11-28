@@ -24,11 +24,7 @@ impl WindowFrame {
             .items_center()
             .gap(px(8.0))
             .min_w_0()
-            .child(
-                img(crate::assets::asset_path("logo.png"))
-                    .size(px(18.0))
-                    .rounded(px(3.0)),
-            )
+            .child(img("logo.png").size(px(18.0)).rounded(px(3.0)))
             .child(
                 div()
                     .text_sm()

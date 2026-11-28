@@ -3,7 +3,13 @@ use std::fs;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use gpui_kit::{AssetSource, SharedString, assets::AllAssets as KitAssets};
+use gpui_kit::assets::{Assets as KitAssets, icon_assets};
+use gpui_kit::{AssetSource, SharedString};
+
+icon_assets!(
+    AppIcons,
+    [Clipboard, Download, QrCode, Smartphone, Trash, X]
+);
 
 pub struct LocalAssets {
     base_dirs: Vec<PathBuf>,
@@ -23,15 +29,6 @@ fn asset_directories() -> Vec<PathBuf> {
     dirs.push(PathBuf::from("assets"));
     dirs.push(PathBuf::from("oplus-connect-gui/assets"));
     dirs
-}
-
-pub fn asset_path(rel_path: &str) -> PathBuf {
-    let clean = rel_path.trim_start_matches('/');
-    asset_directories()
-        .into_iter()
-        .map(|dir| dir.join(clean))
-        .find(|path| path.is_file())
-        .unwrap_or_else(|| PathBuf::from("assets").join(clean))
 }
 
 impl LocalAssets {
@@ -87,7 +84,9 @@ impl AssetSource for LocalAssets {
         }
 
         // Native Kit assets are embedded; missing optional paths remain `None`.
-        Ok(KitAssets::get(path).map(|asset| asset.data))
+        Ok(AppIcons
+            .load(path)?
+            .or_else(|| KitAssets::get(path).map(|asset| asset.data)))
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
@@ -108,7 +107,11 @@ impl AssetSource for LocalAssets {
 
         // Keep local entries first, so a custom path remains the preferred
         // listing when it has the same name as a bundled icon.
-        for asset in KitAssets.list(path)? {
+        for asset in KitAssets
+            .list(path)?
+            .into_iter()
+            .chain(AppIcons.list(path)?)
+        {
             if seen.insert(asset.to_string()) {
                 list.push(asset);
             }
@@ -171,7 +174,7 @@ mod tests {
     }
 
     #[test]
-    fn full_kit_icon_catalog_is_reachable() {
+    fn application_icons_are_reachable() {
         let assets = LocalAssets::new();
         for path in [
             "icons/clipboard.svg",
