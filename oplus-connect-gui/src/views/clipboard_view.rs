@@ -5,7 +5,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::Icon;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_kit::component::tab::{Tab, TabBar};
-use gpui_kit::component::{Disableable, Selectable, WindowExt};
+use gpui_kit::component::{Disableable, WindowExt};
 use gpui_kit::*;
 
 pub struct ClipboardView;
@@ -62,13 +62,11 @@ impl ClipboardView {
                             .size(px(28.0))
                             .p(px(0.0))
                             .tooltip("清空剪贴板历史记录")
-                            .child(Icon::new(IconName::Trash).size(px(16.0)).text_color(
-                                if has_clearable_records {
-                                    Theme::text_secondary()
-                                } else {
-                                    Theme::text_muted()
-                                },
-                            ))
+                            .child(
+                                Icon::new(IconName::Trash)
+                                    .size(px(16.0))
+                                    .text_color(Theme::text_secondary()),
+                            )
                             .accessibility_label("清空剪贴板历史记录")
                             .disabled(!has_clearable_records)
                             .on_click(cx.listener(|_, _, window, cx| {
@@ -164,14 +162,24 @@ impl ClipboardView {
         let id_for_copy = record.id.clone();
         let is_recently_copied = state.last_copied_id.as_ref() == Some(&record.id);
 
-        let (source_label, source_color, source_bg) = match &record.source {
-            ClipboardSource::Local => (
-                SharedString::new_static("本机电脑"),
-                Theme::brand_blue(),
-                Theme::brand_blue_subtle(),
-            ),
+        let (source_icon, source_label) = match &record.source {
+            ClipboardSource::Local => (IconName::Monitor, SharedString::new_static("本机电脑")),
             ClipboardSource::Remote(dev) => {
-                (dev.clone(), Theme::primary(), Theme::primary_subtle())
+                let is_tablet = state
+                    .known_devices
+                    .iter()
+                    .any(|d| d.device_name == dev.as_str() && d.device_type == "tablet");
+                let icon = if is_tablet {
+                    IconName::Tablet
+                } else {
+                    IconName::Smartphone
+                };
+                let label = if dev.is_empty() {
+                    SharedString::new_static("移动设备")
+                } else {
+                    dev.clone()
+                };
+                (icon, label)
             }
         };
 
@@ -179,7 +187,6 @@ impl ClipboardView {
             .id(record.id.clone())
             .p(px(12.0))
             .rounded_lg()
-            .flex_shrink_0()
             .bg(Theme::bg_card())
             .border_1()
             .border_color(Theme::border_card())
@@ -200,20 +207,21 @@ impl ClipboardView {
                         div()
                             .flex()
                             .items_center()
+                            .gap(px(10.0))
                             .min_w_0()
-                            .gap(px(8.0))
+                            .child(
+                                Icon::new(source_icon)
+                                    .size(px(20.0))
+                                    .text_color(Theme::text_muted())
+                                    .flex_shrink_0(),
+                            )
                             .child(
                                 div()
                                     .min_w_0()
-                                    .max_w(px(160.0))
                                     .truncate()
-                                    .px(px(8.0))
-                                    .py(px(2.0))
-                                    .rounded_full()
-                                    .bg(source_bg)
-                                    .text_xs()
+                                    .text_sm()
                                     .font_weight(FontWeight::MEDIUM)
-                                    .text_color(source_color)
+                                    .text_color(Theme::text_primary())
                                     .child(source_label),
                             )
                             .child(
@@ -221,22 +229,19 @@ impl ClipboardView {
                                     .flex_shrink_0()
                                     .text_xs()
                                     .text_color(Theme::text_muted())
-                                    .child(record.timestamp.format("%H:%M:%S").to_string()),
-                            )
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .text_xs()
-                                    .text_color(Theme::text_muted())
-                                    .child(format!("{} 字符", record.char_count)),
+                                    .child(format!(
+                                        "{} · {} 字符",
+                                        record.timestamp.format("%H:%M:%S"),
+                                        record.char_count
+                                    )),
                             ),
                     )
                     .child(
                         div()
                             .flex()
                             .items_center()
-                            .flex_shrink_0()
                             .gap(px(6.0))
+                            .flex_shrink_0()
                             .child(
                                 Button::new("copy")
                                     .ghost()
@@ -275,7 +280,6 @@ impl ClipboardView {
                                 Button::new("favorite")
                                     .ghost()
                                     .compact()
-                                    .selected(is_favorite)
                                     .toggled(is_favorite)
                                     .size(px(28.0))
                                     .p(px(0.0))
@@ -293,7 +297,7 @@ impl ClipboardView {
                                         .size(px(16.0))
                                         .text_color(
                                             if is_favorite {
-                                                rgb(0xeab308).into()
+                                                Theme::warning()
                                             } else {
                                                 Theme::text_secondary()
                                             },
@@ -331,11 +335,8 @@ impl ClipboardView {
             )
             .child(
                 div()
-                    .pt(px(8.0))
-                    .border_t_1()
-                    .border_color(Theme::border_subtle())
                     .text_sm()
-                    .text_color(Theme::text_primary())
+                    .text_color(Theme::text_secondary())
                     .child(record.content.clone()),
             )
     }

@@ -8,7 +8,9 @@ use gpui_kit::{AssetSource, SharedString};
 
 icon_assets!(
     AppIcons,
-    [Clipboard, Download, QrCode, Smartphone, Trash, X]
+    [
+        Clipboard, Download, Monitor, QrCode, Smartphone, Tablet, Trash, X
+    ]
 );
 
 pub struct LocalAssets {
@@ -187,6 +189,8 @@ mod tests {
             "icons/star-fill.svg",
             "icons/x.svg",
             "icons/smartphone.svg",
+            "icons/tablet.svg",
+            "icons/monitor.svg",
             "icons/download.svg",
         ] {
             let loaded = assets.load(path).expect("asset load");
