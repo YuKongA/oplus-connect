@@ -90,9 +90,9 @@ pub struct DeviceInfo {
 }
 
 impl DeviceInfo {
-    /// Phones and tablets expose the same keyboard/mouse sharing (KMS) entry.
+    /// Only tablets expose keyboard/mouse sharing (KMS).
     pub fn kms_capable(&self) -> bool {
-        matches!(self.device_type.as_str(), "phone" | "tablet")
+        self.device_type == "tablet"
     }
 }
 

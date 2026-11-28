@@ -12,10 +12,7 @@ use tokio::sync::{mpsc, oneshot};
 
 const QUEUE_CAPACITY: usize = 128;
 
-/// EPI device categories that accept a Keyboard and Mouse Sharing session.
-/// Phones and tablets run the same KMS wire protocol; the official PC only
-/// exposes the entry point on tablets.
-const PHONE_CATEGORY: u8 = 8;
+/// EPI device category eligible for keyboard and mouse sharing.
 const TABLET_CATEGORY: u8 = 10;
 
 pub enum BusCommand {
@@ -363,8 +360,8 @@ impl Controller {
         }
     }
     pub async fn start(&mut self, config: ServerConfig) -> Result<StartPublication, String> {
-        if !matches!(self.peer_type, PHONE_CATEGORY | TABLET_CATEGORY) {
-            return Err("KMS requires a phone or tablet peer (EPI category 8 or 10)".into());
+        if self.peer_type != TABLET_CATEGORY {
+            return Err("KMS requires a tablet peer (EPI category 10)".into());
         }
         if self.server.is_some() {
             return Err("KMS session already active".to_string());
@@ -592,8 +589,8 @@ mod tests {
         assert!(reply.is_closed());
     }
     #[tokio::test]
-    async fn start_rejects_unknown_categories_without_binding() {
-        for category in [0, 6, 255] {
+    async fn start_rejects_non_tablets_without_binding() {
+        for category in [0, 6, 8, 255] {
             let registry = KmsRegistry::new();
             let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
             let mut controller = registry
@@ -622,49 +619,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_accepts_phone_and_tablet_categories() {
-        for (category, name) in [
-            (PHONE_CATEGORY, "PLZ110"),
-            (TABLET_CATEGORY, "OPPO Pad Mini"),
-        ] {
-            let registry = KmsRegistry::new();
-            let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
-            let mut controller = registry
-                .register_bus("aabbccddeeff", ip, ip)
-                .unwrap()
-                .into_controller(
-                    "AABBCCDDEEFF".into(),
-                    name.into(),
-                    category,
-                    "PC".into(),
-                    "local".into(),
-                );
-            let publication = controller
-                .start(ServerConfig {
-                    device_id: "AABBCCDDEEFF".into(),
-                    peer_ip: ip,
-                    bind_ip: ip,
-                    width: 1920,
-                    height: 1080,
-                    direction: 1,
-                })
-                .await
-                .unwrap();
-            assert_eq!(publication.info.device_id, "AABBCCDDEEFF");
-            assert!(controller.server.is_some());
-            let envelope: serde_json::Value =
-                serde_json::from_str(&publication.device_info).unwrap();
-            let payload: serde_json::Value =
-                serde_json::from_str(envelope["dbs_msg_payload"].as_str().unwrap()).unwrap();
-            let message: serde_json::Value =
-                serde_json::from_str(payload["value"].as_str().unwrap()).unwrap();
-            let body: serde_json::Value =
-                serde_json::from_str(message["msg_body"].as_str().unwrap()).unwrap();
-            assert_eq!(
-                body["remote_device_type"].as_u64(),
-                Some(u64::from(category))
+    async fn start_accepts_tablets_and_advertises_their_category() {
+        let registry = KmsRegistry::new();
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mut controller = registry
+            .register_bus("aabbccddeeff", ip, ip)
+            .unwrap()
+            .into_controller(
+                "AABBCCDDEEFF".into(),
+                "OPPO Pad Mini".into(),
+                TABLET_CATEGORY,
+                "PC".into(),
+                "local".into(),
             );
-            controller.abort().await;
-        }
+        let publication = controller
+            .start(ServerConfig {
+                device_id: "AABBCCDDEEFF".into(),
+                peer_ip: ip,
+                bind_ip: ip,
+                width: 1920,
+                height: 2160,
+                direction: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(publication.info.device_id, "AABBCCDDEEFF");
+        assert!(controller.server.is_some());
+        let envelope: serde_json::Value = serde_json::from_str(&publication.device_info).unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(envelope["dbs_msg_payload"].as_str().unwrap()).unwrap();
+        let message: serde_json::Value =
+            serde_json::from_str(payload["value"].as_str().unwrap()).unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(message["msg_body"].as_str().unwrap()).unwrap();
+        assert_eq!(body["remote_device_type"].as_u64(), Some(10));
+        controller.abort().await;
     }
 }

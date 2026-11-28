@@ -1314,8 +1314,8 @@ mod polling_tests {
     }
 
     #[test]
-    fn keyboard_mouse_sharing_accepts_phones_and_tablets_only() {
-        assert!(device("phone-1", "phone", true).kms_capable());
+    fn keyboard_mouse_sharing_accepts_only_tablets() {
+        assert!(!device("phone-1", "phone", true).kms_capable());
         assert!(tablet("tablet-1", true).kms_capable());
         assert!(!device("unknown-1", "unknown", true).kms_capable());
         assert!(!device("empty-1", "", true).kms_capable());

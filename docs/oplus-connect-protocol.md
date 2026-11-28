@@ -1150,8 +1150,8 @@ Panta 主循环直接等待各控制器的命令队列，避免跨设备共享�
 #### KMS Rust 协议层与键鼠共享（2026-11-04）
 
 `kms/` 实现键鼠共享的编解码、动态监听、Panta 通告和显式输入发送。
-GUI 通过 KDE/Wayland InputCapture + EIS 捕获全局键鼠，并向协议确认的
-手机（EPI category `8`）与平板（`10`）提供此入口；手机同时保留独立投屏链路。
+GUI 通过 KDE/Wayland InputCapture + EIS 捕获全局键鼠，键鼠共享入口仅对平板
+（EPI category `10`）开放；手机仍保留独立投屏链路。
 
 24 字节帧头精确布局如下（多字节整数均为大端）：
 
@@ -1197,7 +1197,7 @@ magic 尝试恢复。序号分配、超时、设备身份校验和连接生命�
 
 尺寸范围为 1..16384；`direction` 经逆向官方 `screenshare.exe`（`handleArrangePosition`）
 证实对应平板相对电脑的方位（1=Left, 2=Right, 3=Above, 4=Below），并在 arrange 中同步发给平板。KMS 启动前
-要求已认证的手机或平板 owner；未知类别不会绑定服务。Start 成功表示 listener 已绑定，
+要求已认证的平板 owner（EPI category `10`）；其他类别不会绑定服务。Start 成功表示 listener 已绑定，
 且确认的 unite session 已发出追加 `Oplus_KeyMouseLink` 的 topic sync 和
 `kms_ability_sync/pc_device_info`，不表示设备已完成连接。响应只含设备、地址和状态，
 不含 randomPwd/testData。状态为 listening/handshaking/connected/closed；没有运行的
